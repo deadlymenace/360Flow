@@ -26,13 +26,15 @@ export default function HomeScreen({ navigation }: Props) {
   const [showModal, setShowModal] = useState(false);
   const [roomName, setRoomName] = useState('');
   const [creating, setCreating] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const loadProjects = useCallback(async () => {
     try {
+      setLoadError(null);
       const data = await api.listProjects();
       setProjects(data.reverse());
     } catch (e: any) {
-      console.warn('Failed to load projects:', e.message);
+      setLoadError(e.message || 'Cannot connect to the backend');
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -105,6 +107,18 @@ export default function HomeScreen({ navigation }: Props) {
       {loading ? (
         <View style={styles.centered}>
           <ActivityIndicator size="large" color="#6C63FF" />
+        </View>
+      ) : loadError ? (
+        <View style={styles.centered}>
+          <Text style={styles.emptyIcon}>⚠️</Text>
+          <Text style={styles.emptyTitle}>Cannot reach server</Text>
+          <Text style={styles.emptySubtitle}>{loadError}</Text>
+          <TouchableOpacity
+            style={[styles.addButton, { marginTop: 20, paddingHorizontal: 24, paddingVertical: 12 }]}
+            onPress={() => { setLoading(true); loadProjects(); }}
+          >
+            <Text style={styles.addButtonText}>Retry</Text>
+          </TouchableOpacity>
         </View>
       ) : projects.length === 0 ? (
         <View style={styles.centered}>
