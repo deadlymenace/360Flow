@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "360Flow",
+    "slug": "threesixtyflow",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1a1a2e"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.threesixtyflow.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "360Flow needs camera access to capture panoramic photos of rooms.",
+        "NSMotionUsageDescription": "360Flow uses motion sensors to guide you through a 360° rotation."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1a1a2e"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.threesixtyflow.app",
+      "permissions": ["CAMERA", "HIGH_SAMPLING_RATE_SENSORS"]
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "360Flow needs camera access to capture panoramic photos of rooms."
+        }
+      ],
+      [
+        "expo-sensors",
+        {
+          "motionPermission": "360Flow uses motion sensors to guide you through a 360° rotation."
+        }
+      ]
+    ]
+  }
+}
