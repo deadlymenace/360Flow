@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# Backend storage (uploaded images and generated panoramas)
+backend/storage/uploads/
+backend/storage/panoramas/
+
+# Xcode
+ios/ThreeSixtyFlow/ThreeSixtyFlow.xcodeproj/xcuserdata/
+ios/ThreeSixtyFlow/ThreeSixtyFlow.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
