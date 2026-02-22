@@ -26,7 +26,22 @@ def stitch_images(image_paths: list[Path], output_path: Path) -> bool:
 
     logger.info("Stitching %d images...", len(images))
     stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
-    status, panorama = stitcher.stitch(images)
+
+    # Lower confidence threshold so the stitcher keeps edge segments
+    # that close the 360° loop (default 1.0 is too strict)
+    stitcher.setPanoConfidenceThresh(0.3)
+
+    # Try with all images including a duplicate of the first to help
+    # the stitcher close the 360° loop between last and first segments
+    images_wrapped = images + [images[0]]
+    status, panorama = stitcher.stitch(images_wrapped)
+
+    if status != cv2.Stitcher_OK:
+        # Fall back to stitching without the duplicate
+        logger.warning("Wrapped stitch failed, trying without wrap...")
+        stitcher2 = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
+        stitcher2.setPanoConfidenceThresh(0.3)
+        status, panorama = stitcher2.stitch(images)
 
     if status != cv2.Stitcher_OK:
         status_names = {
