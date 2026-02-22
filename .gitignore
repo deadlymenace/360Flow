@@ -17,6 +17,20 @@ ios/ThreeSixtyFlow/ThreeSixtyFlow.xcodeproj/project.xcworkspace/xcuserdata/
 DerivedData/
 build/
 
+# Expo / React Native
+mobile/node_modules/
+mobile/.expo/
+mobile/dist/
+mobile/web-build/
+mobile/ios/
+mobile/android/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.orig.*
+
 # macOS
 .DS_Store
 
