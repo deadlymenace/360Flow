@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View,
   Text,
@@ -7,7 +7,10 @@ import {
   ActivityIndicator,
   TouchableOpacity,
   Dimensions,
+  Animated,
   PanResponder,
+  GestureResponderEvent,
+  PanResponderGestureState,
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
@@ -22,27 +25,65 @@ export default function PanoramaScreen({ navigation, route }: Props) {
   const [imageUri, setImageUri] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [imageSize, setImageSize] = useState<{ w: number; h: number } | null>(null);
 
-  // Pan state for scrollable panorama view
-  const [offsetX, setOffsetX] = useState(0);
-  const [offsetY, setOffsetY] = useState(0);
+  // Animated values for smooth pan and zoom
+  const pan = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+  const scale = useRef(new Animated.Value(1)).current;
   const lastOffset = useRef({ x: 0, y: 0 });
+  const lastScale = useRef(1);
+  const pinchStartDist = useRef(0);
+
+  const getDistance = (touches: any[]) => {
+    const dx = touches[0].pageX - touches[1].pageX;
+    const dy = touches[0].pageY - touches[1].pageY;
+    return Math.sqrt(dx * dx + dy * dy);
+  };
 
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => {
-        lastOffset.current = { x: offsetX, y: offsetY };
+      onPanResponderGrant: (evt: GestureResponderEvent) => {
+        lastOffset.current = {
+          x: (pan.x as any)._value,
+          y: (pan.y as any)._value,
+        };
+        lastScale.current = (scale as any)._value;
+        if (evt.nativeEvent.touches.length === 2) {
+          pinchStartDist.current = getDistance(evt.nativeEvent.touches);
+        }
       },
-      onPanResponderMove: (_, gesture) => {
-        setOffsetX(lastOffset.current.x + gesture.dx);
-        setOffsetY(
-          Math.max(
-            -(SCREEN_W / 2),
-            Math.min(SCREEN_W / 2, lastOffset.current.y + gesture.dy)
-          )
-        );
+      onPanResponderMove: (evt: GestureResponderEvent, gesture: PanResponderGestureState) => {
+        if (evt.nativeEvent.touches.length === 2) {
+          // Pinch to zoom
+          const dist = getDistance(evt.nativeEvent.touches);
+          if (pinchStartDist.current > 0) {
+            const newScale = Math.max(0.5, Math.min(4, lastScale.current * (dist / pinchStartDist.current)));
+            scale.setValue(newScale);
+          }
+        } else {
+          // Single finger pan
+          const newX = lastOffset.current.x + gesture.dx;
+          const newY = lastOffset.current.y + gesture.dy;
+
+          // Clamp Y so user can't scroll too far vertically
+          const currentScale = (scale as any)._value;
+          const maxY = imageSize
+            ? Math.max(0, (imageSize.h * currentScale - SCREEN_H) / 2)
+            : SCREEN_H;
+          pan.setValue({ x: newX, y: Math.max(-maxY, Math.min(maxY, newY)) });
+        }
+      },
+      onPanResponderRelease: (_, gesture) => {
+        // Add momentum / deceleration on release
+        if (Math.abs(gesture.vx) > 0.1 || Math.abs(gesture.vy) > 0.1) {
+          Animated.decay(pan, {
+            velocity: { x: gesture.vx, y: gesture.vy * 0.5 },
+            deceleration: 0.985,
+            useNativeDriver: false,
+          }).start();
+        }
       },
     })
   ).current;
@@ -56,10 +97,23 @@ export default function PanoramaScreen({ navigation, route }: Props) {
       setLoading(true);
       setError(null);
       const uri = await api.downloadPanorama(projectId);
-      setImageUri(uri);
+      // Get actual image dimensions for proper rendering
+      Image.getSize(
+        uri,
+        (w, h) => {
+          setImageSize({ w, h });
+          setImageUri(uri);
+          setLoading(false);
+        },
+        (err) => {
+          // Fall back to defaults if getSize fails
+          setImageSize({ w: 4096, h: 2048 });
+          setImageUri(uri);
+          setLoading(false);
+        }
+      );
     } catch (e: any) {
       setError(e.message);
-    } finally {
       setLoading(false);
     }
   };
@@ -85,10 +139,10 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     );
   }
 
-  // Equirectangular panoramas are 2:1 aspect ratio
-  // Show at full screen width, pan to explore
-  const imageWidth = SCREEN_W * 2;
-  const imageHeight = SCREEN_W;
+  // Scale image so its height fills the screen, preserving full resolution
+  const aspectRatio = imageSize ? imageSize.w / imageSize.h : 2;
+  const imageHeight = SCREEN_H;
+  const imageWidth = imageHeight * aspectRatio;
 
   return (
     <View style={styles.container}>
@@ -102,7 +156,7 @@ export default function PanoramaScreen({ navigation, route }: Props) {
 
       <View style={styles.panoramaContainer} {...panResponder.panHandlers}>
         {imageUri && (
-          <Image
+          <Animated.Image
             source={{ uri: imageUri }}
             style={[
               styles.panoramaImage,
@@ -110,8 +164,9 @@ export default function PanoramaScreen({ navigation, route }: Props) {
                 width: imageWidth,
                 height: imageHeight,
                 transform: [
-                  { translateX: offsetX },
-                  { translateY: offsetY },
+                  { translateX: pan.x },
+                  { translateY: pan.y },
+                  { scale: scale },
                 ],
               },
             ]}
@@ -121,7 +176,7 @@ export default function PanoramaScreen({ navigation, route }: Props) {
       </View>
 
       <View style={styles.hint}>
-        <Text style={styles.hintText}>Drag to explore the panorama</Text>
+        <Text style={styles.hintText}>Drag to explore · Pinch to zoom</Text>
       </View>
     </View>
   );

@@ -103,16 +103,10 @@ class APIService {
 
   async downloadPanorama(projectId: string): Promise<string> {
     const url = `${this.baseUrl}/projects/${projectId}/panorama`;
-    const file = new ExpoFile(Paths.cache, `panorama_${projectId}.jpg`);
+    const dest = new ExpoFile(Paths.cache, `panorama_${projectId}.jpg`);
 
-    const res = await fetchWithTimeout(url, {}, 30000); // 30s for panorama download
-    if (!res.ok) throw new Error(`Download panorama failed: ${res.status}`);
-
-    const blob = await res.blob();
-    const buffer = await blob.arrayBuffer();
-    file.write(new Uint8Array(buffer));
-
-    return file.uri;
+    const output = await ExpoFile.downloadFileAsync(url, dest);
+    return output.uri;
   }
 
   async startStaging(projectId: string, prompt: string): Promise<void> {
