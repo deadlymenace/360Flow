@@ -12,7 +12,6 @@ import {
   makeSegments,
 } from '../models/types';
 import { HapticFeedback } from '../utils/haptics';
-import RotationGuide from '../components/RotationGuide';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -36,6 +35,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
 
   const capturedCount = segments.filter((s) => s.imageUri !== null).length;
   const isComplete = capturedCount === SEGMENT_COUNT;
+  const progressPct = (capturedCount / SEGMENT_COUNT) * 100;
 
   // Next uncaptured segment (sequential guidance target)
   const nextTargetIndex = useMemo(() => {
@@ -144,54 +144,57 @@ export default function CaptureScreen({ navigation, route }: Props) {
     );
   }
 
+  const showDirectionOverlay =
+    !isComplete &&
+    !isAligned &&
+    directionInfo &&
+    directionInfo.degrees > ALIGNMENT_TOLERANCE;
+
   return (
     <View style={styles.container}>
+      {/* Camera — no children to avoid CameraView warning */}
       <CameraView
         ref={cameraRef}
-        style={styles.camera}
+        style={StyleSheet.absoluteFill}
         facing="back"
-      >
-        {/* Top bar */}
-        <View style={styles.topBar}>
-          <TouchableOpacity onPress={() => navigation.goBack()}>
-            <Text style={styles.backText}>← Back</Text>
-          </TouchableOpacity>
-          <Text style={styles.roomName}>{projectName}</Text>
-          <View style={{ width: 60 }} />
+      />
+
+      {/* UI overlay positioned on top of camera */}
+      <View style={styles.overlay} pointerEvents="box-none">
+        {/* Top section: nav bar + progress */}
+        <View>
+          <View style={styles.topBar}>
+            <TouchableOpacity onPress={() => navigation.goBack()}>
+              <Text style={styles.backText}>← Back</Text>
+            </TouchableOpacity>
+            <Text style={styles.roomName}>{projectName}</Text>
+            <Text style={styles.countText}>
+              {capturedCount}/{SEGMENT_COUNT}
+            </Text>
+          </View>
+
+          {/* Progress bar */}
+          <View style={styles.progressTrack}>
+            <View style={[styles.progressFill, { width: `${progressPct}%` }]} />
+          </View>
         </View>
 
-        {/* Rotation guide overlay */}
-        <View style={styles.guideContainer}>
-          <RotationGuide
-            segments={segments}
-            currentYaw={currentYaw}
-            currentSegmentIndex={currentSegmentIndex}
-            isAligned={isAligned}
-            nextTargetIndex={nextTargetIndex}
-          />
-        </View>
+        {/* Center: directional arrow (only when not aligned) */}
+        {showDirectionOverlay ? (
+          <View style={styles.directionOverlay} pointerEvents="none">
+            <Text style={styles.directionArrowLarge}>
+              {directionInfo.direction === 'right' ? '→' : '←'}
+            </Text>
+            <Text style={styles.directionDegreesLarge}>
+              {directionInfo.degrees}°
+            </Text>
+          </View>
+        ) : (
+          <View />
+        )}
 
         {/* Bottom controls */}
         <View style={styles.bottomBar}>
-          <Text style={styles.countText}>
-            {capturedCount} of {SEGMENT_COUNT}
-          </Text>
-
-          {/* Directional guidance */}
-          {!isComplete && !isAligned && directionInfo && directionInfo.degrees > ALIGNMENT_TOLERANCE && (
-            <View style={styles.directionRow}>
-              <Text style={styles.directionArrow}>
-                {directionInfo.direction === 'right' ? '→' : '←'}
-              </Text>
-              <Text style={styles.directionLabel}>
-                Turn {directionInfo.direction}
-              </Text>
-              <Text style={styles.directionDegrees}>
-                {directionInfo.degrees}°
-              </Text>
-            </View>
-          )}
-
           {isComplete ? (
             <TouchableOpacity
               style={styles.reviewButton}
@@ -234,11 +237,11 @@ export default function CaptureScreen({ navigation, route }: Props) {
               : isAligned
               ? 'Aligned — tap to capture'
               : capturedCount === 0
-              ? 'Capture your first photo, then follow the arrow'
+              ? 'Point at your starting position and capture'
               : 'Follow the arrow to the next position'}
           </Text>
         </View>
-      </CameraView>
+      </View>
     </View>
   );
 }
@@ -248,8 +251,9 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
-  camera: {
-    flex: 1,
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'space-between',
   },
   centered: {
     flex: 1,
@@ -288,6 +292,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingTop: 60,
     paddingHorizontal: 20,
+    paddingBottom: 12,
   },
   backText: {
     color: '#fff',
@@ -299,20 +304,42 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
-  guideContainer: {
-    flex: 1,
-    justifyContent: 'center',
+  countText: {
+    color: 'rgba(255,255,255,0.8)',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  progressTrack: {
+    height: 4,
+    backgroundColor: 'rgba(255,255,255,0.15)',
+    marginHorizontal: 20,
+    borderRadius: 2,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: '#6C63FF',
+    borderRadius: 2,
+  },
+  directionOverlay: {
     alignItems: 'center',
+    justifyContent: 'center',
+  },
+  directionArrowLarge: {
+    fontSize: 72,
+    fontWeight: '700',
+    color: 'rgba(255, 255, 255, 0.75)',
+  },
+  directionDegreesLarge: {
+    fontSize: 28,
+    fontWeight: '600',
+    color: 'rgba(255, 255, 255, 0.6)',
+    marginTop: -8,
   },
   bottomBar: {
     alignItems: 'center',
     paddingBottom: 50,
     gap: 12,
-  },
-  countText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
   },
   captureButton: {
     width: 76,
@@ -356,26 +383,5 @@ const styles = StyleSheet.create({
   hintTextAligned: {
     color: '#FFD700',
     fontWeight: '600',
-  },
-  directionRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 4,
-  },
-  directionArrow: {
-    fontSize: 28,
-    fontWeight: '700',
-    color: '#00E5FF',
-  },
-  directionLabel: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#fff',
-  },
-  directionDegrees: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#00E5FF',
   },
 });

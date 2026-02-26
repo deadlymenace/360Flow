@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import threading
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, UploadFile, File
@@ -22,8 +21,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _run_stitching(project_id: str):
-    """Run stitching in a background thread."""
+async def _async_stitch(project_id: str):
+    """Run stitching in a background task with proper error handling."""
     project = projects_db.get(project_id)
     if not project:
         return
@@ -32,7 +31,14 @@ def _run_stitching(project_id: str):
     image_paths = get_upload_images(project_id)
     output_path = get_panorama_path(project_id)
 
-    success = stitch_images(image_paths, output_path)
+    try:
+        loop = asyncio.get_event_loop()
+        success = await loop.run_in_executor(None, stitch_images, image_paths, output_path)
+    except Exception as e:
+        logger.exception("Project %s stitching crashed: %s", project_id, e)
+        project.status = ProjectStatus.FAILED
+        project.error = f"Stitching error: {e}"
+        return
 
     if success:
         project.status = ProjectStatus.STITCHED
@@ -80,9 +86,8 @@ async def upload_images(project_id: str, images: list[UploadFile] = File(...)):
     project.image_count = len(images)
     logger.info("Project %s: uploaded %d images", project_id, len(images))
 
-    # Start stitching in background thread
-    thread = threading.Thread(target=_run_stitching, args=(project_id,), daemon=True)
-    thread.start()
+    # Start stitching as async background task
+    asyncio.create_task(_async_stitch(project_id))
 
     return {"status": "stitching", "image_count": len(images)}
 
