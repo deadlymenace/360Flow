@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, Dimensions } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { DeviceMotion, DeviceMotionMeasurement } from 'expo-sensors';
@@ -28,9 +28,33 @@ export default function CaptureScreen({ navigation, route }: Props) {
   const [capturing, setCapturing] = useState(false);
   const cameraRef = useRef<CameraView>(null);
   const initialYawRef = useRef<number | null>(null);
+  const segmentsRef = useRef<CaptureSegment[]>(segments);
+
+  useEffect(() => {
+    segmentsRef.current = segments;
+  }, [segments]);
 
   const capturedCount = segments.filter((s) => s.imageUri !== null).length;
   const isComplete = capturedCount === SEGMENT_COUNT;
+
+  // Next uncaptured segment (sequential guidance target)
+  const nextTargetIndex = useMemo(() => {
+    const idx = segments.findIndex((s) => s.imageUri === null);
+    return idx >= 0 ? idx : -1;
+  }, [segments]);
+
+  // Direction and degrees to next target
+  const directionInfo = useMemo(() => {
+    if (nextTargetIndex === -1) return null;
+    const targetDeg = nextTargetIndex * SEGMENT_ANGLE;
+    let delta = targetDeg - currentYaw;
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    return {
+      direction: delta >= 0 ? ('right' as const) : ('left' as const),
+      degrees: Math.round(Math.abs(delta)),
+    };
+  }, [nextTargetIndex, currentYaw]);
 
   useEffect(() => {
     DeviceMotion.setUpdateInterval(33); // ~30Hz
@@ -54,11 +78,12 @@ export default function CaptureScreen({ navigation, route }: Props) {
       const segIdx = Math.round(yaw / SEGMENT_ANGLE) % SEGMENT_COUNT;
       setCurrentSegmentIndex(segIdx);
 
-      // Check alignment
+      // Check alignment — only align with uncaptured segments
       const targetYaw = segIdx * SEGMENT_ANGLE;
       let diff = Math.abs(yaw - targetYaw);
       if (diff > 180) diff = 360 - diff;
-      setIsAligned(diff <= ALIGNMENT_TOLERANCE);
+      const alreadyCaptured = segmentsRef.current[segIdx]?.imageUri !== null;
+      setIsAligned(diff <= ALIGNMENT_TOLERANCE && !alreadyCaptured);
     });
 
     return () => {
@@ -142,6 +167,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
             currentYaw={currentYaw}
             currentSegmentIndex={currentSegmentIndex}
             isAligned={isAligned}
+            nextTargetIndex={nextTargetIndex}
           />
         </View>
 
@@ -150,6 +176,21 @@ export default function CaptureScreen({ navigation, route }: Props) {
           <Text style={styles.countText}>
             {capturedCount} of {SEGMENT_COUNT}
           </Text>
+
+          {/* Directional guidance */}
+          {!isComplete && !isAligned && directionInfo && directionInfo.degrees > ALIGNMENT_TOLERANCE && (
+            <View style={styles.directionRow}>
+              <Text style={styles.directionArrow}>
+                {directionInfo.direction === 'right' ? '→' : '←'}
+              </Text>
+              <Text style={styles.directionLabel}>
+                Turn {directionInfo.direction}
+              </Text>
+              <Text style={styles.directionDegrees}>
+                {directionInfo.degrees}°
+              </Text>
+            </View>
+          )}
 
           {isComplete ? (
             <TouchableOpacity
@@ -187,12 +228,14 @@ export default function CaptureScreen({ navigation, route }: Props) {
             </TouchableOpacity>
           )}
 
-          <Text style={styles.hintText}>
+          <Text style={[styles.hintText, isAligned && styles.hintTextAligned]}>
             {isComplete
               ? 'All segments captured!'
               : isAligned
-              ? 'Tap to capture'
-              : 'Rotate to align'}
+              ? 'Aligned — tap to capture'
+              : capturedCount === 0
+              ? 'Capture your first photo, then follow the arrow'
+              : 'Follow the arrow to the next position'}
           </Text>
         </View>
       </CameraView>
@@ -309,5 +352,30 @@ const styles = StyleSheet.create({
   hintText: {
     color: 'rgba(255,255,255,0.6)',
     fontSize: 13,
+  },
+  hintTextAligned: {
+    color: '#FFD700',
+    fontWeight: '600',
+  },
+  directionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 4,
+  },
+  directionArrow: {
+    fontSize: 28,
+    fontWeight: '700',
+    color: '#00E5FF',
+  },
+  directionLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  directionDegrees: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#00E5FF',
   },
 });

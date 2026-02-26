@@ -8,6 +8,7 @@ interface Props {
   currentYaw: number;
   currentSegmentIndex: number;
   isAligned: boolean;
+  nextTargetIndex: number;
 }
 
 const SIZE = 200;
@@ -30,12 +31,25 @@ function describeArc(cx: number, cy: number, r: number, startAngle: number, endA
   return `M ${start.x} ${start.y} A ${r} ${r} 0 ${largeArcFlag} 0 ${end.x} ${end.y}`;
 }
 
-export default function RotationGuide({ segments, currentYaw, currentSegmentIndex, isAligned }: Props) {
+export default function RotationGuide({
+  segments,
+  currentYaw,
+  currentSegmentIndex,
+  isAligned,
+  nextTargetIndex,
+}: Props) {
   const capturedCount = segments.filter((s) => s.imageUri !== null).length;
 
   // Current direction indicator position
   const indicatorAngle = currentYaw;
   const indicator = polarToCartesian(CENTER, CENTER, RADIUS, indicatorAngle);
+
+  // Next target indicator position (outer ring)
+  const nextTargetAngle = nextTargetIndex >= 0 ? nextTargetIndex * SEGMENT_ANGLE : -1;
+  const nextIndicator =
+    nextTargetIndex >= 0
+      ? polarToCartesian(CENTER, CENTER, RADIUS + 18, nextTargetAngle)
+      : null;
 
   return (
     <View style={styles.container}>
@@ -46,22 +60,46 @@ export default function RotationGuide({ segments, currentYaw, currentSegmentInde
           const endAngle = (i + 1) * SEGMENT_ANGLE - 1;
           const isCaptured = seg.imageUri !== null;
           const isCurrent = i === currentSegmentIndex;
+          const isNextTarget = i === nextTargetIndex;
 
-          let color = '#444'; // uncaptured
-          if (isCaptured) color = '#4CAF50'; // captured
-          if (isCurrent && !isCaptured) color = isAligned ? '#FFD700' : '#666';
+          let color = '#333';
+          let width = ARC_WIDTH;
+
+          if (isCaptured) {
+            color = '#4CAF50';
+          } else if (isCurrent && isAligned) {
+            color = '#FFD700';
+            width = ARC_WIDTH + 4;
+          } else if (isNextTarget) {
+            color = '#00E5FF';
+            width = ARC_WIDTH + 4;
+          } else if (isCurrent) {
+            color = '#555';
+          }
 
           return (
             <Path
               key={i}
               d={describeArc(CENTER, CENTER, RADIUS, startAngle, endAngle)}
               stroke={color}
-              strokeWidth={ARC_WIDTH}
+              strokeWidth={width}
               fill="none"
               strokeLinecap="round"
             />
           );
         })}
+
+        {/* Next target beacon (outer ring) */}
+        {nextIndicator && currentSegmentIndex !== nextTargetIndex && (
+          <Circle
+            cx={nextIndicator.x}
+            cy={nextIndicator.y}
+            r={5}
+            fill="none"
+            stroke="#00E5FF"
+            strokeWidth={2}
+          />
+        )}
 
         {/* Direction indicator dot */}
         <Circle cx={indicator.x} cy={indicator.y} r={6} fill="#fff" />
