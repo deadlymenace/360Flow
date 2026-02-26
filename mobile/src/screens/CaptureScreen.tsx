@@ -146,11 +146,15 @@ export default function CaptureScreen({ navigation, route }: Props) {
 
   return (
     <View style={styles.container}>
+      {/* Camera — no children to avoid CameraView warning */}
       <CameraView
         ref={cameraRef}
-        style={styles.camera}
+        style={StyleSheet.absoluteFill}
         facing="back"
-      >
+      />
+
+      {/* UI overlay positioned on top of camera */}
+      <View style={styles.overlay} pointerEvents="box-none">
         {/* Top bar */}
         <View style={styles.topBar}>
           <TouchableOpacity onPress={() => navigation.goBack()}>
@@ -238,7 +242,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
               : 'Follow the arrow to the next position'}
           </Text>
         </View>
-      </CameraView>
+      </View>
     </View>
   );
 }
@@ -248,8 +252,9 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#000',
   },
-  camera: {
-    flex: 1,
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'space-between',
   },
   centered: {
     flex: 1,
