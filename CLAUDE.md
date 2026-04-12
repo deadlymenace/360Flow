@@ -21,6 +21,8 @@
 ### OpenCV Stitcher
 - **Set `setPanoConfidenceThresh(0.3)`** — the default (1.0) is too strict and drops edge segments, resulting in incomplete 360° panoramas.
 - When stitching a full 360° loop, try appending a duplicate of the first image to help close the gap between the last and first segments.
+- **Downscale inputs to ~1500px on the longest side** before passing to `cv2.Stitcher`. Full-resolution iPhone photos (~12MP) often cause `CAMERA_PARAMS_ADJUST_FAIL` because bundle adjustment struggles with so much data and feature matching becomes ambiguous at high resolutions.
+- **Do NOT chain 2D homographies as a fallback for rotational 360° captures.** Each homography assumes a planar scene; chaining them through a 360° rotation accumulates error exponentially (we saw canvases explode to 172363×196330 px). Use **cylindrical projection** instead: project each image onto a cylinder using estimated focal length, then align adjacent frames with translation only. Errors compose additively, not multiplicatively. See `_cylindrical_stitch` in `backend/services/stitcher.py`.
 
 ## Conventions
 - Backend uses `uvicorn` with `--host 0.0.0.0`
