@@ -1,34 +1,74 @@
+"""Local-disk object storage used when R2 credentials are not configured."""
+
+from __future__ import annotations
+
 from pathlib import Path
 
-STORAGE_ROOT = Path("./storage")
-UPLOADS_DIR = STORAGE_ROOT / "uploads"
-PANORAMAS_DIR = STORAGE_ROOT / "panoramas"
 
+class LocalStorage:
+    name = "local"
 
-def ensure_dirs():
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    PANORAMAS_DIR.mkdir(parents=True, exist_ok=True)
+    def __init__(self, root: Path):
+        self.root = root
 
+    def ensure_ready(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
 
-def get_project_upload_dir(project_id: str) -> Path:
-    d = UPLOADS_DIR / project_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    def _path(self, key: str) -> Path:
+        relative = Path(key)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"Invalid storage key: {key}")
+        return self.root / relative
 
+    def put_bytes(self, key: str, data: bytes, content_type: str) -> None:
+        del content_type
+        path = self._path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
 
-def save_upload(project_id: str, filename: str, data: bytes) -> Path:
-    d = get_project_upload_dir(project_id)
-    path = d / filename
-    path.write_bytes(data)
-    return path
+    def put_file(self, key: str, path: Path, content_type: str) -> None:
+        self.put_bytes(key, path.read_bytes(), content_type)
 
+    def get_bytes(self, key: str) -> bytes:
+        path = self._path(key)
+        if not path.is_file():
+            raise FileNotFoundError(key)
+        return path.read_bytes()
 
-def get_panorama_path(project_id: str) -> Path:
-    return PANORAMAS_DIR / f"{project_id}.jpg"
+    def exists(self, key: str) -> bool:
+        return self._path(key).is_file()
 
+    def delete_prefix(self, prefix: str) -> None:
+        root = self._path(prefix)
+        if root.is_file():
+            root.unlink()
+            return
+        if not root.exists():
+            return
+        for path in sorted(root.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+        if root.is_dir():
+            root.rmdir()
 
-def get_upload_images(project_id: str) -> list[Path]:
-    d = UPLOADS_DIR / project_id
-    if not d.exists():
-        return []
-    return sorted(d.glob("*.jpg")) + sorted(d.glob("*.jpeg")) + sorted(d.glob("*.png"))
+    def list_keys(self, prefix: str) -> list[str]:
+        root = self._path(prefix)
+        if not root.exists():
+            return []
+        if root.is_file():
+            return [prefix]
+        keys = []
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                keys.append(path.relative_to(self.root).as_posix())
+        return keys
+
+    def presign_get(self, key: str, expires: int = 3600) -> str | None:
+        del key, expires
+        return None
+
+    def materialize(self, key: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self.get_bytes(key))

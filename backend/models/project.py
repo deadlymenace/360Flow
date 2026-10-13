@@ -1,7 +1,6 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Optional
-from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -19,25 +18,37 @@ class ProjectStatus(str, Enum):
 
 
 class Project(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid4()))
+    id: str
     name: str
-    status: ProjectStatus = ProjectStatus.CREATED
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    status: ProjectStatus
+    created_at: datetime
     image_count: int = 0
     panorama_path: Optional[str] = None
     error: Optional[str] = None
     staging_prompt: Optional[str] = None
-    staging_started_at: Optional[datetime] = None
-    gen3d_started_at: Optional[datetime] = None
+    share_token: str
+    share_url: Optional[str] = None
+    has_original: bool = False
+    has_staged: bool = False
+    staging_provider: Optional[str] = None
+    world_provider: Optional[str] = None
+    world_viewer_url: Optional[str] = None
+    world_marble_url: Optional[str] = None
+    world_thumbnail_url: Optional[str] = None
+    world_splat_url: Optional[str] = None
+    world_mesh_url: Optional[str] = None
+    disclosure: Optional[str] = None
 
 
 class CreateProjectRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=120)
 
 
 class StageRequest(BaseModel):
-    prompt: str
+    prompt: str = Field(min_length=1, max_length=2000)
 
 
-# In-memory project store
-projects_db: dict[str, Project] = {}
+class UploadMetadata(BaseModel):
+    hfov_deg: Optional[float] = None
+    yaws_deg: Optional[list[float]] = None
+    lens: Optional[str] = Field(default=None, max_length=64)
