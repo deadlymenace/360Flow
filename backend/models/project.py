@@ -30,8 +30,10 @@ class Project(BaseModel):
     share_token: str
     share_url: Optional[str] = None
     share_expires_at: Optional[datetime] = None
+    preview_url: Optional[str] = None
     has_original: bool = False
     has_staged: bool = False
+    staged_published: bool = False
     staging_provider: Optional[str] = None
     world_provider: Optional[str] = None
     world_viewer_url: Optional[str] = None

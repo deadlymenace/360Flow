@@ -11,8 +11,10 @@ export interface Project {
   staging_prompt: string | null;
   share_token: string;
   share_url: string | null;
+  preview_url: string | null;
   has_original: boolean;
   has_staged: boolean;
+  staged_published: boolean;
   staging_provider: string | null;
   world_provider: string | null;
   world_viewer_url: string | null;

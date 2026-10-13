@@ -95,6 +95,8 @@ def test_share_token_can_be_rotated(client):
     created = client.post("/api/v1/projects", json={"name": "Rotate me"}).json()
     rotated = client.post(f"/api/v1/projects/{created['id']}/share/rotate").json()
     assert rotated["share_token"] != created["share_token"]
+    assert rotated["preview_url"] == created["preview_url"]
+    assert created["preview_url"]
     from db import get_by_share_token
 
     assert get_by_share_token(created["share_token"]) is None
@@ -119,6 +121,9 @@ def test_docs_are_disabled(client):
 
 def test_share_pages_send_security_headers(client, monkeypatch):
     response = client.raw.get("/v/missing-token")
+    preview_missing = client.raw.get("/p/missing-token")
+    assert preview_missing.headers["x-robots-tag"] == "noindex"
+    assert "frame-ancestors 'none'" in preview_missing.headers["content-security-policy"]
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["x-robots-tag"] == "noindex"

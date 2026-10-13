@@ -189,7 +189,7 @@ class GuardMiddleware:
                 if allowed and origin:
                     extra.append((b"access-control-allow-origin", origin.encode()))
                     extra.append((b"vary", b"Origin"))
-                if path.startswith("/v/"):
+                if path.startswith("/v/") or path.startswith("/p/"):
                     extra.extend(
                         share_security_headers(scope.get("query_string") or b"", settings.embed_frame_ancestors)
                     )

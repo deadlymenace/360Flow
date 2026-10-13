@@ -60,6 +60,8 @@ def test_sqlite_migration_adds_share_expiry_as_timestamp():
         conn.execute(text(_OLD_PROJECTS))
     _migrate_like_startup(engine)
     _assert_share_expiry_roundtrip(engine)
+    indexes = {index["name"] for index in inspect(engine).get_indexes("projects")}
+    assert "projects_preview_token" in indexes
     engine.dispose()
 
 
@@ -87,6 +89,8 @@ def test_postgres_migration_adds_every_column():
     assert {"devices", "daily_usage", "pending_world_deletes", "jobs"} <= table_names
     index_names = {index["name"] for index in inspect(engine).get_indexes("jobs")}
     assert "jobs_one_open_per_project" in index_names
+    project_indexes = {index["name"] for index in inspect(engine).get_indexes("projects")}
+    assert "projects_preview_token" in project_indexes
     with engine.begin() as conn:
         locked = conn.execute(text("SELECT pg_try_advisory_lock(360360160)")).scalar()
         assert locked is True

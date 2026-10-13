@@ -15,7 +15,7 @@ import { WebView } from 'react-native-webview';
 import * as Sharing from 'expo-sharing';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList, ViewerMode } from '../navigation';
-import { api, getApiOrigin } from '../services/api';
+import { api } from '../services/api';
 import { DISCLOSURE_TEXT, Project, STAGING_PRESETS } from '../models/types';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Panorama'>;
@@ -63,7 +63,8 @@ export default function PanoramaScreen({ navigation, route }: Props) {
   }, [projectId]);
 
   const shareUrl = project?.share_url;
-  const viewerUrl = shareUrl ? `${shareUrl}?view=${mode}&embed=1` : null;
+  const viewerBase = project?.preview_url || shareUrl;
+  const viewerUrl = viewerBase ? `${viewerBase}?view=${mode}&embed=1` : null;
   const showDisclosure = Boolean(project?.has_staged) && mode !== 'original';
   const buildingWorld =
     project?.active_job === 'world' ||
@@ -96,7 +97,13 @@ export default function PanoramaScreen({ navigation, route }: Props) {
       previousStaging.current = 'staging';
       setProject((current) =>
         current
-          ? { ...current, staging_status: 'staging', staging_error: null, staging_prompt: text }
+          ? {
+              ...current,
+              staging_status: 'staging',
+              staging_error: null,
+              staging_prompt: text,
+              staged_published: false,
+            }
           : current,
       );
     } catch (err) {
@@ -147,10 +154,28 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     await Share.share({ message: shareUrl, url: shareUrl });
   };
 
-  const handleExportStaged = async () => {
-    if (!project?.share_token) return;
+  const handlePublishToggle = async () => {
+    if (!project) return;
+    setSubmitting(true);
     try {
-      const url = `${getApiOrigin()}/v/${project.share_token}/staged.jpg?download=1`;
+      const updated = project.staged_published
+        ? await api.unpublishStaged(projectId)
+        : await api.publishStaged(projectId);
+      setProject(updated);
+    } catch (err) {
+      Alert.alert(
+        project.staged_published ? 'Could not unpublish' : 'Could not publish',
+        err instanceof Error ? err.message : 'Try again',
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleExportStaged = async () => {
+    if (!project?.preview_url) return;
+    try {
+      const url = `${project.preview_url}/staged.jpg?download=1`;
       const uri = await api.downloadToCache(url, `virtually-staged-${projectId}.jpg`);
       if (await Sharing.isAvailableAsync()) {
         await Sharing.shareAsync(uri, { mimeType: 'image/jpeg', UTI: 'public.jpeg' });
@@ -271,6 +296,26 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             <Text style={styles.link}>Retry</Text>
           </TouchableOpacity>
         )}
+        {project?.has_staged && !project.staged_published && (
+          <>
+            <Text style={styles.hint}>The share link shows the original panorama and 3D until you publish.</Text>
+            <TouchableOpacity
+              style={[styles.primary, (submitting || project.staging_status === 'staging') && styles.disabled]}
+              disabled={submitting || project.staging_status === 'staging'}
+              onPress={handlePublishToggle}
+            >
+              <Text style={styles.primaryText}>Publish staged view</Text>
+            </TouchableOpacity>
+          </>
+        )}
+        {project?.has_staged && project.staged_published && (
+          <TouchableOpacity
+            onPress={handlePublishToggle}
+            disabled={submitting || project.staging_status === 'staging'}
+          >
+            <Text style={styles.link}>Unpublish staged view</Text>
+          </TouchableOpacity>
+        )}
         {project?.has_staged && (
           <TouchableOpacity onPress={handleExportStaged}>
             <Text style={styles.link}>Export staged image</Text>
@@ -310,6 +355,7 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             <Text style={styles.modalBody}>
               Adds furniture and decor only. Walls, windows, floors, and fixtures stay as captured.
               The result is labeled {DISCLOSURE_TEXT} and can be compared with the original.
+              It stays private until you tap Publish staged view.
             </Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.presets}>
               {STAGING_PRESETS.map((preset) => (
@@ -418,6 +464,7 @@ const styles = StyleSheet.create({
   },
   secondaryText: { color: '#fff', fontWeight: '600' },
   link: { color: '#ffe08a', textAlign: 'center', fontWeight: '600' },
+  hint: { color: '#c9c6e2', textAlign: 'center', fontSize: 13 },
   deleteLink: { color: '#F44336', textAlign: 'center', fontWeight: '700' },
   disabled: { opacity: 0.4 },
   centered: { flex: 1, backgroundColor: '#1a1a2e', justifyContent: 'center', alignItems: 'center', padding: 24 },

@@ -204,6 +204,7 @@ async def upload_images(
             "staging_notes": None,
             "staging_status": None,
             "staging_error": None,
+            "staged_published": 0,
         },
         replace_delayed=True,
         retire_worlds="all",
@@ -289,6 +290,28 @@ async def get_staged(project_id: str, request: Request, download: bool = Query(d
     return labeled_jpeg(data, f"{project_id}-staged.jpg", download)
 
 
+@router.post("/projects/{project_id}/staged/publish")
+async def publish_staged(project_id: str, request: Request) -> Project:
+    """Let the public share page show the staged panorama and staged 3D."""
+    project = _require(project_id, request)
+    if not project.staged_key:
+        raise HTTPException(status_code=400, detail="No staged image to publish")
+    updated = update_project(project_id, staged_published=1)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return to_project(updated)
+
+
+@router.post("/projects/{project_id}/staged/unpublish")
+async def unpublish_staged(project_id: str, request: Request) -> Project:
+    """Hide the staged view from the public share page again."""
+    _require(project_id, request)
+    updated = update_project(project_id, staged_published=0)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return to_project(updated)
+
+
 @router.post("/projects/{project_id}/stage")
 async def stage_project(project_id: str, req: StageRequest, request: Request):
     project = _require(project_id, request)
@@ -302,7 +325,7 @@ async def stage_project(project_id: str, req: StageRequest, request: Request):
     outcome, _job_id = await enqueue_job(
         project_id,
         "stage",
-        project_fields={"staging_prompt": req.prompt},
+        project_fields={"staging_prompt": req.prompt, "staged_published": 0},
     )
     _raise_for_enqueue(outcome, "stage")
     latest = get_project(project_id)
@@ -357,7 +380,9 @@ async def get_generate_3d_status(project_id: str, request: Request):
     provider = project.world_provider
     if provider is None:
         provider = "worldlabs" if get_settings().worldlabs_api_key else "worldlabs_mock"
-    share = to_project(project).share_url or ""
+    body = to_project(project)
+    share = body.share_url or ""
+    private = body.preview_url or share
     assets = None
     if project.panorama_key and (project.world_provider or project.world_marble_url or project.world_preview_url):
         assets = {
@@ -371,7 +396,7 @@ async def get_generate_3d_status(project_id: str, request: Request):
     staged_assets = None
     if project.staged_key and (project.staged_world_provider or project.staged_world_marble_url):
         staged_assets = {
-            "viewer_url": f"{share}/world?source=staged",
+            "viewer_url": f"{private}/world?source=staged",
             "marble_url": project.staged_world_marble_url,
             "preview_url": project.staged_world_preview_url,
             "splat_url": project.staged_world_splat_url,

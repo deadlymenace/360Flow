@@ -79,6 +79,9 @@ class ProjectRow(Base):
     staging_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     active_job: Mapped[str | None] = mapped_column(String(32), nullable=True)
     provider_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Null and 0 both mean the staged view is private. 1 means the owner published it.
+    staged_published: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    preview_token: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
 
 
 class JobRow(Base):
@@ -148,6 +151,8 @@ _EXTRA_COLUMNS = {
     "staged_world_preview_id": "VARCHAR(64)",
     "share_expires_at": "TIMESTAMP",
     "provider_error": "TEXT",
+    "staged_published": "INTEGER",
+    "preview_token": "VARCHAR(64)",
 }
 
 _JOB_EXTRA_COLUMNS = {
@@ -198,6 +203,8 @@ class ProjectRecord:
     staging_error: str | None
     active_job: str | None
     provider_error: str | None
+    staged_published: bool
+    preview_token: str | None
 
 
 @dataclass
@@ -242,6 +249,18 @@ def _ensure_columns(engine) -> None:
         for name, ddl in _EXTRA_COLUMNS.items():
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE projects ADD COLUMN {name} {ddl}"))
+        missing = conn.execute(text("SELECT id FROM projects WHERE preview_token IS NULL")).fetchall()
+        for (project_id,) in missing:
+            conn.execute(
+                text("UPDATE projects SET preview_token = :token WHERE id = :id"),
+                {"token": secrets.token_urlsafe(16), "id": project_id},
+            )
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS projects_preview_token "
+                "ON projects (preview_token)"
+            )
+        )
 
 
 def _ensure_job_schema(engine) -> None:
@@ -332,6 +351,8 @@ def _record(row: ProjectRow) -> ProjectRecord:
         staging_error=row.staging_error,
         active_job=row.active_job,
         provider_error=row.provider_error,
+        staged_published=bool(row.staged_published),
+        preview_token=row.preview_token,
     )
 
 
@@ -402,6 +423,8 @@ def create_project(name: str, owner_device_id: str | None = None) -> ProjectReco
         share_token=secrets.token_urlsafe(16),
         share_expires_at=share_deadline(now),
         owner_device_id=owner_device_id,
+        preview_token=secrets.token_urlsafe(16),
+        staged_published=0,
     )
     with session_scope() as session:
         session.add(row)
@@ -578,6 +601,15 @@ def get_by_share_token(token: str) -> ProjectRecord | None:
         if row is None or _share_expired(row.share_expires_at):
             return None
         return _record(row)
+
+
+def get_by_preview_token(token: str) -> ProjectRecord | None:
+    """Owner preview. This token does not expire with the public share link."""
+    if not token:
+        return None
+    with session_scope() as session:
+        row = session.scalar(select(ProjectRow).where(ProjectRow.preview_token == token))
+        return _record(row) if row else None
 
 
 def daily_quota_available(device_id: str | None, kind: str, limit: int) -> bool:
