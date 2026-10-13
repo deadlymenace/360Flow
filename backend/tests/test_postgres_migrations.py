@@ -74,6 +74,7 @@ def test_postgres_migration_adds_every_column():
         conn.execute(text("DROP TABLE IF EXISTS pending_world_deletes"))
         conn.execute(text("DROP TABLE IF EXISTS daily_usage"))
         conn.execute(text("DROP TABLE IF EXISTS devices"))
+        conn.execute(text("DROP TABLE IF EXISTS jobs"))
         conn.execute(text("DROP TABLE IF EXISTS projects"))
         conn.execute(text(_OLD_PROJECTS))
     _migrate_like_startup(engine)
@@ -83,7 +84,7 @@ def test_postgres_migration_adds_every_column():
     assert data_type.startswith("timestamp"), data_type
     _assert_share_expiry_roundtrip(engine)
     table_names = set(inspect(engine).get_table_names())
-    assert {"devices", "daily_usage", "pending_world_deletes"} <= table_names
+    assert {"devices", "daily_usage", "pending_world_deletes", "jobs"} <= table_names
     engine.dispose()
 
 

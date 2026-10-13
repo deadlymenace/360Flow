@@ -517,8 +517,50 @@ def _fill_poles(composed: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """
     filled = composed.copy()
     _inpaint_pole_cap(filled, valid, zenith=True)
-    _inpaint_pole_cap(filled, valid, zenith=False)
+    _fill_nadir(filled, valid)
     return _inpaint_remaining_holes(filled, valid)
+
+
+def _fill_nadir(image: np.ndarray, valid: np.ndarray) -> None:
+    """Fill the unseen floor without blending over the photographed rows.
+
+    A wide inpaint feather mixes the cap into the last real floor rows and
+    reads as a blurry band. Those rows stay untouched. The hole takes the
+    color of the floor edge at each longitude, then eases to that edge's
+    average toward the pole so the cap is even instead of a stretched smear.
+    """
+    height, width = image.shape[:2]
+    covered = np.where(valid.mean(axis=1) > 0.2)[0]
+    if len(covered) == 0:
+        return
+    boundary = int(covered[-1])
+    if boundary >= height - 2:
+        return
+    ring_start = max(0, boundary - 4)
+    ring_valid = valid[ring_start : boundary + 1]
+    if not bool(ring_valid.any()):
+        return
+    ring_h = ring_valid.shape[0]
+    row_index = np.where(ring_valid, np.arange(ring_h)[:, None], -1).max(axis=0)
+    known = row_index >= 0
+    if not bool(known.any()):
+        return
+    edge = np.zeros((width, 3), dtype=np.float32)
+    cols = np.flatnonzero(known)
+    edge[cols] = image[ring_start + row_index[cols], cols]
+    unknown = np.flatnonzero(~known)
+    if len(unknown):
+        delta = np.abs(unknown[:, None] - cols[None, :])
+        delta = np.minimum(delta, width - delta)
+        edge[unknown] = edge[cols[delta.argmin(axis=1)]]
+    mean = edge.mean(axis=0)
+    start = boundary + 1
+    span = height - start
+    offsets = np.arange(span, dtype=np.float32)
+    ease = float(min(6, span))
+    blend = np.clip(offsets / ease, 0.0, 1.0)[:, None, None]
+    colors = edge[None, :, :] * (1.0 - blend) + mean.reshape(1, 1, 3) * blend
+    image[start:] = colors
 
 
 def _inpaint_pole_cap(image: np.ndarray, valid: np.ndarray, *, zenith: bool) -> None:

@@ -91,6 +91,7 @@ class Settings:
     worldlabs_model: str
     worldlabs_draft_model: str | None
     worldlabs_public: bool
+    worker_concurrency: int
     stitch_concurrency: int
     jobs_inline: bool
     mock_stage_delay: float
@@ -183,6 +184,7 @@ def get_settings() -> Settings:
         worldlabs_model=_blank("WORLDLABS_MODEL") or "marble-1.1",
         worldlabs_draft_model=draft_model,
         worldlabs_public=_bool("WORLDLABS_PUBLIC", False),
+        worker_concurrency=max(1, _int("WORKER_CONCURRENCY", 3)),
         stitch_concurrency=max(1, _int("STITCH_CONCURRENCY", 1)),
         jobs_inline=_bool("JOBS_INLINE", False),
         mock_stage_delay=_float("MOCK_STAGE_DELAY", 3),

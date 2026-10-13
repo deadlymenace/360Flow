@@ -316,6 +316,16 @@ def test_gemini_http_error_fails_the_job(client, monkeypatch):
     assert body["error"] == "Staging failed. Try again."
     assert "test-key" not in body["error"]
     assert "API key not valid" not in body["error"]
+    assert "provider_error" not in body
+    project = client.get(f"/api/v1/projects/{project_id}").json()
+    assert project["provider_error"] is None
+    monkeypatch.setenv("API_KEY", "secret-key")
+    admin = client.raw.get(
+        f"/api/v1/projects/{project_id}",
+        headers={"X-API-Key": "secret-key"},
+    ).json()
+    assert admin["provider_error"] == "HTTP 401: API key not valid"
+    assert "test-key" not in admin["provider_error"]
     project = client.get(f"/api/v1/projects/{project_id}").json()
     assert project["status"] == "complete"
     assert project["has_original"] is True

@@ -47,6 +47,7 @@ class Project(BaseModel):
     staging_error: Optional[str] = None
     active_job: Optional[str] = None
     disclosure: Optional[str] = None
+    provider_error: Optional[str] = None
 
 
 class CreateProjectRequest(BaseModel):

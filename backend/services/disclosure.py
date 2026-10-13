@@ -17,21 +17,30 @@ _BAR_COLOR = (46, 26, 26)
 _TEXT_COLOR = (170, 236, 255)
 
 
-def build_staging_prompt(user_prompt: str, *, perspective: bool = False) -> str:
+def build_staging_prompt(user_prompt: str, *, perspective: bool = False, yaw_deg: float | None = None) -> str:
     """Fixed preservation instructions, then the user's style and furniture only.
 
     Gemini cannot guarantee it will obey this. Callers must treat the result as
-    best effort and keep the unstaged original. Perspective views share one
-    furniture list so the five crops of a panorama stay consistent.
+    best effort and keep the unstaged original. Each perspective view names its
+    yaw so furniture is placed in that camera's perspective, on empty floor,
+    without overlapping furniture that is already in the room.
     """
     style = " ".join(user_prompt.split())
     if perspective:
+        facing = f" This camera faces yaw {yaw_deg:.0f} degrees." if yaw_deg is not None else ""
         opening = (
             "Edit this perspective photograph. It is one view of a real room that was "
-            "captured as a 360° panorama. Other views of the same room use this exact furniture list."
+            "captured as a 360° panorama."
+            + facing
+            + " Other views of the same room must show this exact furniture in the same places."
         )
         closing = (
-            "Keep the added furniture consistent with that list. Do not change the camera angle. "
+            "Place every new piece on the floor plane in this camera's perspective. "
+            "Match the room's vanishing lines, scale, and contact shadows. "
+            "Do not overlap existing furniture, beds, tables, or rugs, and do not overlap the pieces you add. "
+            "If a bed or sofa is already in the room, leave it and use empty floor instead. "
+            "Do not float furniture, duplicate a bed, or push a piece through a wall. "
+            "Do not change the camera angle. "
             "Output one photorealistic photograph of this same view. No people, no text, no watermarks."
         )
     else:

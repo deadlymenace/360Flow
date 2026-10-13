@@ -16,7 +16,7 @@ from models.project import CreateProjectRequest, Project, StageRequest, UploadMe
 from routers.responses import jpeg_response, labeled_jpeg, status_body, to_project
 from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
-from services.pipeline import enqueue, run_stage, run_stitch, run_world
+from services.pipeline import enqueue_job
 from services.uploads import normalize_upload
 from services.world_gen import delete_worlds
 from storage import delete_project_assets, get_storage, panorama_key, staged_key, upload_key
@@ -116,12 +116,13 @@ async def create_project(req: CreateProjectRequest, request: Request) -> Project
 async def list_projects(request: Request) -> list[Project]:
     caller = _caller(request)
     rows = list_project_rows(owner_device_id=caller.device_id, admin=caller.is_admin)
-    return [to_project(row) for row in rows]
+    return [to_project(row, admin=caller.is_admin) for row in rows]
 
 
 @router.get("/projects/{project_id}")
 async def get_one(project_id: str, request: Request) -> Project:
-    return to_project(_require(project_id, request))
+    caller = _caller(request)
+    return to_project(_require(project_id, request), admin=caller.is_admin)
 
 
 @router.delete("/projects/{project_id}", status_code=204)
@@ -217,7 +218,7 @@ async def upload_images(
         active_job="stitch",
     )
     logger.info("Project %s: stored %d images", project_id, count)
-    await enqueue(run_stitch(project_id))
+    await enqueue_job(project_id, "stitch")
     latest = get_project(project_id)
     return {"status": latest.status if latest else "stitching", "image_count": count}
 
@@ -236,17 +237,17 @@ async def retry_project(project_id: str, request: Request):
     uploads = storage.list_keys(f"uploads/{project_id}/")
     job = project.active_job
     if job == "stage":
-        await enqueue(run_stage(project_id))
+        await enqueue_job(project_id, "stage")
         return {"status": "staging"}
     if job == "staged_world":
-        await enqueue(run_world(project_id, source="staged"))
+        await enqueue_job(project_id, "staged_world")
         return {"status": "generating_3d"}
     if job == "world":
-        await enqueue(run_world(project_id, source="original"))
+        await enqueue_job(project_id, "world")
         return {"status": "generating_3d"}
     if not uploads:
         raise HTTPException(status_code=400, detail="No uploaded images to retry")
-    await enqueue(run_stitch(project_id))
+    await enqueue_job(project_id, "stitch")
     return {"status": "stitching"}
 
 
@@ -279,7 +280,7 @@ async def stage_project(project_id: str, req: StageRequest, request: Request):
     if project.staging_status == "staging" and not get_settings().jobs_inline:
         raise HTTPException(status_code=409, detail="This project is already processing")
     update_project(project_id, staging_prompt=req.prompt, staging_status="staging", staging_error=None)
-    await enqueue(run_stage(project_id))
+    await enqueue_job(project_id, "stage")
     latest = get_project(project_id)
     return {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
 
@@ -319,7 +320,7 @@ async def generate_3d(project_id: str, request: Request, source: str = Query(def
     if world_quota_blocks(project.owner_device_id):
         raise HTTPException(status_code=429, detail=WORLD_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
-    await enqueue(run_world(project_id, source=source))
+    await enqueue_job(project_id, "staged_world" if source == "staged" else "world")
     latest = get_project(project_id)
     return {"status": latest.status if latest else "generating_3d"}
 

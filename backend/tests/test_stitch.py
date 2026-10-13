@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import pytest
 
-from services.stitcher import render_perspective, stitch_images
+from services.stitcher import _fill_poles, render_perspective, stitch_images
 
 HFOV = 70.0
 SEGMENT_COUNT = 16
@@ -154,6 +154,26 @@ def test_synthetic_loop_is_two_to_one(tmp_path: Path):
         destination = Path(artifact_dir)
         destination.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(destination / "synthetic-equirect.jpg"), panorama, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+
+def test_nadir_fill_leaves_the_photographed_floor_sharp():
+    """The bottom cap fills unseen rows and does not smear the real floor."""
+    height, width = 180, 360
+    image = np.zeros((height, width, 3), dtype=np.float32)
+    valid = np.zeros((height, width), dtype=bool)
+    checker = ((np.arange(width) // 4) % 2) * 200 + 20
+    image[30:121, :, 1] = checker
+    image[30:121, :, 0] = 40
+    image[30:121, :, 2] = 90
+    valid[30:121] = True
+    before = image[100].copy()
+
+    filled = _fill_poles(image, valid)
+
+    assert np.allclose(filled[100], before), "photographed floor was blended into the cap"
+    assert float(np.std(filled[100, :, 1])) > 80
+    assert float(filled[-4:].mean()) > 20, "nadir cap is black"
+    assert float(np.std(filled[-1, :, 1])) < 5, "nadir pole is a stretched smear"
 
 
 def test_refinement_still_closes_the_loop(tmp_path: Path):

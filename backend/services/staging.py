@@ -32,11 +32,16 @@ QUOTA_MESSAGE = "AI staging is unavailable right now (provider quota)"
 
 
 class StagingProviderError(Exception):
-    """Staging failure whose message is safe to show to the client."""
+    """Staging failure whose message is safe to show to the client.
 
-    def __init__(self, client_message: str) -> None:
+    ``detail`` is the provider status and message. It is stored for operators
+    and is not returned to the device.
+    """
+
+    def __init__(self, client_message: str, detail: str | None = None) -> None:
         super().__init__(client_message)
         self.client_message = client_message
+        self.detail = detail
 
 
 def gemini_client_message(status_code: int, body: object) -> str | None:
@@ -112,7 +117,6 @@ async def stage_image(image_bytes: bytes, user_prompt: str) -> tuple[bytes, str,
     settings = get_settings()
     equirect = fit_equirect(decode_image(image_bytes))
     views = split_views(equirect)
-    prompt = build_staging_prompt(user_prompt, perspective=True)
     provider = "gemini" if settings.gemini_api_key else "gemini_mock"
     if provider == "gemini_mock":
         await mock_stage("memory", user_prompt)
@@ -120,6 +124,7 @@ async def stage_image(image_bytes: bytes, user_prompt: str) -> tuple[bytes, str,
     edited: list[PerspectiveView] = []
     notes: list[str] = []
     for view in views:
+        prompt = build_staging_prompt(user_prompt, perspective=True, yaw_deg=view.yaw_deg)
         image, note = await _edit_view(view, prompt, settings)
         edited.append(PerspectiveView(view.yaw_deg, view.hfov_deg, image))
         if note:
@@ -172,12 +177,11 @@ async def _gemini_edit(api_key: str, model: str, prompt: str, image_bgr: np.ndar
         )
     if response.status_code >= 400:
         body = _response_body(response)
-        detail = _gemini_error_message(body)
-        logger.error("Gemini staging request failed (%s): %s", response.status_code, detail)
-        client_message = gemini_client_message(response.status_code, body)
-        if client_message:
-            raise StagingProviderError(client_message)
-        raise RuntimeError(f"Gemini rejected the staging request ({response.status_code}): {detail}")
+        message = _gemini_error_message(body)
+        detail = f"HTTP {response.status_code}: {message}"
+        logger.error("Gemini staging request failed: %s", detail)
+        client_message = gemini_client_message(response.status_code, body) or "Staging failed. Try again."
+        raise StagingProviderError(client_message, detail)
     return extract_gemini_image(response.json())
 
 

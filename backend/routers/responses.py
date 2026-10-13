@@ -35,7 +35,7 @@ def share_url(token: str, request: Request | None = None) -> str | None:
     return f"{base.rstrip('/')}/v/{token}"
 
 
-def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
+def to_project(row: ProjectRecord, request: Request | None = None, *, admin: bool = False) -> Project:
     share = share_url(row.share_token, request)
     staged = bool(row.staged_key)
     return Project(
@@ -68,6 +68,7 @@ def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
         staging_error=row.staging_error,
         active_job=row.active_job,
         disclosure=DISCLOSURE_TEXT if staged else None,
+        provider_error=row.provider_error if admin else None,
     )
 
 

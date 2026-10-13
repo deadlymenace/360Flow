@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from config import get_settings
 from db import fail_interrupted_jobs, init_db
+from services.pipeline import resume_durable_jobs
 from httpguard import GuardMiddleware
 from routers.devices import router as devices_router
 from routers.projects import router as projects_router
@@ -22,6 +23,9 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     init_db(settings)
     init_storage(settings)
+    resumed = await resume_durable_jobs()
+    if resumed:
+        logging.getLogger(__name__).warning("Resumed %d durable jobs", resumed)
     interrupted = fail_interrupted_jobs()
     if interrupted:
         logging.getLogger(__name__).warning("Marked %d interrupted jobs as failed", interrupted)

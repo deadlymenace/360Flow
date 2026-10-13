@@ -3,7 +3,15 @@ import numpy as np
 
 from services.disclosure import DISCLOSURE_TEXT, apply_disclosure_label, build_staging_prompt
 from services.staging import QUOTA_MESSAGE, build_gemini_request, gemini_client_message
-from services.world_gen import FULL_WORLD_TIMEOUT_S, build_world_request, generation_models
+from services.world_gen import (
+    FULL_WORLD_TIMEOUT_S,
+    WORLD_CREDITS_MESSAGE,
+    WORLD_FAILED_MESSAGE,
+    WORLD_PROVIDER_QUOTA_MESSAGE,
+    build_world_request,
+    generation_models,
+    world_client_message,
+)
 
 
 def _has_disclosure_bar(image: np.ndarray) -> bool:
@@ -41,6 +49,18 @@ def test_perspective_prompt_still_preserves_architecture():
     assert "one view of a real room" in prompt
 
 
+def test_perspective_prompt_places_furniture_without_overlap():
+    prompt = build_staging_prompt("a linen sofa", perspective=True, yaw_deg=72)
+    lowered = prompt.lower()
+    assert "yaw 72" in lowered
+    assert "floor plane" in lowered
+    assert "vanishing" in lowered
+    assert "do not overlap existing furniture" in lowered
+    assert "bed" in lowered
+    assert "same places" in lowered
+    assert prompt.index("PRESERVE EXACTLY") < prompt.index("a linen sofa")
+
+
 def test_gemini_request_matches_generate_content():
     body = build_gemini_request("add a sofa", b"jpeg-bytes", "1K")
     parts = body["contents"][0]["parts"]
@@ -63,6 +83,16 @@ def test_gemini_quota_errors_use_a_client_message():
     assert gemini_client_message(403, {"error": {"message": "Your quota has been exceeded"}}) == QUOTA_MESSAGE
     assert gemini_client_message(401, {"error": {"message": "API key not valid"}}) is None
     assert "quota" in QUOTA_MESSAGE
+
+
+def test_world_provider_errors_map_credits_and_quota():
+    assert world_client_message(402, "") == WORLD_CREDITS_MESSAGE
+    assert world_client_message(400, "The account is out of credits") == WORLD_CREDITS_MESSAGE
+    assert world_client_message(429, "slow down") == WORLD_PROVIDER_QUOTA_MESSAGE
+    assert world_client_message(403, "quota exceeded for this project") == WORLD_PROVIDER_QUOTA_MESSAGE
+    assert world_client_message(500, "internal error") == WORLD_FAILED_MESSAGE
+    assert "HTTP" not in WORLD_CREDITS_MESSAGE
+    assert "HTTP" not in WORLD_PROVIDER_QUOTA_MESSAGE
 
 
 def test_full_world_poll_allows_at_least_fifteen_minutes():

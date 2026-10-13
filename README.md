@@ -168,7 +168,8 @@ Backend (`backend/.env.example`):
 | `WORLDLABS_DRAFT_MODEL` | Default `marble-1.0-draft`. `off` skips the fast preview |
 | `WORLDLABS_MODEL` | Full world. Default `marble-1.1` |
 | `WORLDLABS_PUBLIC` | Default `false`. Worlds are private |
-| `STITCH_CONCURRENCY` | Stitch and generation jobs at once |
+| `WORKER_CONCURRENCY` | Stitch, staging, and world jobs at once. Default 3 |
+| `STITCH_CONCURRENCY` | CPU threads for panorama stitching. Default 1 |
 | `JOBS_INLINE` | Await jobs inside the request. Tests only |
 | `MOCK_STAGE_DELAY` | Seconds the mock staging waits |
 | `MOCK_WORLD_DELAY` | Seconds the mock world job waits |

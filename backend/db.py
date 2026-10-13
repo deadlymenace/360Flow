@@ -72,6 +72,23 @@ class ProjectRow(Base):
     staging_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     staging_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     active_job: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class JobRow(Base):
+    """A stitch, stage, or world job that must survive a process restart."""
+
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(String(36), index=True)
+    kind: Mapped[str] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(String(16))
+    operation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    operation_phase: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    media_asset_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class DailyUsageRow(Base):
@@ -113,6 +130,7 @@ _EXTRA_COLUMNS = {
     "owner_device_id": "VARCHAR(36)",
     "staged_world_preview_id": "VARCHAR(64)",
     "share_expires_at": "TIMESTAMP",
+    "provider_error": "TEXT",
 }
 
 
@@ -157,6 +175,18 @@ class ProjectRecord:
     staging_status: str | None
     staging_error: str | None
     active_job: str | None
+    provider_error: str | None
+
+
+@dataclass
+class JobRecord:
+    id: str
+    project_id: str
+    kind: str
+    status: str
+    operation_id: str | None
+    operation_phase: str | None
+    media_asset_id: str | None
 
 
 _engine = None
@@ -250,6 +280,19 @@ def _record(row: ProjectRow) -> ProjectRecord:
         staging_status=row.staging_status,
         staging_error=row.staging_error,
         active_job=row.active_job,
+        provider_error=row.provider_error,
+    )
+
+
+def _job_record(row: JobRow) -> JobRecord:
+    return JobRecord(
+        id=row.id,
+        project_id=row.project_id,
+        kind=row.kind,
+        status=row.status,
+        operation_id=row.operation_id,
+        operation_phase=row.operation_phase,
+        media_asset_id=row.media_asset_id,
     )
 
 
@@ -342,8 +385,80 @@ def delete_project(project_id: str) -> bool:
         row = session.get(ProjectRow, project_id)
         if row is None:
             return False
+        for job in session.scalars(select(JobRow).where(JobRow.project_id == project_id)).all():
+            session.delete(job)
         session.delete(row)
         return True
+
+
+def create_job(project_id: str, kind: str) -> JobRecord:
+    now = datetime.now(timezone.utc)
+    row = JobRow(
+        id=str(uuid4()),
+        project_id=project_id,
+        kind=kind,
+        status="pending",
+        created_at=now,
+        updated_at=now,
+    )
+    with session_scope() as session:
+        session.add(row)
+        session.flush()
+        return _job_record(row)
+
+
+def get_job(job_id: str) -> JobRecord | None:
+    with session_scope() as session:
+        row = session.get(JobRow, job_id)
+        return _job_record(row) if row else None
+
+
+def update_job(job_id: str, **fields: object) -> JobRecord | None:
+    with session_scope() as session:
+        row = session.get(JobRow, job_id)
+        if row is None:
+            return None
+        for key, value in fields.items():
+            setattr(row, key, value)
+        row.updated_at = datetime.now(timezone.utc)
+        session.flush()
+        return _job_record(row)
+
+
+def delete_job(job_id: str) -> None:
+    with session_scope() as session:
+        row = session.get(JobRow, job_id)
+        if row is not None:
+            session.delete(row)
+
+
+_JOB_PRIORITY = {"stitch": 1, "stage": 2, "world": 3, "staged_world": 4}
+
+
+def claim_resumable_jobs() -> list[JobRecord]:
+    """One unfinished job per project, preferring the furthest-along kind.
+
+    A restart can leave both a finished stitch job and the world job it
+    started. Only the later one should run.
+    """
+    with session_scope() as session:
+        rows = session.scalars(select(JobRow).where(JobRow.status.in_(("pending", "running")))).all()
+        best: dict[str, JobRow] = {}
+        for row in rows:
+            current = best.get(row.project_id)
+            if current is None or _JOB_PRIORITY.get(row.kind, 0) > _JOB_PRIORITY.get(current.kind, 0):
+                best[row.project_id] = row
+        for row in rows:
+            winner = best[row.project_id]
+            if row.id != winner.id:
+                session.delete(row)
+        return [_job_record(row) for row in best.values()]
+
+
+def resumable_project_ids() -> set[str]:
+    with session_scope() as session:
+        rows = session.scalars(select(JobRow.project_id).where(JobRow.status.in_(("pending", "running")))).all()
+        return set(rows)
 
 
 def get_by_share_token(token: str) -> ProjectRecord | None:
@@ -433,11 +548,13 @@ def update_project(project_id: str, **fields: object) -> ProjectRecord | None:
 
 
 def fail_interrupted_jobs() -> int:
-    """In-process jobs do not survive a restart. Mark them so the app can retry.
+    """Fail leftover work that has no durable job row to resume.
 
-    A staging job that was in progress fails on its own status. A finished
-    panorama and 3D world stay available.
+    Jobs recorded in the jobs table are resumed instead. A project left in a
+    transient status by an older deploy, with no job row, is still marked failed
+    so the app can retry it.
     """
+    active = resumable_project_ids()
     with session_scope() as session:
         rows = session.scalars(
             select(ProjectRow).where(
@@ -448,7 +565,11 @@ def fail_interrupted_jobs() -> int:
             )
         ).all()
         now = datetime.now(timezone.utc)
+        failed = 0
         for row in rows:
+            if row.id in active:
+                continue
+            failed += 1
             if row.status in TRANSIENT_STATUSES:
                 previous = row.status
                 row.status = "failed"
@@ -463,4 +584,4 @@ def fail_interrupted_jobs() -> int:
                 row.staging_status = "failed"
                 row.staging_error = "Staging was interrupted by a server restart. Try staging again."
             row.updated_at = now
-        return len(rows)
+        return failed
