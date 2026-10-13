@@ -43,6 +43,7 @@ from services.world_gen import (
     WORLD_DELAYED_MESSAGE,
     WORLD_DELAY_EXPIRED_MESSAGE,
     WORLD_FAILED_MESSAGE,
+    OperationInFlight,
     ProviderFailure,
     _is_out_of_credits,
     continue_full_world,
@@ -59,10 +60,19 @@ from storage import delete_project_assets, get_storage, panorama_key, staged_key
 logger = logging.getLogger(__name__)
 
 _stitch_pool: ThreadPoolExecutor | None = None
+_world_semaphore: asyncio.Semaphore | None = None
 _INTERRUPTED_WORLD = "3D generation was interrupted. Retry from the app."
 _INTERRUPTED_WORLD_DETAIL = (
     "Interrupted before a World Labs operation id was saved; not started again, to avoid a second charge."
 )
+
+
+def world_limit() -> asyncio.Semaphore:
+    """How many World Labs jobs may run at once. Separate from worker concurrency."""
+    global _world_semaphore
+    if _world_semaphore is None:
+        _world_semaphore = asyncio.Semaphore(get_settings().worldlabs_concurrency)
+    return _world_semaphore
 
 
 def stitch_executor() -> ThreadPoolExecutor:
@@ -120,7 +130,7 @@ async def enqueue_job(
     The outcome is queued, busy, quota, or missing. The job id is set when a
     row was inserted.
     """
-    outcome, job = begin_job(
+    outcome, job, retired_world_ids = begin_job(
         project_id,
         kind,
         project_fields=project_fields,
@@ -134,6 +144,8 @@ async def enqueue_job(
         if current is None or current.staging_status != "staged":
             update_project(project_id, staging_status="failed", staging_error=STAGING_QUOTA_MESSAGE, active_job=None)
     job_id = job.id if job is not None else None
+    if retired_world_ids:
+        await delete_worlds(retired_world_ids)
     if outcome == "queued" and job_id is not None and start:
         await _schedule(job_id)
     return outcome, job_id
@@ -254,10 +266,11 @@ async def run_job(job_id: str) -> None:
             follow = await run_stitch(job.project_id)
         elif job.kind == "stage":
             await run_stage(job.project_id, resume=resume)
-        elif job.kind == "world":
-            keep = await run_world(job.project_id, source="original", job_id=job_id, resume=resume) == "delayed"
-        elif job.kind == "staged_world":
-            keep = await run_world(job.project_id, source="staged", job_id=job_id, resume=resume) == "delayed"
+        elif job.kind in {"world", "staged_world"}:
+            async with world_limit():
+                source = "staged" if job.kind == "staged_world" else "original"
+                outcome = await run_world(job.project_id, source=source, job_id=job_id, resume=resume)
+                keep = outcome in {"delayed", "poll"}
         else:
             logger.error("Unknown job kind %s", job.kind)
     finally:
@@ -434,7 +447,16 @@ async def run_world(
             on_tick=on_tick,
         )
         await _store_world(project_id, result, staged_source, created_ids)
+    except OperationInFlight:
+        held = _hold_charged_operation(project_id, job_id, staged_source)
+        if held:
+            return held
+        await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
     except ProviderFailure as exc:
+        if exc.status_code == 429:
+            held = _hold_charged_operation(project_id, job_id, staged_source)
+            if held:
+                return held
         if _is_out_of_credits(exc):
             return _delay_world(project_id, job_id, exc.detail, staged_source)
         await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
@@ -484,7 +506,16 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
                 on_tick=on_tick,
             )
         await _store_world(project_id, parsed, staged_source, created_ids)
+    except OperationInFlight:
+        held = _hold_charged_operation(project_id, job.id, staged_source)
+        if held:
+            return held
+        await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
     except ProviderFailure as exc:
+        if exc.status_code == 429:
+            held = _hold_charged_operation(project_id, job.id, staged_source)
+            if held:
+                return held
         if _is_out_of_credits(exc):
             return _delay_world(project_id, job.id, exc.detail, staged_source)
         await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
@@ -580,6 +611,35 @@ async def _store_world(project_id: str, result: dict, staged_source: bool, creat
         delete_project_assets(project_id)
         return
     logger.info("Project %s %s world ready via %s", project_id, "staged" if staged_source else "original", result.get("provider"))
+
+
+def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: bool) -> str | None:
+    """Leave the job queued so the next run polls the operation World Labs already accepted."""
+    if not job_id:
+        return None
+    job = get_job(job_id)
+    if job is None or not job.operation_id:
+        return None
+    phase = job.operation_phase
+    if phase == "submitting":
+        phase = "draft"
+    if phase not in {"draft", "full"}:
+        return None
+    logger.warning(
+        "World Labs rate limited project %s; polling operation %s (%s) instead of generating again",
+        project_id,
+        job.operation_id,
+        phase,
+    )
+    update_job(job_id, status="pending", operation_id=job.operation_id, operation_phase=phase)
+    update_project(
+        project_id,
+        status="generating_3d",
+        error=None,
+        provider_error=f"HTTP 429: polling operation {job.operation_id}",
+        active_job="staged_world" if staged_source else "world",
+    )
+    return "poll"
 
 
 def _remember_operation(project_id: str, job_id: str | None, operation_id: str, phase: str, staged_source: bool) -> None:

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -46,6 +49,19 @@ class ProviderFailure(Exception):
         self.status_code = status_code
 
 
+class OperationInFlight(ProviderFailure):
+    """A worlds:generate call was accepted, then a later request was rate limited.
+
+    The operation id has already been charged. Callers poll it instead of
+    submitting worlds:generate again.
+    """
+
+    def __init__(self, operation_id: str, phase: str, detail: str) -> None:
+        super().__init__(WORLD_PROVIDER_QUOTA_MESSAGE, detail, 429)
+        self.operation_id = operation_id
+        self.phase = phase
+
+
 def world_client_message(status_code: int | None, message: str) -> str:
     """Map credit and quota failures to a specific sentence. Everything else stays generic."""
     text = (message or "").lower()
@@ -57,6 +73,67 @@ def world_client_message(status_code: int | None, message: str) -> str:
     ):
         return WORLD_PROVIDER_QUOTA_MESSAGE
     return WORLD_FAILED_MESSAGE
+
+
+def retry_wait_seconds(attempt: int, retry_after: float | None) -> float:
+    """Seconds to wait after attempt ``attempt`` (1 = the first HTTP 429).
+
+    The wait is exponential in the attempt, with full jitter. A Retry-After
+    value is a floor: the wait is never shorter than that header, and never
+    longer than ``WORLDLABS_RETRY_MAX_SECONDS``.
+    """
+    settings = get_settings()
+    cap = settings.worldlabs_retry_max_seconds
+    base = settings.worldlabs_retry_base_seconds
+    expo = min(cap, base * (2 ** max(attempt - 1, 0)))
+    jittered = random.uniform(0.0, expo) if expo > 0 else 0.0
+    if retry_after is None:
+        return jittered
+    return min(cap, max(jittered, retry_after))
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    headers = getattr(response, "headers", None) or {}
+    raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+async def _send_retrying_rate_limit(send):
+    """Call ``send`` again after HTTP 429, up to the configured attempt cap.
+
+    ``send`` must perform one HTTP request. A non-429 response is returned
+    immediately so a charged call is not repeated for any other status.
+    """
+    attempts = get_settings().worldlabs_retry_attempts
+    response = None
+    for attempt in range(1, attempts + 1):
+        response = await send()
+        if response.status_code != 429 or attempt == attempts:
+            return response
+        delay = retry_wait_seconds(attempt, _retry_after_seconds(response))
+        logger.warning(
+            "World Labs returned HTTP 429; waiting %.2fs before attempt %s of %s",
+            delay,
+            attempt + 1,
+            attempts,
+        )
+        await asyncio.sleep(delay)
+    return response
 
 
 def provider_detail(status_code: int | None, message: str) -> str:
@@ -365,6 +442,8 @@ async def _generate_models(
                 on_tick=on_tick,
             )
         except ProviderFailure as exc:
+            if isinstance(exc, OperationInFlight) or exc.status_code == 429:
+                raise
             if phase == "draft" and not _is_out_of_credits(exc):
                 logger.error("Draft world failed (%s); continuing with the full model", exc.detail)
                 continue
@@ -438,15 +517,18 @@ async def _delete_one(client: httpx.AsyncClient, headers: dict, world_id: str) -
         logger.exception("Could not delete Marble world %s", world_id)
         return False, "request failed"
     if response.status_code in {200, 204, 404}:
+        logger.info("Deleted Marble world %s", world_id)
         return True, None
     return False, f"HTTP {response.status_code}"
 
 
 async def _upload_panorama(client: httpx.AsyncClient, headers: dict, image_bytes: bytes) -> str:
-    prepared = await client.post(
-        f"{WORLDLABS_BASE}/marble/v1/media-assets:prepare_upload",
-        headers={**headers, "Content-Type": "application/json"},
-        json={"file_name": "panorama.jpg", "kind": "image", "extension": "jpg"},
+    prepared = await _send_retrying_rate_limit(
+        lambda: client.post(
+            f"{WORLDLABS_BASE}/marble/v1/media-assets:prepare_upload",
+            headers={**headers, "Content-Type": "application/json"},
+            json={"file_name": "panorama.jpg", "kind": "image", "extension": "jpg"},
+        )
     )
     _raise_for_status(prepared, "World Labs could not prepare the upload")
     payload = prepared.json()
@@ -456,7 +538,9 @@ async def _upload_panorama(client: httpx.AsyncClient, headers: dict, image_bytes
         raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs did not return an upload URL")
     put_headers = dict(upload.get("required_headers") or {})
     method = (upload.get("upload_method") or "PUT").upper()
-    uploaded = await client.request(method, upload["upload_url"], content=image_bytes, headers=put_headers)
+    uploaded = await _send_retrying_rate_limit(
+        lambda: client.request(method, upload["upload_url"], content=image_bytes, headers=put_headers)
+    )
     _raise_for_status(uploaded, "World Labs upload failed")
     return media_id
 
@@ -478,10 +562,12 @@ async def _generate_model(
     await _require_credits(model)
     if on_submitting is not None:
         await on_submitting(phase)
-    started = await client.post(
-        f"{WORLDLABS_BASE}/marble/v1/worlds:generate",
-        headers={**headers, "Content-Type": "application/json"},
-        json=body,
+    started = await _send_retrying_rate_limit(
+        lambda: client.post(
+            f"{WORLDLABS_BASE}/marble/v1/worlds:generate",
+            headers={**headers, "Content-Type": "application/json"},
+            json=body,
+        )
     )
     _raise_for_status(started, "World Labs rejected world generation")
     operation = started.json()
@@ -491,7 +577,9 @@ async def _generate_model(
     if on_operation is not None:
         await on_operation(operation_id, phase)
     clear_world_credits_cache()
-    operation = await _poll_until_done(client, headers, operation_id, timeout_s, operation, on_tick=on_tick)
+    operation = await _poll_until_done(
+        client, headers, operation_id, timeout_s, operation, on_tick=on_tick, phase=phase
+    )
     _raise_operation_error(operation)
     parsed = parse_world(operation)
     parsed["model"] = model
@@ -505,6 +593,7 @@ async def _poll_until_done(
     timeout_s: int,
     operation: dict | None = None,
     on_tick=None,
+    phase: str = "full",
 ) -> dict:
     operation = operation or {"operation_id": operation_id, "done": False}
     deadline = time.monotonic() + timeout_s
@@ -513,7 +602,12 @@ async def _poll_until_done(
             on_tick()
         if time.monotonic() > deadline:
             raise ProviderFailure(WORLD_FAILED_MESSAGE, f"HTTP timeout: operation {operation_id} exceeded {timeout_s}s")
-        polled = await client.get(f"{WORLDLABS_BASE}/marble/v1/operations/{operation_id}", headers=headers)
+        polled = await _send_retrying_rate_limit(
+            lambda: client.get(f"{WORLDLABS_BASE}/marble/v1/operations/{operation_id}", headers=headers)
+        )
+        if polled.status_code == 429:
+            message = _response_message(polled) or "rate limited"
+            raise OperationInFlight(operation_id, phase, provider_detail(429, message))
         _raise_for_status(polled, "World Labs status check failed")
         operation = polled.json()
         if not operation.get("done"):

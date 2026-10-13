@@ -18,6 +18,31 @@ def test_worker_concurrency_defaults_to_three():
     settings = get_settings()
     assert settings.worker_concurrency == 3
     assert settings.stitch_concurrency == 1
+    assert settings.worldlabs_concurrency == 2
+
+
+def test_worldlabs_jobs_are_capped_separately_from_workers(monkeypatch):
+    monkeypatch.setenv("WORKER_CONCURRENCY", "3")
+    monkeypatch.setenv("WORLDLABS_CONCURRENCY", "2")
+    pipeline._world_semaphore = None
+    current = {"n": 0, "peak": 0}
+
+    async def hold() -> None:
+        async with pipeline.world_limit():
+            current["n"] += 1
+            current["peak"] = max(current["peak"], current["n"])
+            await asyncio.sleep(0.05)
+            current["n"] -= 1
+
+    async def run() -> None:
+        await asyncio.gather(*(hold() for _ in range(4)))
+
+    asyncio.run(run())
+    assert pipeline.world_limit()._value == 2
+    assert current["peak"] == 2
+    runner = pipeline.JobRunner()
+    assert runner._limit()._value == 3
+    pipeline._world_semaphore = None
 
 
 def test_runner_limit_follows_worker_concurrency(monkeypatch):

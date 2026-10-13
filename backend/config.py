@@ -96,6 +96,10 @@ class Settings:
     worldlabs_draft_model: str | None
     worldlabs_public: bool
     worldlabs_low_credit_threshold: int
+    worldlabs_concurrency: int
+    worldlabs_retry_attempts: int
+    worldlabs_retry_base_seconds: float
+    worldlabs_retry_max_seconds: float
     worker_concurrency: int
     stitch_concurrency: int
     jobs_inline: bool
@@ -194,6 +198,10 @@ def get_settings() -> Settings:
         worldlabs_draft_model=draft_model,
         worldlabs_public=_bool("WORLDLABS_PUBLIC", False),
         worldlabs_low_credit_threshold=max(0, _int("WORLDLABS_LOW_CREDIT_THRESHOLD", 6000)),
+        worldlabs_concurrency=max(1, _int("WORLDLABS_CONCURRENCY", 2)),
+        worldlabs_retry_attempts=max(1, _int("WORLDLABS_RETRY_ATTEMPTS", 5)),
+        worldlabs_retry_base_seconds=max(0.0, _float("WORLDLABS_RETRY_BASE_SECONDS", 0.5)),
+        worldlabs_retry_max_seconds=max(0.0, _float("WORLDLABS_RETRY_MAX_SECONDS", 32)),
         worker_concurrency=max(1, _int("WORKER_CONCURRENCY", 3)),
         stitch_concurrency=max(1, _int("STITCH_CONCURRENCY", 1)),
         jobs_inline=_bool("JOBS_INLINE", False),

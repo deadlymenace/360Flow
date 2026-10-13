@@ -846,8 +846,11 @@ def begin_job(
     replace_delayed: bool = False,
     retire_worlds: str | None = None,
     charge: bool = True,
-) -> tuple[str, JobRecord | None]:
+) -> tuple[str, JobRecord | None, list[str]]:
     """Mark the project busy and insert its job in one transaction.
+
+    The third value is the Marble world ids retired by this enqueue. The caller
+    deletes those worlds after the transaction commits.
 
     The update matches only when the project has no open job. A unique partial
     index on ``jobs`` is the backstop. World and staging quota are counted here,
@@ -866,9 +869,9 @@ def begin_job(
                 charge,
             )
     except _EnqueueStop as exc:
-        return exc.outcome, None
+        return exc.outcome, None, []
     except IntegrityError:
-        return "busy", None
+        return "busy", None, []
 
 
 def _begin_job(
@@ -879,7 +882,7 @@ def _begin_job(
     replace_delayed: bool,
     retire_worlds: str | None,
     charge: bool,
-) -> tuple[str, JobRecord]:
+) -> tuple[str, JobRecord, list[str]]:
     dialect = session.get_bind().dialect.name
     query = select(ProjectRow).where(ProjectRow.id == project_id)
     if dialect == "postgresql":
@@ -915,8 +918,10 @@ def _begin_job(
     row = session.get(ProjectRow, project_id)
     if row is None:
         raise _EnqueueStop("missing")
+    retired: list[str] = []
     if retire_worlds:
-        _queue_deletes_in_session(session, _world_ids(row, retire_worlds), "replaced by a new capture")
+        retired = _world_ids(row, retire_worlds)
+        _queue_deletes_in_session(session, retired, "replaced by a new capture")
         clearing = _ORIGINAL_WORLD_FIELDS if retire_worlds == "original" else ()
         if retire_worlds == "staged":
             clearing = _STAGED_WORLD_FIELDS
@@ -948,7 +953,7 @@ def _begin_job(
     )
     session.add(job)
     session.flush()
-    return "queued", _job_record(job)
+    return "queued", _job_record(job), retired
 
 
 def claim_delayed_job(job_id: str) -> JobRecord | None:
