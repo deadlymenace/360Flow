@@ -1,0 +1,13 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+**/.env
+mobile/node_modules
+mobile/.expo
+ios
+backend/storage/uploads
+backend/storage/panoramas
+backend/storage/staged
+backend/storage/*.db
+**/.pytest_cache

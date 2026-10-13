@@ -9,6 +9,8 @@ import {
   SEGMENT_COUNT,
   SEGMENT_ANGLE,
   ALIGNMENT_TOLERANCE,
+  ULTRA_WIDE_PORTRAIT_HFOV,
+  WIDE_PORTRAIT_HFOV,
   makeSegments,
 } from '../models/types';
 import { HapticFeedback } from '../utils/haptics';
@@ -25,6 +27,9 @@ export default function CaptureScreen({ navigation, route }: Props) {
   const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
   const [isAligned, setIsAligned] = useState(false);
   const [capturing, setCapturing] = useState(false);
+  const [selectedLens, setSelectedLens] = useState<string | undefined>();
+  const [hfov, setHfov] = useState(ULTRA_WIDE_PORTRAIT_HFOV);
+  const [tilted, setTilted] = useState(false);
   const cameraRef = useRef<CameraView>(null);
   const initialYawRef = useRef<number | null>(null);
   const segmentsRef = useRef<CaptureSegment[]>(segments);
@@ -59,6 +64,11 @@ export default function CaptureScreen({ navigation, route }: Props) {
   useEffect(() => {
     DeviceMotion.setUpdateInterval(33); // ~30Hz
     const sub = DeviceMotion.addListener((data: DeviceMotionMeasurement) => {
+      const gravity = data.accelerationIncludingGravity;
+      if (gravity) {
+        const tilt = Math.atan2(Math.hypot(gravity.x, gravity.z), Math.abs(gravity.y));
+        setTilted(tilt > (20 * Math.PI) / 180);
+      }
       if (!data.rotation) return;
 
       // Convert alpha (yaw) from radians to degrees
@@ -99,7 +109,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
     try {
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.8,
-        skipProcessing: true,
+        skipProcessing: false,
       });
 
       if (photo) {
@@ -121,6 +131,23 @@ export default function CaptureScreen({ navigation, route }: Props) {
       setCapturing(false);
     }
   }, [capturing, currentSegmentIndex, currentYaw]);
+
+  const handleLenses = useCallback((event: { lenses: string[] }) => {
+    const available = event.lenses ?? [];
+    const ultra = available.find((name) => /ultra/i.test(name));
+    if (ultra) {
+      setSelectedLens(ultra);
+      setHfov(ULTRA_WIDE_PORTRAIT_HFOV);
+      return;
+    }
+    const wide = available.find((name) => /wide/i.test(name));
+    if (wide) {
+      setSelectedLens(wide);
+      setHfov(WIDE_PORTRAIT_HFOV);
+      return;
+    }
+    setHfov(ULTRA_WIDE_PORTRAIT_HFOV);
+  }, []);
 
   if (!permission) {
     return (
@@ -157,6 +184,8 @@ export default function CaptureScreen({ navigation, route }: Props) {
         ref={cameraRef}
         style={StyleSheet.absoluteFill}
         facing="back"
+        selectedLens={selectedLens}
+        onAvailableLensesChanged={handleLenses}
       />
 
       {/* UI overlay positioned on top of camera */}
@@ -177,6 +206,12 @@ export default function CaptureScreen({ navigation, route }: Props) {
           <View style={styles.progressTrack}>
             <View style={[styles.progressFill, { width: `${progressPct}%` }]} />
           </View>
+          <Text style={styles.lensText}>
+            {selectedLens ? `${selectedLens} · ${hfov}°` : `Ultra-wide · ${hfov}°`}
+          </Text>
+          {tilted ? (
+            <Text style={styles.tiltWarning}>Hold the phone upright — tilt is too high</Text>
+          ) : null}
         </View>
 
         {/* Center: directional arrow (only when not aligned) */}
@@ -202,9 +237,12 @@ export default function CaptureScreen({ navigation, route }: Props) {
                 navigation.navigate('Review', {
                   projectId,
                   projectName,
+                  hfov,
+                  lens: selectedLens,
                   segments: segments.map((s) => ({
                     id: s.id,
                     imageUri: s.imageUri,
+                    actualYaw: s.actualYaw,
                   })),
                 })
               }
@@ -320,6 +358,20 @@ const styles = StyleSheet.create({
     height: '100%',
     backgroundColor: '#6C63FF',
     borderRadius: 2,
+  },
+  lensText: {
+    color: 'rgba(255,255,255,0.75)',
+    fontSize: 12,
+    textAlign: 'center',
+    marginTop: 8,
+  },
+  tiltWarning: {
+    color: '#FFD54F',
+    fontSize: 13,
+    fontWeight: '600',
+    textAlign: 'center',
+    marginTop: 6,
+    paddingHorizontal: 20,
   },
   directionOverlay: {
     alignItems: 'center',

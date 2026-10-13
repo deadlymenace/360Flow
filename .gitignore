@@ -6,9 +6,13 @@ __pycache__/
 venv/
 .venv/
 
-# Backend storage (uploaded images and generated panoramas)
+# Backend storage (uploaded images, generated panoramas, local SQLite)
 backend/storage/uploads/
 backend/storage/panoramas/
+backend/storage/staged/
+backend/storage/*.db
+backend/data/
+*.db
 
 # Xcode
 ios/ThreeSixtyFlow/ThreeSixtyFlow.xcodeproj/xcuserdata/

@@ -1,3 +1,19 @@
+"""Stitch a guided 360° capture into a 2:1 equirectangular panorama.
+
+The phone takes 16 ultra-wide photos at known yaw steps. OpenCV's global
+Stitcher is a poor fit for that capture: bundle adjustment fails on the full
+loop (CAMERA_PARAMS_ADJUST_FAIL), and a successful planar stitch is still not
+equirectangular. Chaining homographies is worse — error compounds around the
+circle.
+
+This pipeline instead projects each photo onto a shared equirectangular canvas
+with a pinhole camera at the captured yaw. Overlaps are feather-blended, the
+loop is 360° by construction, and the uncovered poles are filled so the JPEG
+is exactly 2:1 (the aspect World Labs expects for ``is_pano``).
+"""
+
+from __future__ import annotations
+
 import logging
 from pathlib import Path
 
@@ -6,267 +22,515 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Resize inputs so the longest side is at most this many pixels before stitching.
-# Full-resolution iPhone photos (~12MP) make OpenCV's bundle adjustment fail and
-# slow ORB matching to a crawl. 1500px preserves plenty of detail for a 360° viewer.
-_MAX_INPUT_DIM = 1500
+# Longest side before projection. Full-resolution phone photos make feature
+# matching ambiguous and blow up the equirectangular canvas.
+MAX_INPUT_DIM = 1500
 
-# Assumed horizontal FOV of an iPhone's main (wide) back camera.
-# Used to estimate focal length for the cylindrical fallback.
-_IPHONE_HFOV_DEG = 70.0
+# Output width is 2π * focal, clamped so a Railway-sized instance stays
+# within memory. Height is always exactly width / 2.
+MIN_OUTPUT_WIDTH = 640
+MAX_OUTPUT_WIDTH = 4096
 
-# Sanity caps on the cylindrical canvas to reject runaway alignments.
-_MAX_CANVAS_W = 30000
-_MAX_CANVAS_H = 5000
+# Portrait ultra-wide on iPhone 11+ is about 120° on the diagonal. Held in
+# portrait (4:3), the horizontal field is ~92°. Override via hfov_deg when the
+# capture used a different lens.
+DEFAULT_HFOV_DEG = 92.0
+
+_OFFSET_SEARCH_FEATURES = 2500
+
+
+def stitch_images(
+    image_paths: list[Path],
+    output_path: Path,
+    *,
+    yaws_deg: list[float] | None = None,
+    hfov_deg: float | None = None,
+    refine: bool = True,
+) -> bool:
+    """Stitch ordered photos into an equirectangular JPEG.
+
+    ``yaws_deg`` is the compass yaw of each photo in degrees (0 = first shot,
+    increasing as the user turns). When omitted, shots are spaced evenly
+    around the circle. ``hfov_deg`` is the horizontal field of view of the
+    photos; EXIF is tried next, then the portrait ultra-wide default.
+    """
+    paths = sorted(image_paths, key=lambda p: p.name)
+    images = _load_images(paths)
+    if len(images) < 2:
+        logger.error("Need at least 2 images to stitch, got %d", len(images))
+        return False
+
+    images = _downscale_images(images)
+    images = _match_sizes(images)
+    hfov = float(hfov_deg) if hfov_deg else _hfov_from_exif(paths[0]) or DEFAULT_HFOV_DEG
+    yaws = _resolve_yaws(yaws_deg, len(images))
+    pitches = [0.0] * len(images)
+
+    if refine:
+        refined_yaws, refined_pitches = _refine_alignment(images, yaws, hfov)
+        if refined_yaws is not None:
+            yaws = refined_yaws
+            pitches = refined_pitches or pitches
+
+    panorama = _project_equirect(images, yaws, pitches, hfov)
+    if panorama is None:
+        logger.error("Equirectangular projection produced an empty canvas")
+        return False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), panorama, [cv2.IMWRITE_JPEG_QUALITY, 95]):
+        logger.error("Failed to write panorama to %s", output_path)
+        return False
+
+    height, width = panorama.shape[:2]
+    logger.info(
+        "Panorama saved to %s (%dx%d, hfov=%.1f°, 2:1=%s)",
+        output_path,
+        width,
+        height,
+        hfov,
+        width == height * 2,
+    )
+    return True
+
+
+def render_perspective(
+    equirect_bgr: np.ndarray,
+    yaw_deg: float,
+    hfov_deg: float,
+    out_w: int,
+    out_h: int,
+    pitch_deg: float = 0.0,
+) -> np.ndarray:
+    """Rasterize one pinhole view of an equirectangular image.
+
+    Used by the synthetic stitch test and kept in this module so the capture
+    model and the stitcher stay inverses of each other. The center pixel looks
+    along ``yaw_deg`` at ``pitch_deg`` (0 = horizon, positive = up).
+    """
+    src_h, src_w = equirect_bgr.shape[:2]
+    hfov = np.radians(hfov_deg)
+    focal = (out_w / 2.0) / np.tan(hfov / 2.0)
+    cx = (out_w - 1) / 2.0
+    cy = (out_h - 1) / 2.0
+    yaw = np.radians(yaw_deg)
+    pitch = np.radians(pitch_deg)
+    cos_p, sin_p = np.cos(pitch), np.sin(pitch)
+    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+
+    xs = np.arange(out_w, dtype=np.float32)
+    ys = np.arange(out_h, dtype=np.float32)
+    uu, vv = np.meshgrid(xs, ys)
+    x2 = (uu - cx) / focal
+    y2 = -(vv - cy) / focal
+    z2 = np.ones_like(x2)
+
+    y1 = y2 * cos_p + z2 * sin_p
+    z1 = -y2 * sin_p + z2 * cos_p
+    x1 = x2
+    world_x = x1 * cos_y + z1 * sin_y
+    world_y = y1
+    world_z = -x1 * sin_y + z1 * cos_y
+
+    lon = np.arctan2(world_x, world_z)
+    lat = np.arctan2(world_y, np.hypot(world_x, world_z))
+    map_x = ((lon + np.pi) / (2 * np.pi) * src_w).astype(np.float32)
+    map_y = ((np.pi / 2 - lat) / np.pi * src_h).astype(np.float32)
+    return cv2.remap(
+        equirect_bgr,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+
+def _load_images(paths: list[Path]) -> list[np.ndarray]:
+    images: list[np.ndarray] = []
+    for path in paths:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            logger.warning("Failed to read image: %s", path)
+            continue
+        images.append(image)
+    return images
 
 
 def _downscale_images(images: list[np.ndarray]) -> list[np.ndarray]:
-    """Shrink images so their longest side is _MAX_INPUT_DIM, preserving aspect ratio."""
     out = []
-    for img in images:
-        h, w = img.shape[:2]
-        long_side = max(h, w)
-        if long_side > _MAX_INPUT_DIM:
-            scale = _MAX_INPUT_DIM / long_side
-            img = cv2.resize(
-                img,
-                (int(round(w * scale)), int(round(h * scale))),
+    for image in images:
+        height, width = image.shape[:2]
+        long_side = max(height, width)
+        if long_side > MAX_INPUT_DIM:
+            scale = MAX_INPUT_DIM / long_side
+            image = cv2.resize(
+                image,
+                (max(2, int(round(width * scale))), max(2, int(round(height * scale)))),
                 interpolation=cv2.INTER_AREA,
             )
-        out.append(img)
+        out.append(image)
     return out
 
 
-def _enhance_images(images: list[np.ndarray]) -> list[np.ndarray]:
-    """Apply CLAHE contrast enhancement to help the stitcher find features
-    in low-texture scenes (plain walls, uniform floors, etc.)."""
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = []
-    for img in images:
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-        enhanced.append(cv2.cvtColor(lab, cv2.COLOR_LAB2BGR))
-    return enhanced
+def _match_sizes(images: list[np.ndarray]) -> list[np.ndarray]:
+    height, width = images[0].shape[:2]
+    matched = [images[0]]
+    for image in images[1:]:
+        if image.shape[:2] != (height, width):
+            image = cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+        matched.append(image)
+    return matched
 
 
-def _crop_black_borders(panorama: np.ndarray) -> np.ndarray:
-    """Remove black borders produced by warping."""
-    gray = cv2.cvtColor(panorama, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
-        panorama = panorama[y : y + h, x : x + w]
-    return panorama
+def _hfov_from_exif(path: Path) -> float | None:
+    """Horizontal FOV from the 35mm-equivalent focal length, if EXIF has it."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as handle:
+            exif = handle.getexif()
+            focal_35 = exif.get(0xA405) if exif else None
+            if not focal_35:
+                return None
+            width, height = handle.size
+    except Exception:
+        logger.debug("EXIF hfov lookup failed for %s", path, exc_info=True)
+        return None
+
+    focal_35 = float(focal_35)
+    if focal_35 <= 0:
+        return None
+    # 35mm-equivalent focal length matches the diagonal of a 36×24mm frame.
+    diag_fov = 2 * np.arctan(43.266 / (2 * focal_35))
+    diag = float(np.hypot(width, height))
+    hfov = 2 * np.arctan((width / diag) * np.tan(diag_fov / 2))
+    return float(np.degrees(hfov))
 
 
-def _try_opencv_stitcher(images: list[np.ndarray]) -> np.ndarray | None:
-    """Primary attempt: OpenCV's built-in Stitcher (global bundle adjustment)."""
-    stitcher = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
-    stitcher.setPanoConfidenceThresh(0.3)
-
-    # Try with a duplicate of the first image appended to help close the 360° loop
-    images_wrapped = images + [images[0]]
-    status, panorama = stitcher.stitch(images_wrapped)
-    if status == cv2.Stitcher_OK:
-        return panorama
-
-    logger.warning("Wrapped stitch failed (status %d), trying without wrap...", status)
-    stitcher2 = cv2.Stitcher.create(cv2.Stitcher_PANORAMA)
-    stitcher2.setPanoConfidenceThresh(0.3)
-    status, panorama = stitcher2.stitch(images)
-    if status == cv2.Stitcher_OK:
-        return panorama
-
-    status_names = {
-        cv2.Stitcher_ERR_NEED_MORE_IMGS: "NEED_MORE_IMGS",
-        cv2.Stitcher_ERR_HOMOGRAPHY_EST_FAIL: "HOMOGRAPHY_EST_FAIL",
-        cv2.Stitcher_ERR_CAMERA_PARAMS_ADJUST_FAIL: "CAMERA_PARAMS_ADJUST_FAIL",
-    }
-    logger.warning("OpenCV stitcher failed: %s", status_names.get(status, str(status)))
-    return None
+def _resolve_yaws(yaws_deg: list[float] | None, count: int) -> list[float]:
+    if yaws_deg and len(yaws_deg) == count:
+        return [float(yaw) % 360.0 for yaw in yaws_deg]
+    if yaws_deg and len(yaws_deg) != count:
+        logger.warning(
+            "Ignoring %d yaw values for %d images; using even spacing",
+            len(yaws_deg),
+            count,
+        )
+    step = 360.0 / count
+    return [i * step for i in range(count)]
 
 
-def _cylindrical_warp(img: np.ndarray, focal: float) -> np.ndarray:
-    """Project a pinhole image onto a cylinder with the given focal length (in pixels).
-    The camera sits on the cylinder's axis with the principal point at image center.
-    This is the correct projection model for rotational 360° captures — it flattens
-    the cylinder into a strip where rotation becomes pure horizontal translation."""
-    h, w = img.shape[:2]
-    cx, cy = w / 2.0, h / 2.0
+def _refine_alignment(
+    images: list[np.ndarray],
+    yaws: list[float],
+    hfov_deg: float,
+) -> tuple[list[float] | None, list[float] | None]:
+    """Nudge the nominal yaws using translation measured on a cylinder.
 
-    u = np.arange(w, dtype=np.float32)
-    v = np.arange(h, dtype=np.float32)
-    U, V = np.meshgrid(u, v)
+    Measurements are accepted only when every neighbor matches and the steps
+    close the loop near 360°. Otherwise the captured (or evenly spaced) yaws
+    are kept — a bad match must not spin the panorama.
+    """
+    height, width = images[0].shape[:2]
+    focal = (width / 2.0) / np.tan(np.radians(hfov_deg) / 2.0)
+    warped = [_cylindrical_warp(image, focal) for image in images]
+    dxs: list[float] = []
+    dys: list[float] = []
+    count = len(warped)
+    for index in range(count):
+        offset = _estimate_offset(warped[index], warped[(index + 1) % count])
+        if offset is None:
+            logger.info("Alignment refine skipped: pair %d did not match", index)
+            return None, None
+        dxs.append(float(offset[0]))
+        dys.append(float(offset[1]))
 
-    # Inverse map: for each pixel on the cylinder, find where to sample in the source.
-    # theta = horizontal angle on the cylinder; h_param = vertical coord
-    theta = (U - cx) / focal
-    h_param = (V - cy) / focal
+    if any(dx <= width * 0.04 for dx in dxs):
+        logger.info("Alignment refine skipped: a step was not a forward rotation")
+        return None, None
 
-    # 3D ray from the camera center
-    X = np.sin(theta)
-    Y = h_param
-    Z = np.cos(theta)
+    circumference = 2 * np.pi * focal
+    total = float(sum(dxs))
+    if total <= 0 or abs(total - circumference) / circumference > 0.12:
+        logger.info(
+            "Alignment refine skipped: loop is %.0fpx vs circumference %.0fpx",
+            total,
+            circumference,
+        )
+        return None, None
 
-    # Project back onto the original image plane
-    x_src = (focal * X / Z + cx).astype(np.float32)
-    y_src = (focal * Y / Z + cy).astype(np.float32)
+    median_step = float(np.median(dxs))
+    if any(abs(dx - median_step) > 0.45 * median_step for dx in dxs):
+        logger.info("Alignment refine skipped: step sizes disagree")
+        return None, None
 
+    scale = circumference / total
+    yaws_out = [yaws[0]]
+    for dx in dxs[:-1]:
+        yaws_out.append((yaws_out[-1] + np.degrees(dx * scale / focal)) % 360.0)
+
+    # Vertical drift around a level loop should sum to ~0. Convert the
+    # closed residual into a small per-shot pitch, and drop it if it is large
+    # enough to be a bad match rather than handheld tilt.
+    dy = np.array(dys, dtype=np.float64)
+    dy = dy - dy.mean()
+    pitches = [0.0]
+    for step in dy[:-1]:
+        pitches.append(pitches[-1] + float(np.degrees(step / focal)))
+    if max(abs(p) for p in pitches) > 5:
+        pitches = [0.0] * count
+    logger.info("Alignment refine accepted (scale %.3f)", scale)
+    return yaws_out, pitches
+
+
+def _cylindrical_warp(image: np.ndarray, focal: float) -> np.ndarray:
+    """Map a pinhole photo onto a cylinder so pure yaw becomes translation."""
+    height, width = image.shape[:2]
+    cx, cy = width / 2.0, height / 2.0
+    u = np.arange(width, dtype=np.float32)
+    v = np.arange(height, dtype=np.float32)
+    uu, vv = np.meshgrid(u, v)
+    theta = (uu - cx) / focal
+    height_param = (vv - cy) / focal
+    x = np.sin(theta)
+    y = height_param
+    z = np.cos(theta)
+    map_x = (focal * x / z + cx).astype(np.float32)
+    map_y = (focal * y / z + cy).astype(np.float32)
     return cv2.remap(
-        img,
-        x_src,
-        y_src,
+        image,
+        map_x,
+        map_y,
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0),
     )
 
 
-def _estimate_offset(img_a: np.ndarray, img_b: np.ndarray) -> tuple[int, int] | None:
-    """Find (dx, dy) such that placing img_b at (img_a_origin + (dx, dy)) aligns
-    matched features. Uses ORB features with median-of-matches for robustness.
-    Returns None if there aren't enough confident matches."""
-    orb = cv2.ORB_create(nfeatures=2000)
-    gray_a = cv2.cvtColor(img_a, cv2.COLOR_BGR2GRAY)
-    gray_b = cv2.cvtColor(img_b, cv2.COLOR_BGR2GRAY)
-
-    kp_a, des_a = orb.detectAndCompute(gray_a, None)
-    kp_b, des_b = orb.detectAndCompute(gray_b, None)
-    if des_a is None or des_b is None:
+def _estimate_offset(image_a: np.ndarray, image_b: np.ndarray) -> tuple[int, int] | None:
+    """Return (dx, dy) placing image_b relative to image_a. None if unsure."""
+    orb = cv2.ORB_create(nfeatures=_OFFSET_SEARCH_FEATURES)
+    gray_a = cv2.cvtColor(image_a, cv2.COLOR_BGR2GRAY)
+    gray_b = cv2.cvtColor(image_b, cv2.COLOR_BGR2GRAY)
+    keypoints_a, desc_a = orb.detectAndCompute(gray_a, None)
+    keypoints_b, desc_b = orb.detectAndCompute(gray_b, None)
+    if desc_a is None or desc_b is None or len(keypoints_a) < 20 or len(keypoints_b) < 20:
         return None
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des_a, des_b)
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = matcher.match(desc_a, desc_b)
     if len(matches) < 20:
         return None
-
-    matches = sorted(matches, key=lambda m: m.distance)[:100]
-
-    # Shared point P is at (A_origin + a_pt) = (B_origin + b_pt), so:
-    #   B_origin = A_origin + (a_pt - b_pt)
-    # We want offset = (a_pt - b_pt), median'd for robustness.
-    dxs = np.array([kp_a[m.queryIdx].pt[0] - kp_b[m.trainIdx].pt[0] for m in matches])
-    dys = np.array([kp_a[m.queryIdx].pt[1] - kp_b[m.trainIdx].pt[1] for m in matches])
-
-    # Drop matches whose offset is a statistical outlier from the median
-    med_dx, med_dy = np.median(dxs), np.median(dys)
-    dist = np.sqrt((dxs - med_dx) ** 2 + (dys - med_dy) ** 2)
-    mad = np.median(dist) + 1.0
-    inliers = dist < 3 * mad
-    if inliers.sum() < 10:
-        return None
-
-    dx = float(np.median(dxs[inliers]))
-    dy = float(np.median(dys[inliers]))
-    return int(round(dx)), int(round(dy))
-
-
-def _cylindrical_stitch(images: list[np.ndarray]) -> np.ndarray | None:
-    """Fallback stitcher for rotational 360° captures.
-
-    Pipeline:
-      1. Warp every image onto a cylinder using estimated focal length.
-      2. Find translation-only alignment between each adjacent pair (ORB + median).
-      3. Accumulate offsets (sum, not matrix product) — errors don't explode.
-      4. Composite into a strip with paint-where-empty blending.
-    """
-    if len(images) < 2:
-        return None
-
-    h_img, w_img = images[0].shape[:2]
-    focal = (w_img / 2.0) / np.tan(np.radians(_IPHONE_HFOV_DEG / 2.0))
-    logger.info(
-        "Cylindrical stitch: warping %d images (size=%dx%d, focal=%.1fpx)",
-        len(images), w_img, h_img, focal,
+    matches = sorted(matches, key=lambda item: item.distance)[:120]
+    dxs = np.array(
+        [keypoints_a[m.queryIdx].pt[0] - keypoints_b[m.trainIdx].pt[0] for m in matches]
     )
-
-    warped = [_cylindrical_warp(img, focal) for img in images]
-    wh, ww = warped[0].shape[:2]
-
-    # Compute cumulative offsets relative to warped[0]
-    offsets: list[tuple[int, int]] = [(0, 0)]
-    for i in range(len(warped) - 1):
-        off = _estimate_offset(warped[i], warped[i + 1])
-        if off is None:
-            logger.error(
-                "Cylindrical stitch: failed to match pair %d→%d (not enough features)",
-                i, i + 1,
-            )
-            return None
-        dx, dy = off
-        offsets.append((offsets[-1][0] + dx, offsets[-1][1] + dy))
-
-    xs = [o[0] for o in offsets]
-    ys = [o[1] for o in offsets]
-    x_min, x_max = min(xs), max(xs) + ww
-    y_min, y_max = min(ys), max(ys) + wh
-    canvas_w = x_max - x_min
-    canvas_h = y_max - y_min
-
-    if canvas_w > _MAX_CANVAS_W or canvas_h > _MAX_CANVAS_H:
-        logger.error(
-            "Cylindrical stitch: canvas too large (%dx%d) — alignment probably bad",
-            canvas_w, canvas_h,
-        )
+    dys = np.array(
+        [keypoints_a[m.queryIdx].pt[1] - keypoints_b[m.trainIdx].pt[1] for m in matches]
+    )
+    median_dx, median_dy = np.median(dxs), np.median(dys)
+    distance = np.sqrt((dxs - median_dx) ** 2 + (dys - median_dy) ** 2)
+    mad = np.median(distance) + 1.0
+    inliers = distance < 3 * mad
+    if int(inliers.sum()) < 12:
         return None
-
-    logger.info("Cylindrical stitch: composing %dx%d canvas", canvas_w, canvas_h)
-    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
-    for i, (ox, oy) in enumerate(offsets):
-        x = ox - x_min
-        y = oy - y_min
-        src = warped[i]
-        region = canvas[y : y + wh, x : x + ww]
-        src_mask = src.max(axis=2) > 0
-        empty_mask = region.max(axis=2) == 0
-        write_mask = src_mask & empty_mask
-        region[write_mask] = src[write_mask]
-
-    return canvas
+    return int(round(float(np.median(dxs[inliers])))), int(round(float(np.median(dys[inliers]))))
 
 
-def stitch_images(image_paths: list[Path], output_path: Path) -> bool:
+def _project_equirect(
+    images: list[np.ndarray],
+    yaws: list[float],
+    pitches: list[float],
+    hfov_deg: float,
+) -> np.ndarray | None:
+    height, width = images[0].shape[:2]
+    hfov = np.radians(hfov_deg)
+    focal = (width / 2.0) / np.tan(hfov / 2.0)
+    out_w = int(round(2 * np.pi * focal))
+    out_w = max(MIN_OUTPUT_WIDTH, min(MAX_OUTPUT_WIDTH, out_w))
+    out_w -= out_w % 2
+    out_h = out_w // 2
+
+    # When the focal length wants a wider canvas than we allow, sample the
+    # output on that coarser grid but keep the source focal — the pinhole
+    # model is in source pixels, and the equirect maps longitude linearly.
+    scales = _overlap_gains(images, yaws, hfov_deg)
+    acc = np.zeros((out_h, out_w, 3), dtype=np.float32)
+    weight_acc = np.zeros((out_h, out_w), dtype=np.float32)
+    for image, yaw, pitch, scale in zip(images, yaws, pitches, scales):
+        prepared = np.clip(image.astype(np.float32) * scale, 0, 255)
+        _blend_image(prepared, acc, weight_acc, yaw, pitch, hfov_deg, focal)
+
+    valid = weight_acc > 1e-3
+    if int(valid.sum()) < 100:
+        return None
+    composed = np.zeros_like(acc)
+    composed[valid] = acc[valid] / weight_acc[valid, None]
+    panorama = _fill_poles(composed, valid)
+    return np.clip(np.round(panorama), 0, 255).astype(np.uint8)
+
+
+def _overlap_gains(
+    images: list[np.ndarray],
+    yaws: list[float],
+    hfov_deg: float,
+) -> list[float]:
+    """Match exposure on the overlapping strip of each neighbor pair.
+
+    Scales stay at 1 when the shots already agree, which is the synthetic
+    case and any locked-exposure capture.
     """
-    Stitch ordered images into a panorama.
-    Pipeline: downscale → enhance → OpenCV global stitcher → cylindrical fallback.
-    Returns True on success, False on failure.
-    """
-    raw_images = []
-    for path in image_paths:
-        img = cv2.imread(str(path))
-        if img is None:
-            logger.warning("Failed to read image: %s", path)
+    count = len(images)
+    ones = [1.0] * count
+    height, width = images[0].shape[:2]
+    ratios: list[float] = []
+    for index in range(count):
+        step = (yaws[(index + 1) % count] - yaws[index]) % 360.0
+        if step <= 1 or step >= hfov_deg:
+            return ones
+        overlap = 1.0 - step / hfov_deg
+        cols = max(8, int(width * overlap * 0.45))
+        if cols >= width - 4:
+            return ones
+        left = images[index][:, -cols:]
+        right = images[(index + 1) % count][:, :cols]
+        shared_h = min(left.shape[0], right.shape[0])
+        shared_w = min(left.shape[1], right.shape[1])
+        gray_left = cv2.cvtColor(left[:shared_h, :shared_w], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gray_right = cv2.cvtColor(right[:shared_h, :shared_w], cv2.COLOR_BGR2GRAY).astype(np.float32)
+        median_left = float(np.median(gray_left)) + 1.0
+        median_right = float(np.median(gray_right)) + 1.0
+        ratios.append(median_left / median_right)
+
+    logs = np.log(np.clip(ratios, 0.5, 2.0))
+    logs = logs - logs.mean()
+    if float(np.max(np.abs(logs))) < 0.02:
+        return ones
+    log_scale = np.zeros(count, dtype=np.float64)
+    for index in range(count - 1):
+        log_scale[index + 1] = log_scale[index] + logs[index]
+    log_scale -= log_scale.mean()
+    scales = np.exp(np.clip(log_scale, np.log(0.75), np.log(1.35)))
+    return [float(scale) for scale in scales]
+
+
+def _blend_image(
+    image: np.ndarray,
+    acc: np.ndarray,
+    weight_acc: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+    hfov_deg: float,
+    focal: float,
+) -> None:
+    src_h, src_w = image.shape[:2]
+    out_h, out_w = weight_acc.shape
+    hfov = np.radians(hfov_deg)
+    vfov = 2 * np.arctan((src_h / float(src_w)) * np.tan(hfov / 2.0))
+    margin = np.radians(1.2)
+    half_lon = hfov / 2.0 + margin
+    half_lat = vfov / 2.0 + margin
+    yaw = np.radians(yaw_deg)
+    pitch = np.radians(pitch_deg)
+    cos_p, sin_p = float(np.cos(pitch)), float(np.sin(pitch))
+    cos_y, sin_y = float(np.cos(yaw)), float(np.sin(yaw))
+
+    span = (2 * half_lon) / (2 * np.pi) * out_w
+    x_left = np.mod(((yaw - half_lon) + np.pi) / (2 * np.pi) * out_w, out_w)
+    if x_left + span <= out_w:
+        segments = [(float(x_left), float(x_left + span))]
+    else:
+        segments = [
+            (float(x_left), float(out_w)),
+            (0.0, float(x_left + span - out_w)),
+        ]
+
+    y_top = (np.pi / 2 - half_lat) / np.pi * out_h
+    y_bot = (np.pi / 2 + half_lat) / np.pi * out_h
+    y0 = max(0, int(np.floor(y_top)) - 1)
+    y1 = min(out_h, int(np.ceil(y_bot)) + 1)
+    if y1 <= y0:
+        return
+
+    cx = (src_w - 1) / 2.0
+    cy = (src_h - 1) / 2.0
+    rows = np.arange(y0, y1)
+    lat = np.pi / 2 - (rows + 0.5) / out_h * np.pi
+
+    for seg_left, seg_right in segments:
+        x0 = max(0, int(np.floor(seg_left)) - 1)
+        x1 = min(out_w, int(np.ceil(seg_right)) + 1)
+        if x1 <= x0:
             continue
-        raw_images.append(img)
+        cols = np.arange(x0, x1)
+        lon = (cols + 0.5) / out_w * 2 * np.pi - np.pi
+        lon_grid, lat_grid = np.meshgrid(lon, lat)
+        cos_lat = np.cos(lat_grid)
+        world_x = np.sin(lon_grid) * cos_lat
+        world_y = np.sin(lat_grid)
+        world_z = np.cos(lon_grid) * cos_lat
+        x1c = world_x * cos_y - world_z * sin_y
+        y1c = world_y
+        z1c = world_x * sin_y + world_z * cos_y
+        y2 = y1c * cos_p - z1c * sin_p
+        z2 = y1c * sin_p + z1c * cos_p
+        safe = z2 > 0.05
+        z_safe = np.where(safe, z2, 1.0)
+        map_x = (cx + focal * (x1c / z_safe)).astype(np.float32)
+        map_y = (cy - focal * (y2 / z_safe)).astype(np.float32)
+        patch = cv2.remap(
+            image,
+            map_x,
+            map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        inside = safe & (map_x >= 0) & (map_y >= 0) & (map_x <= src_w - 1) & (map_y <= src_h - 1)
+        weight = _feather(map_x, map_y, src_w, src_h) * inside.astype(np.float32)
+        acc[y0:y1, x0:x1] += patch * weight[..., None]
+        weight_acc[y0:y1, x0:x1] += weight
 
-    if len(raw_images) < 2:
-        logger.error("Need at least 2 images to stitch, got %d", len(raw_images))
-        return False
 
-    logger.info("Stitching %d images...", len(raw_images))
+def _feather(map_x: np.ndarray, map_y: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Smoothstep weight that is 1 at the photo center and 0 at its edges."""
+    edge_x = max(width * 0.08, 2.0)
+    edge_y = max(height * 0.08, 2.0)
+    nx = np.minimum(map_x / edge_x, (width - 1 - map_x) / edge_x)
+    ny = np.minimum(map_y / edge_y, (height - 1 - map_y) / edge_y)
+    t = np.clip(np.minimum(nx, ny), 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
 
-    # Downscale first so every subsequent step is fast and well-conditioned
-    small = _downscale_images(raw_images)
 
-    # Enhance contrast to help feature detection on low-texture surfaces
-    images = _enhance_images(small)
+def _fill_poles(composed: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Extend the captured band to the poles so the frame is a full 2:1 equirect.
 
-    # Try 1: OpenCV global stitcher (best quality when it works)
-    panorama = _try_opencv_stitcher(images)
-
-    # Try 2: cylindrical projection fallback (handles rotational 360° captures)
-    if panorama is None:
-        logger.info("Falling back to cylindrical projection stitching...")
-        panorama = _cylindrical_stitch(images)
-
-    if panorama is None:
-        logger.error("All stitching methods failed")
-        return False
-
-    panorama = _crop_black_borders(panorama)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_path), panorama, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    logger.info("Panorama saved to %s (%dx%d)", output_path, panorama.shape[1], panorama.shape[0])
-    return True
+    Real phone photos only cover the lens's vertical field, not 180°. The
+    poles are a blurred continuation of the top and bottom captured rows.
+    """
+    height = composed.shape[0]
+    row_fraction = valid.mean(axis=1)
+    content = np.where(row_fraction > 0.15)[0]
+    if len(content) == 0:
+        return composed
+    top = int(content[0])
+    bottom = int(content[-1])
+    filled = composed.copy()
+    if top > 0:
+        filled[:top] = composed[top]
+    if bottom < height - 1:
+        filled[bottom + 1 :] = composed[bottom]
+    blurred = cv2.GaussianBlur(filled, (0, 0), sigmaX=24, sigmaY=18)
+    band = np.zeros((height,), dtype=np.float32)
+    band[top : bottom + 1] = 1.0
+    ramp = 24
+    for offset in range(ramp):
+        fade = 1.0 - (offset + 1) / ramp
+        above = top - offset - 1
+        below = bottom + offset + 1
+        if above >= 0:
+            band[above] = fade
+        if below < height:
+            band[below] = fade
+    alpha = band[:, None, None]
+    return composed * alpha + blurred * (1.0 - alpha)

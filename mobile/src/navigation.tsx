@@ -7,6 +7,15 @@ import CaptureScreen from './screens/CaptureScreen';
 import ReviewScreen from './screens/ReviewScreen';
 import ProcessingScreen from './screens/ProcessingScreen';
 import PanoramaScreen from './screens/PanoramaScreen';
+import WorldScreen from './screens/WorldScreen';
+
+export type ViewerMode = 'original' | 'staged' | 'compare';
+
+export type ReviewSegment = {
+  id: number;
+  imageUri: string | null;
+  actualYaw: number | null;
+};
 
 export type RootStackParamList = {
   Home: undefined;
@@ -14,14 +23,21 @@ export type RootStackParamList = {
   Review: {
     projectId: string;
     projectName: string;
-    segments: { id: number; imageUri: string | null }[];
+    hfov: number;
+    lens?: string;
+    segments: ReviewSegment[];
   };
   Processing: {
     projectId: string;
     projectName: string;
     imageUris?: string[];
+    yaws?: number[];
+    hfov?: number;
+    lens?: string;
+    retry?: boolean;
   };
   Panorama: { projectId: string; projectName: string };
+  World: { projectId: string; projectName: string };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -41,6 +57,7 @@ export default function Navigation() {
         <Stack.Screen name="Review" component={ReviewScreen} />
         <Stack.Screen name="Processing" component={ProcessingScreen} />
         <Stack.Screen name="Panorama" component={PanoramaScreen} />
+        <Stack.Screen name="World" component={WorldScreen} />
       </Stack.Navigator>
     </NavigationContainer>
   );

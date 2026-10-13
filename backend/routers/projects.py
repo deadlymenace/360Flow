@@ -1,206 +1,240 @@
-import asyncio
+"""Project, upload, stitch, staging, and world-generation endpoints."""
+
+from __future__ import annotations
+
+import json
 import logging
-from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 
-from models.project import (
-    CreateProjectRequest,
-    Project,
-    ProjectStatus,
-    StageRequest,
-    projects_db,
-)
-from services.stitcher import stitch_images
-from services.staging_mock import mock_stage
-from services.world_gen_mock import mock_generate_3d
-from storage.local import get_panorama_path, get_upload_images, save_upload
+from db import TRANSIENT_STATUSES, get_project, update_project
+from db import create_project as create_project_row
+from db import list_projects as list_project_rows
+from models.project import CreateProjectRequest, Project, StageRequest, UploadMetadata
+from routers.responses import jpeg_response, labeled_jpeg, status_body, to_project
+from services.disclosure import DISCLOSURE_TEXT
+from services.pipeline import enqueue, run_stage, run_stitch, run_world
+from services.uploads import normalize_upload
+from storage import get_storage, panorama_key, staged_key, upload_key
+from config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _async_stitch(project_id: str):
-    """Run stitching in a background task with proper error handling."""
-    project = projects_db.get(project_id)
-    if not project:
-        return
+async def _read_limited(upload: UploadFile, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Each image must be at most {limit // (1024 * 1024)} MB",
+            )
+        chunks.append(chunk)
+    if total == 0:
+        raise HTTPException(status_code=400, detail="Empty image upload")
+    return b"".join(chunks)
 
-    project.status = ProjectStatus.STITCHING
-    image_paths = get_upload_images(project_id)
-    output_path = get_panorama_path(project_id)
 
+def _parse_metadata(raw: str | None, count: int) -> UploadMetadata:
+    if not raw:
+        return UploadMetadata()
     try:
-        loop = asyncio.get_event_loop()
-        success = await loop.run_in_executor(None, stitch_images, image_paths, output_path)
-    except Exception as e:
-        logger.exception("Project %s stitching crashed: %s", project_id, e)
-        project.status = ProjectStatus.FAILED
-        project.error = f"Stitching error: {e}"
-        return
+        meta = UploadMetadata.model_validate_json(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="metadata must be JSON") from exc
+    if meta.hfov_deg is not None and not 30 <= meta.hfov_deg <= 150:
+        raise HTTPException(status_code=400, detail="hfov_deg must be between 30 and 150")
+    if meta.yaws_deg is not None and len(meta.yaws_deg) != count:
+        raise HTTPException(status_code=400, detail="yaws_deg must have one value per image")
+    return meta
 
-    if success:
-        project.status = ProjectStatus.STITCHED
-        project.panorama_path = str(output_path)
-        logger.info("Project %s stitching complete", project_id)
-    else:
-        project.status = ProjectStatus.FAILED
-        project.error = "Stitching failed. Try recapturing with more overlap between photos."
-        logger.error("Project %s stitching failed", project_id)
+
+def _require(project_id: str):
+    project = get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+def _reject_if_busy(status: str) -> None:
+    if status in TRANSIENT_STATUSES and not get_settings().jobs_inline:
+        raise HTTPException(status_code=409, detail="This project is already processing")
 
 
 @router.post("/projects")
-async def create_project(req: CreateProjectRequest) -> Project:
-    project = Project(name=req.name)
-    projects_db[project.id] = project
-    return project
+async def create_project(req: CreateProjectRequest, request: Request) -> Project:
+    return to_project(create_project_row(req.name), request)
 
 
 @router.get("/projects")
-async def list_projects() -> list[Project]:
-    return list(projects_db.values())
+async def list_projects(request: Request) -> list[Project]:
+    return [to_project(row, request) for row in list_project_rows()]
 
 
 @router.get("/projects/{project_id}")
-async def get_project(project_id: str) -> Project:
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return project
+async def get_one(project_id: str, request: Request) -> Project:
+    return to_project(_require(project_id), request)
 
 
 @router.post("/projects/{project_id}/upload")
-async def upload_images(project_id: str, images: list[UploadFile] = File(...)):
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+async def upload_images(
+    project_id: str,
+    images: list[UploadFile] = File(...),
+    metadata: str | None = Form(default=None),
+):
+    project = _require(project_id)
+    _reject_if_busy(project.status)
+    settings = get_settings()
+    count = len(images)
+    if count < settings.min_images or count > settings.max_images:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Upload between {settings.min_images} and {settings.max_images} images",
+        )
+    meta = _parse_metadata(metadata, count)
+    payloads = [normalize_upload(await _read_limited(image, settings.max_image_bytes)) for image in images]
 
-    project.status = ProjectStatus.UPLOADING
+    storage = get_storage()
+    storage.delete_prefix(f"uploads/{project_id}/")
+    storage.delete_prefix(panorama_key(project_id))
+    storage.delete_prefix(staged_key(project_id))
+    for index, payload in enumerate(payloads):
+        storage.put_bytes(upload_key(project_id, index), payload, "image/jpeg")
 
-    for i, image in enumerate(images):
-        data = await image.read()
-        filename = f"{i:02d}_{image.filename}"
-        save_upload(project_id, filename, data)
-
-    project.image_count = len(images)
-    logger.info("Project %s: uploaded %d images", project_id, len(images))
-
-    # Start stitching as async background task
-    asyncio.create_task(_async_stitch(project_id))
-
-    return {"status": "stitching", "image_count": len(images)}
+    update_project(
+        project_id,
+        status="stitching",
+        image_count=count,
+        error=None,
+        hfov_deg=meta.hfov_deg,
+        yaws_json=json.dumps(meta.yaws_deg) if meta.yaws_deg is not None else None,
+        lens=meta.lens,
+        panorama_key=None,
+        staged_key=None,
+        staging_prompt=None,
+        staging_provider=None,
+        world_provider=None,
+        world_id=None,
+        world_marble_url=None,
+        world_splat_url=None,
+        world_mesh_url=None,
+        world_thumbnail_url=None,
+        world_operation_id=None,
+    )
+    logger.info("Project %s: stored %d images", project_id, count)
+    await enqueue(run_stitch(project_id))
+    latest = get_project(project_id)
+    return {"status": latest.status if latest else "stitching", "image_count": count}
 
 
 @router.get("/projects/{project_id}/status")
-async def get_status(project_id: str):
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+async def get_status(project_id: str, request: Request):
+    return status_body(_require(project_id), request)
 
-    progress = 0
-    if project.status == ProjectStatus.UPLOADING:
-        progress = 25
-    elif project.status == ProjectStatus.STITCHING:
-        progress = 50
-    elif project.status in (ProjectStatus.STITCHED, ProjectStatus.STAGED, ProjectStatus.COMPLETE):
-        progress = 100
 
-    return {
-        "status": project.status.value,
-        "progress": progress,
-        "error": project.error,
-    }
+@router.post("/projects/{project_id}/retry")
+async def retry_project(project_id: str):
+    project = _require(project_id)
+    if project.status != "failed":
+        raise HTTPException(status_code=400, detail="Only a failed project can be retried")
+    storage = get_storage()
+    uploads = storage.list_keys(f"uploads/{project_id}/")
+    if project.staged_key:
+        await enqueue(run_world(project_id))
+        return {"status": "generating_3d"}
+    if project.panorama_key and project.staging_prompt:
+        await enqueue(run_stage(project_id))
+        return {"status": "staging"}
+    if not uploads:
+        raise HTTPException(status_code=400, detail="No uploaded images to retry")
+    await enqueue(run_stitch(project_id))
+    return {"status": "stitching"}
 
 
 @router.get("/projects/{project_id}/panorama")
-async def get_panorama(project_id: str):
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    pano_path = get_panorama_path(project_id)
-    if not pano_path.exists():
+async def get_panorama(project_id: str, download: bool = Query(default=False)):
+    project = _require(project_id)
+    if not project.panorama_key:
         raise HTTPException(status_code=404, detail="Panorama not ready yet")
+    data = get_storage().get_bytes(project.panorama_key)
+    return jpeg_response(data, f"{project_id}-original.jpg", download)
 
-    return FileResponse(pano_path, media_type="image/jpeg")
+
+@router.get("/projects/{project_id}/staged")
+async def get_staged(project_id: str, download: bool = Query(default=False)):
+    project = _require(project_id)
+    if not project.staged_key:
+        raise HTTPException(status_code=404, detail="Staged panorama not ready yet")
+    data = get_storage().get_bytes(project.staged_key)
+    return labeled_jpeg(data, f"{project_id}-staged.jpg", download)
 
 
 @router.post("/projects/{project_id}/stage")
 async def stage_project(project_id: str, req: StageRequest):
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if not project.panorama_path:
+    project = _require(project_id)
+    if not project.panorama_key:
         raise HTTPException(status_code=400, detail="No panorama available to stage")
-
-    project.status = ProjectStatus.STAGING
-    project.staging_prompt = req.prompt
-    project.staging_started_at = datetime.now(timezone.utc)
-
-    # Run mock staging in background
-    asyncio.create_task(_async_stage(project_id, project.panorama_path, req.prompt))
-    return {"status": "staging", "prompt": req.prompt}
-
-
-async def _async_stage(project_id: str, panorama_path: str, prompt: str):
-    result = await mock_stage(panorama_path, prompt)
-    project = projects_db.get(project_id)
-    if project:
-        project.status = ProjectStatus.STAGED
+    _reject_if_busy(project.status)
+    update_project(project_id, staging_prompt=req.prompt, status="staging", error=None)
+    await enqueue(run_stage(project_id))
+    latest = get_project(project_id)
+    return {"status": latest.status if latest else "staging", "prompt": req.prompt}
 
 
 @router.get("/projects/{project_id}/stage/status")
 async def get_stage_status(project_id: str):
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
+    project = _require(project_id)
+    provider = project.staging_provider
+    if provider is None:
+        provider = "nanobanana" if get_settings().nanobanana_api_key else "nanobanana_mock"
     return {
-        "status": project.status.value,
+        "status": project.status,
         "prompt": project.staging_prompt,
-        "provider": "nanobanana_mock",
+        "provider": provider,
+        "has_staged": bool(project.staged_key),
+        "disclosure": DISCLOSURE_TEXT if project.staged_key else None,
+        "error": project.error,
     }
 
 
 @router.post("/projects/{project_id}/generate-3d")
 async def generate_3d(project_id: str):
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if not project.panorama_path:
-        raise HTTPException(status_code=400, detail="No panorama available")
-
-    project.status = ProjectStatus.GENERATING_3D
-    project.gen3d_started_at = datetime.now(timezone.utc)
-
-    asyncio.create_task(_async_generate_3d(project_id, project.panorama_path))
-    return {"status": "generating_3d"}
-
-
-async def _async_generate_3d(project_id: str, panorama_path: str):
-    result = await mock_generate_3d(panorama_path)
-    project = projects_db.get(project_id)
-    if project:
-        project.status = ProjectStatus.COMPLETE
+    project = _require(project_id)
+    if not project.staged_key:
+        raise HTTPException(status_code=400, detail="Stage the panorama before generating a 3D world")
+    _reject_if_busy(project.status)
+    update_project(project_id, status="generating_3d", error=None)
+    await enqueue(run_world(project_id))
+    latest = get_project(project_id)
+    return {"status": latest.status if latest else "generating_3d"}
 
 
 @router.get("/projects/{project_id}/generate-3d/status")
-async def get_generate_3d_status(project_id: str):
-    project = projects_db.get(project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-
+async def get_generate_3d_status(project_id: str, request: Request):
+    project = _require(project_id)
+    provider = project.world_provider
+    if provider is None:
+        provider = "worldlabs" if get_settings().worldlabs_api_key else "worldlabs_mock"
     assets = None
-    if project.status == ProjectStatus.COMPLETE:
+    if project.status == "complete":
+        share = to_project(project, request).share_url or ""
         assets = {
-            "splat_url": "https://mock.worldlabs.ai/assets/fake-splat.spz",
-            "mesh_url": "https://mock.worldlabs.ai/assets/fake-mesh.glb",
-            "thumbnail_url": "https://mock.worldlabs.ai/assets/fake-thumb.jpg",
+            "viewer_url": f"{share}/world",
+            "marble_url": project.world_marble_url,
+            "splat_url": project.world_splat_url,
+            "mesh_url": project.world_mesh_url,
+            "thumbnail_url": project.world_thumbnail_url,
         }
-
     return {
-        "status": project.status.value,
+        "status": project.status,
         "assets": assets,
-        "provider": "worldlabs_mock",
+        "provider": provider,
+        "error": project.error,
+        "disclosure": DISCLOSURE_TEXT if project.staged_key else None,
     }

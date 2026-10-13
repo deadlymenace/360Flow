@@ -10,7 +10,7 @@ import {
 } from 'react-native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
-import { SEGMENT_COUNT } from '../models/types';
+import { SEGMENT_ANGLE, SEGMENT_COUNT } from '../models/types';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const GRID_PADDING = 16;
@@ -20,20 +20,20 @@ const THUMB_SIZE = (SCREEN_WIDTH - GRID_PADDING * 2 - GRID_GAP * 3) / 4;
 type Props = NativeStackScreenProps<RootStackParamList, 'Review'>;
 
 export default function ReviewScreen({ navigation, route }: Props) {
-  const { projectId, projectName, segments } = route.params;
+  const { projectId, projectName, hfov, lens, segments } = route.params;
 
   const capturedCount = segments.filter((s) => s.imageUri !== null).length;
   const allCaptured = capturedCount === SEGMENT_COUNT;
 
   const handleUpload = () => {
-    const imageUris = segments
-      .filter((s) => s.imageUri !== null)
-      .map((s) => s.imageUri as string);
-
+    const ordered = segments.filter((s) => s.imageUri !== null);
     navigation.navigate('Processing', {
       projectId,
       projectName,
-      imageUris,
+      imageUris: ordered.map((s) => s.imageUri as string),
+      yaws: ordered.map((s) => s.actualYaw ?? s.id * SEGMENT_ANGLE),
+      hfov,
+      lens,
     });
   };
 
