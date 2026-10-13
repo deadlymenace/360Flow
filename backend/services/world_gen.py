@@ -24,6 +24,14 @@ WORLD_FAILED_MESSAGE = "3D generation failed. Try again."
 WORLD_CREDITS_MESSAGE = "3D generation is unavailable right now (provider credits)."
 WORLD_PROVIDER_QUOTA_MESSAGE = "3D generation is unavailable right now (provider quota)."
 
+# Pano world generation. Draft is 150; marble-1.0 / marble-1.1 are 1,500.
+# A plus model can cost more, so 1,500 is only the minimum that must be on hand.
+DRAFT_WORLD_CREDITS = 150
+FULL_WORLD_CREDITS = 1500
+CREDIT_CACHE_TTL_S = 30.0
+
+_credit_cache: dict | None = None
+
 
 class ProviderFailure(Exception):
     """Provider error with a client-safe sentence and an internal detail string."""
@@ -53,6 +61,87 @@ def provider_detail(status_code: int | None, message: str) -> str:
     if status_code is None:
         return text
     return f"HTTP {status_code}: {text}"
+
+
+def credits_required(model: str) -> int:
+    """Minimum credits for one world. Pano input adds no extra pano-generation charge."""
+    if "draft" in model:
+        return DRAFT_WORLD_CREDITS
+    return FULL_WORLD_CREDITS
+
+
+def clear_world_credits_cache() -> None:
+    global _credit_cache
+    _credit_cache = None
+
+
+def note_out_of_credits() -> None:
+    """Remember a zero balance so the next job fails before it calls generate."""
+    global _credit_cache
+    _credit_cache = {"at": time.monotonic(), "remaining": 0.0}
+
+
+def _is_out_of_credits(exc: ProviderFailure) -> bool:
+    return exc.status_code == 402 or exc.client_message == WORLD_CREDITS_MESSAGE
+
+
+async def world_credits_balance() -> float | None:
+    """Remaining World Labs credits.
+
+    The value is cached for ``CREDIT_CACHE_TTL_S``. None means the key is unset
+    or the credits call failed; callers then let generation try and rely on a
+    402 to stop.
+    """
+    global _credit_cache
+    settings = get_settings()
+    if not settings.worldlabs_api_key:
+        return None
+    now = time.monotonic()
+    if _credit_cache is not None and now - float(_credit_cache["at"]) < CREDIT_CACHE_TTL_S:
+        return _credit_cache["remaining"]
+    remaining = await _fetch_credits(settings.worldlabs_api_key)
+    _credit_cache = {"at": now, "remaining": remaining}
+    return remaining
+
+
+async def _fetch_credits(api_key: str) -> float | None:
+    timeout = httpx.Timeout(5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.get(
+                f"{WORLDLABS_BASE}/marble/v1/credits",
+                headers={"WLT-Api-Key": api_key},
+            )
+    except Exception:
+        logger.warning("World Labs credits check failed", exc_info=True)
+        return None
+    if response.status_code >= 400:
+        logger.warning("World Labs credits check returned HTTP %s", response.status_code)
+        return None
+    try:
+        body = response.json()
+    except Exception:
+        logger.warning("World Labs credits check returned a body that is not JSON")
+        return None
+    remaining = body.get("remaining_credits") if isinstance(body, dict) else None
+    if not isinstance(remaining, (int, float)):
+        logger.warning("World Labs credits check did not include remaining_credits")
+        return None
+    logger.info("World Labs credits remaining: %s", remaining)
+    return float(remaining)
+
+
+async def _require_credits(model: str) -> None:
+    """Stop before worlds:generate when the cached balance cannot pay for this model."""
+    remaining = await world_credits_balance()
+    if remaining is None:
+        return
+    needed = credits_required(model)
+    if remaining >= needed:
+        return
+    detail = f"out of credits (remaining {remaining:g}, {model} needs {needed})"
+    logger.error("World Labs %s", detail)
+    raise ProviderFailure(WORLD_CREDITS_MESSAGE, detail, 402)
 
 
 def generation_models(draft_model: str | None, full_model: str) -> list[str]:
@@ -135,6 +224,7 @@ async def generate_world(
 
     headers = {"WLT-Api-Key": settings.worldlabs_api_key}
     timeout = httpx.Timeout(60.0, read=180.0)
+    await _require_credits(models[0])
     async with httpx.AsyncClient(timeout=timeout) as client:
         media_id = await _upload_panorama(client, headers, image_bytes)
         if on_media is not None:
@@ -181,6 +271,7 @@ async def continue_full_world(
         return await _mock_world([model], on_operation=on_operation, on_submitting=on_submitting)
     headers = {"WLT-Api-Key": settings.worldlabs_api_key}
     timeout = httpx.Timeout(60.0, read=180.0)
+    await _require_credits(model)
     async with httpx.AsyncClient(timeout=timeout) as client:
         media_id = media_asset_id or await _upload_panorama(client, headers, image_bytes)
         return await _generate_model(
@@ -241,6 +332,11 @@ async def _generate_models(
                 on_operation=on_operation,
                 on_submitting=on_submitting,
             )
+        except ProviderFailure as exc:
+            if phase == "draft" and not _is_out_of_credits(exc):
+                logger.error("Draft world failed (%s); continuing with the full model", exc.detail)
+                continue
+            raise
         except Exception:
             if phase == "draft":
                 logger.exception("Draft world failed; continuing with the full model")
@@ -344,6 +440,7 @@ async def _generate_model(
     on_submitting=None,
 ) -> dict:
     body = build_world_request(display_name, media_id, model, public)
+    await _require_credits(model)
     if on_submitting is not None:
         await on_submitting(phase)
     started = await client.post(
@@ -358,6 +455,7 @@ async def _generate_model(
         raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs did not return an operation id")
     if on_operation is not None:
         await on_operation(operation_id, phase)
+    clear_world_credits_cache()
     operation = await _poll_until_done(client, headers, operation_id, timeout_s, operation)
     _raise_operation_error(operation)
     parsed = parse_world(operation)
@@ -390,6 +488,9 @@ def _raise_for_status(response: httpx.Response, fallback: str) -> None:
         return
     message = _response_message(response) or fallback
     detail = provider_detail(response.status_code, message)
+    if response.status_code == 402 or world_client_message(response.status_code, message) == WORLD_CREDITS_MESSAGE:
+        note_out_of_credits()
+        detail = f"out of credits: {detail}"
     logger.error("World Labs request failed: %s", detail)
     raise ProviderFailure(world_client_message(response.status_code, message), detail, response.status_code)
 
@@ -402,9 +503,13 @@ def _raise_operation_error(operation: dict) -> None:
     code = err.get("code") if isinstance(err, dict) else None
     status = code if isinstance(code, int) and code >= 400 else None
     text = message or "World Labs generation failed"
+    client_message = world_client_message(status, text)
     detail = provider_detail(status, text)
+    if client_message == WORLD_CREDITS_MESSAGE:
+        note_out_of_credits()
+        detail = f"out of credits: {detail}"
     logger.error("World Labs operation failed: %s", detail)
-    raise ProviderFailure(world_client_message(status, text), detail, status)
+    raise ProviderFailure(client_message, detail, status)
 
 
 def _response_message(response: httpx.Response) -> str:

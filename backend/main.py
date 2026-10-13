@@ -2,10 +2,11 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from auth import _admin_key_matches
 from config import get_settings
 from db import fail_interrupted_jobs, init_db
 from services.pipeline import resume_durable_jobs
@@ -13,7 +14,7 @@ from httpguard import GuardMiddleware
 from routers.devices import router as devices_router
 from routers.projects import router as projects_router
 from routers.share import router as share_router
-from services.world_gen import retry_pending_world_deletes
+from services.world_gen import retry_pending_world_deletes, world_credits_balance
 from storage import init_storage
 
 
@@ -80,9 +81,9 @@ def create_app() -> FastAPI:
     app.include_router(share_router)
 
     @app.get("/health")
-    async def health():
+    async def health(x_api_key: str | None = Header(default=None)):
         current = get_settings()
-        return {
+        body = {
             "status": "ok",
             "storage": current.storage_backend_name,
             "database": current.database_backend_name,
@@ -91,6 +92,9 @@ def create_app() -> FastAPI:
             "auth": current.auth_mode,
             "admin": bool(current.api_key),
         }
+        if _admin_key_matches(x_api_key):
+            body["worldlabs_credits"] = await world_credits_balance()
+        return body
 
     return app
 
