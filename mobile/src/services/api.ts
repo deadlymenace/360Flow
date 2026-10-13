@@ -1,38 +1,63 @@
-import { Paths, File as ExpoFile } from 'expo-file-system';
+import { File as ExpoFile, Paths } from 'expo-file-system';
 import Constants from 'expo-constants';
-import { Project, StatusResponse } from '../models/types';
+import { Project, StageStatus, StatusResponse, WorldStatus } from '../models/types';
 
-// Auto-detect the backend URL from the Expo dev server host.
-// When running via Expo Go on a physical device, this extracts the host IP
-// from the Expo manifest so the app can reach the backend without hardcoding.
-function getBaseUrl(): string {
-  const debuggerHost =
-    Constants.expoConfig?.hostUri ?? Constants.manifest2?.extra?.expoGo?.debuggerHost;
+function configuredBaseUrl(): string | null {
+  const configured = process.env.EXPO_PUBLIC_API_URL?.trim();
+  if (!configured) return null;
+  const trimmed = configured.replace(/\/$/, '');
+  return trimmed.endsWith('/api/v1') ? trimmed : `${trimmed}/api/v1`;
+}
+
+// EXPO_PUBLIC_API_URL wins so an installed build can reach Railway.
+// The Expo dev host is only a fallback for Expo Go on the same Wi-Fi.
+export function getBaseUrl(): string {
+  const configured = configuredBaseUrl();
+  if (configured) return configured;
+
+  const extra = Constants.manifest2?.extra as { expoGo?: { debuggerHost?: string } } | undefined;
+  const debuggerHost = Constants.expoConfig?.hostUri ?? extra?.expoGo?.debuggerHost;
   if (debuggerHost) {
-    const host = debuggerHost.split(':')[0]; // strip the Expo port
+    const host = debuggerHost.split(':')[0];
     return `http://${host}:8000/api/v1`;
   }
-  // Fallback for local development / emulator
   return 'http://localhost:8000/api/v1';
 }
 
-const BASE_URL = getBaseUrl();
+export function getApiOrigin(): string {
+  return getBaseUrl().replace(/\/api\/v1\/?$/, '');
+}
 
-const REQUEST_TIMEOUT = 10000; // 10 seconds
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const headers = { ...extra };
+  const key = process.env.EXPO_PUBLIC_API_KEY?.trim();
+  if (key) headers['X-API-Key'] = key;
+  return headers;
+}
+
+const REQUEST_TIMEOUT = 10000;
 
 function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = REQUEST_TIMEOUT): Promise<Response> {
+  const headers = authHeaders(options.headers as Record<string, string> | undefined);
   return Promise.race([
-    fetch(url, options),
+    fetch(url, { ...options, headers }),
     new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('Request timed out — is the backend running?')), timeout)
     ),
   ]);
 }
 
+export interface UploadOptions {
+  yaws?: number[];
+  hfov?: number;
+  lens?: string;
+  onProgress?: (progress: number) => void;
+}
+
 class APIService {
   private baseUrl: string;
 
-  constructor(baseUrl: string = BASE_URL) {
+  constructor(baseUrl: string = getBaseUrl()) {
     this.baseUrl = baseUrl;
   }
 
@@ -58,33 +83,34 @@ class APIService {
     return res.json();
   }
 
-  async uploadImages(
-    projectId: string,
-    imageUris: string[],
-    onProgress?: (progress: number) => void
-  ): Promise<void> {
+  async uploadImages(projectId: string, imageUris: string[], options: UploadOptions = {}): Promise<void> {
     const formData = new FormData();
+    formData.append(
+      'metadata',
+      JSON.stringify({
+        hfov_deg: options.hfov,
+        yaws_deg: options.yaws,
+        lens: options.lens,
+      })
+    );
 
     for (let i = 0; i < imageUris.length; i++) {
       const uri = imageUris[i];
       const filename = `segment_${i.toString().padStart(2, '0')}.jpg`;
-
       formData.append('images', {
         uri,
         name: filename,
         type: 'image/jpeg',
-      } as any);
-
-      onProgress?.((i + 1) / imageUris.length * 0.5); // 0-50% for prep
+      } as unknown as Blob);
+      options.onProgress?.((i + 1) / imageUris.length * 0.5);
     }
 
-    const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/upload`, {
-      method: 'POST',
-      body: formData,
-    }, 60000); // 60s timeout for uploads
-
-    onProgress?.(1.0);
-
+    const res = await fetchWithTimeout(
+      `${this.baseUrl}/projects/${projectId}/upload`,
+      { method: 'POST', body: formData },
+      120000
+    );
+    options.onProgress?.(1);
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Upload failed: ${res.status} - ${text}`);
@@ -97,15 +123,12 @@ class APIService {
     return res.json();
   }
 
-  async getPanoramaUrl(projectId: string): Promise<string> {
-    return `${this.baseUrl}/projects/${projectId}/panorama`;
-  }
-
-  async downloadPanorama(projectId: string): Promise<string> {
-    const url = `${this.baseUrl}/projects/${projectId}/panorama`;
-    const dest = new ExpoFile(Paths.cache, `panorama_${projectId}.jpg`);
-
-    const output = await ExpoFile.downloadFileAsync(url, dest);
+  async downloadToCache(url: string, filename: string): Promise<string> {
+    const dest = new ExpoFile(Paths.cache, filename);
+    const output = await ExpoFile.downloadFileAsync(url, dest, {
+      headers: authHeaders(),
+      idempotent: true,
+    });
     return output.uri;
   }
 
@@ -118,7 +141,7 @@ class APIService {
     if (!res.ok) throw new Error(`Start staging failed: ${res.status}`);
   }
 
-  async getStagingStatus(projectId: string): Promise<{ status: string; prompt: string }> {
+  async getStagingStatus(projectId: string): Promise<StageStatus> {
     const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/stage/status`);
     if (!res.ok) throw new Error(`Get staging status failed: ${res.status}`);
     return res.json();
@@ -128,10 +151,23 @@ class APIService {
     const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/generate-3d`, {
       method: 'POST',
     });
-    if (!res.ok) throw new Error(`Start 3D generation failed: ${res.status}`);
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Start 3D generation failed: ${res.status} ${text}`);
+    }
   }
 
-  async getGenerate3DStatus(projectId: string): Promise<{ status: string; assets: any }> {
+  async retry(projectId: string): Promise<void> {
+    const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/retry`, {
+      method: 'POST',
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Retry failed: ${res.status} ${text}`);
+    }
+  }
+
+  async getGenerate3DStatus(projectId: string): Promise<WorldStatus> {
     const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/generate-3d/status`);
     if (!res.ok) throw new Error(`Get 3D status failed: ${res.status}`);
     return res.json();

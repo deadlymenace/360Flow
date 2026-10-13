@@ -16,7 +16,7 @@ type Props = NativeStackScreenProps<RootStackParamList, 'Processing'>;
 type Phase = 'uploading' | 'stitching' | 'done' | 'error';
 
 export default function ProcessingScreen({ navigation, route }: Props) {
-  const { projectId, projectName, imageUris } = route.params;
+  const { projectId, projectName, imageUris, yaws, hfov, lens, retry } = route.params;
   const [phase, setPhase] = useState<Phase>('uploading');
   const [uploadProgress, setUploadProgress] = useState(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -25,8 +25,9 @@ export default function ProcessingScreen({ navigation, route }: Props) {
   useEffect(() => {
     if (imageUris && imageUris.length > 0) {
       startUpload();
+    } else if (retry) {
+      startRetry();
     } else {
-      // Came from HomeScreen, just poll status
       setPhase('stitching');
       startPolling();
     }
@@ -39,10 +40,25 @@ export default function ProcessingScreen({ navigation, route }: Props) {
   const startUpload = async () => {
     try {
       setPhase('uploading');
-      await api.uploadImages(projectId, imageUris!, (progress) => {
-        setUploadProgress(progress);
+      await api.uploadImages(projectId, imageUris!, {
+        yaws,
+        hfov,
+        lens,
+        onProgress: (progress) => setUploadProgress(progress),
       });
       setPhase('stitching');
+      startPolling();
+    } catch (e: any) {
+      setPhase('error');
+      setErrorMsg(e.message);
+      HapticFeedback.error();
+    }
+  };
+
+  const startRetry = async () => {
+    try {
+      setPhase('stitching');
+      await api.retry(projectId);
       startPolling();
     } catch (e: any) {
       setPhase('error');
@@ -76,8 +92,7 @@ export default function ProcessingScreen({ navigation, route }: Props) {
     if (imageUris && imageUris.length > 0) {
       startUpload();
     } else {
-      setPhase('stitching');
-      startPolling();
+      startRetry();
     }
   };
 

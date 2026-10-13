@@ -32,7 +32,7 @@ export default function HomeScreen({ navigation }: Props) {
     try {
       setLoadError(null);
       const data = await api.listProjects();
-      setProjects(data.reverse());
+      setProjects(data);
     } catch (e: any) {
       setLoadError(e.message || 'Cannot connect to the backend');
     } finally {
@@ -69,13 +69,43 @@ export default function HomeScreen({ navigation }: Props) {
     }
   };
 
+  const openPanorama = (project: Project) => {
+    navigation.navigate('Panorama', { projectId: project.id, projectName: project.name });
+  };
+
   const handleProjectPress = (project: Project) => {
     if (project.status === 'created') {
       navigation.navigate('Capture', { projectId: project.id, projectName: project.name });
-    } else if (project.status === 'stitched' || project.status === 'staged' || project.status === 'complete') {
-      navigation.navigate('Panorama', { projectId: project.id, projectName: project.name });
-    } else if (project.status === 'stitching' || project.status === 'uploading') {
+      return;
+    }
+    if (project.status === 'uploading' || project.status === 'stitching') {
       navigation.navigate('Processing', { projectId: project.id, projectName: project.name });
+      return;
+    }
+    if (
+      project.status === 'stitched' ||
+      project.status === 'staging' ||
+      project.status === 'staged' ||
+      project.status === 'generating_3d' ||
+      project.status === 'complete' ||
+      project.has_original
+    ) {
+      openPanorama(project);
+      return;
+    }
+    if (project.status === 'failed') {
+      Alert.alert('Capture failed', project.error || 'The last step did not finish.', [
+        { text: 'Dismiss', style: 'cancel' },
+        {
+          text: 'Retry',
+          onPress: () =>
+            navigation.navigate('Processing', {
+              projectId: project.id,
+              projectName: project.name,
+              retry: true,
+            }),
+        },
+      ]);
     }
   };
 
