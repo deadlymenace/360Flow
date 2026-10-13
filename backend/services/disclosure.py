@@ -1,8 +1,8 @@
-"""Staging disclosure and the preservation prompt sent to NanoBanana.
+"""Staging disclosure and the preservation prompt sent to Gemini.
 
 The label is burned into every staged JPEG the API serves, and the viewers
 draw the same words on screen. The original panorama is never passed through
-this function.
+this function. Preservation is best effort: the model can still change the room.
 """
 
 from __future__ import annotations
@@ -17,27 +17,41 @@ _BAR_COLOR = (46, 26, 26)
 _TEXT_COLOR = (170, 236, 255)
 
 
-def build_staging_prompt(user_prompt: str) -> str:
+def build_staging_prompt(user_prompt: str, *, perspective: bool = False) -> str:
     """Fixed preservation instructions, then the user's style and furniture only.
 
-    NanoBanana cannot guarantee it will obey this. Callers must treat the
-    result as best effort and keep the unstaged original.
+    Gemini cannot guarantee it will obey this. Callers must treat the result as
+    best effort and keep the unstaged original. Perspective views share one
+    furniture list so the five crops of a panorama stay consistent.
     """
     style = " ".join(user_prompt.split())
+    if perspective:
+        opening = (
+            "Edit this perspective photograph. It is one view of a real room that was "
+            "captured as a 360° panorama. Other views of the same room use this exact furniture list."
+        )
+        closing = (
+            "Keep the added furniture consistent with that list. Do not change the camera angle. "
+            "Output one photorealistic photograph of this same view. No people, no text, no watermarks."
+        )
+    else:
+        opening = "Edit this equirectangular 360° photograph of a real room."
+        closing = (
+            "Output one photorealistic 2:1 equirectangular image. No people, no text, no watermarks, no extra rooms."
+        )
     return (
-        "Edit this equirectangular 360° photograph of a real room.\n\n"
+        f"{opening}\n\n"
         "PRESERVE EXACTLY. Do not change, move, remove, recolor, reshape, or replace any of the following: "
         "walls, wall color, trim, and built-in cabinetry; windows, doors, and glass; "
         "floors, ceiling, and flooring material; installed fixtures including lights, outlets, vents, "
-        "radiators, plumbing, and built-in appliances; room geometry; camera viewpoint; "
-        "and the equirectangular 2:1 projection. Do not change the view through the windows, "
-        "the time of day, or the direction of the light.\n\n"
+        "radiators, plumbing, and built-in appliances; room geometry; camera viewpoint. "
+        "Do not change the view through the windows, the time of day, or the direction of the light.\n\n"
         "ONLY ADD movable furniture and decor that is not part of the building: seating, tables, rugs, "
         "art, plants, lamps, cushions, and similar loose items. Do not remove architecture to make room. "
         "If the style request below asks to renovate, paint, or replace walls, windows, floors, or fixtures, "
         "ignore that part and only add furniture and decor.\n\n"
         f"Style and furniture to add: {style}\n\n"
-        "Output one photorealistic 2:1 equirectangular image. No people, no text, no watermarks, no extra rooms."
+        f"{closing}"
     )
 
 

@@ -1,7 +1,7 @@
 """Environment-driven settings.
 
 Postgres, R2, and the external APIs are optional. With nothing set, the API
-uses a SQLite file, local disk, and the NanoBanana / World Labs mocks.
+uses a SQLite file, local disk, and the Gemini / World Labs mocks.
 """
 
 from __future__ import annotations
@@ -75,10 +75,12 @@ class Settings:
     api_key: str | None
     public_base_url: str | None
     cors_origins: list[str]
-    nanobanana_api_key: str | None
-    nanobanana_resolution: str
+    gemini_api_key: str | None
+    gemini_model: str
+    gemini_image_size: str
     worldlabs_api_key: str | None
     worldlabs_model: str
+    worldlabs_draft_model: str | None
     worldlabs_public: bool
     stitch_concurrency: int
     jobs_inline: bool
@@ -103,7 +105,7 @@ class Settings:
 
     @property
     def staging_mode(self) -> str:
-        return "nanobanana" if self.nanobanana_api_key else "mock"
+        return "gemini" if self.gemini_api_key else "mock"
 
     @property
     def world_mode(self) -> str:
@@ -127,9 +129,16 @@ def get_settings() -> Settings:
     if not origins:
         origins = ["*"]
 
-    resolution = (_blank("NANOBANANA_RESOLUTION") or "2K").upper()
-    if resolution not in {"1K", "2K", "4K"}:
-        resolution = "2K"
+    image_size = (_blank("GEMINI_IMAGE_SIZE") or "1K").upper()
+    if image_size not in {"1K", "2K", "4K"}:
+        image_size = "1K"
+    draft = os.environ.get("WORLDLABS_DRAFT_MODEL")
+    if draft is None:
+        draft_model = "marble-1.0-draft"
+    elif draft.strip().lower() in {"", "off", "none", "false"}:
+        draft_model = None
+    else:
+        draft_model = draft.strip()
 
     return Settings(
         database_url=database_url,
@@ -142,10 +151,12 @@ def get_settings() -> Settings:
         api_key=_blank("API_KEY"),
         public_base_url=_blank("PUBLIC_BASE_URL"),
         cors_origins=origins,
-        nanobanana_api_key=_blank("NANOBANANA_API_KEY"),
-        nanobanana_resolution=resolution,
+        gemini_api_key=_blank("GEMINI_API_KEY"),
+        gemini_model=_blank("GEMINI_MODEL") or "gemini-nano-banana-2.1",
+        gemini_image_size=image_size,
         worldlabs_api_key=_blank("WORLDLABS_API_KEY"),
         worldlabs_model=_blank("WORLDLABS_MODEL") or "marble-1.1",
+        worldlabs_draft_model=draft_model,
         worldlabs_public=_bool("WORLDLABS_PUBLIC", True),
         stitch_concurrency=max(1, _int("STITCH_CONCURRENCY", 1)),
         jobs_inline=_bool("JOBS_INLINE", False),

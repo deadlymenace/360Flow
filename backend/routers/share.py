@@ -20,6 +20,16 @@ def _project(token: str):
     return project
 
 
+def _world_note(project) -> str:
+    if project.active_job == "staged_world":
+        return "A 3D walkthrough of the staged room is generating."
+    if project.world_preview_url and not project.world_marble_url:
+        return "A fast 3D preview is ready. The full walkthrough is still generating."
+    if project.active_job == "world" or project.status == "generating_3d":
+        return "The 3D walkthrough is generating. You can look around this panorama now."
+    return ""
+
+
 @router.get("/v/{token}", response_class=HTMLResponse)
 async def view_panorama(token: str, view: str = Query(default="original"), embed: int = Query(default=0)):
     project = _project(token)
@@ -29,25 +39,42 @@ async def view_panorama(token: str, view: str = Query(default="original"), embed
         title=project.name,
         asset_base=f"/v/{token}",
         has_staged=bool(project.staged_key),
-        has_world=project.status == "complete",
+        has_world=True,
         initial=view,
         embed=bool(embed),
+        world_note="" if embed else _world_note(project),
     )
     return HTMLResponse(html)
 
 
 @router.get("/v/{token}/world", response_class=HTMLResponse)
-async def view_world(token: str):
+async def view_world(token: str, source: str = Query(default="original")):
+    if source not in {"original", "staged"}:
+        raise HTTPException(status_code=400, detail="source must be original or staged")
     project = _project(token)
-    if project.status != "complete" and not project.panorama_key:
-        raise HTTPException(status_code=404, detail="World not ready yet")
     if not project.panorama_key:
         raise HTTPException(status_code=404, detail="Panorama not ready yet")
+    staged_source = source == "staged"
+    if staged_source and not project.staged_key:
+        raise HTTPException(status_code=404, detail="Staged panorama not ready yet")
+    if staged_source:
+        marble = project.staged_world_marble_url or project.staged_world_preview_url
+        preview = bool(marble and project.staged_world_preview_url and not project.staged_world_marble_url)
+        generating = project.active_job == "staged_world"
+    else:
+        marble = project.world_marble_url or project.world_preview_url
+        preview = bool(marble and project.world_preview_url and not project.world_marble_url)
+        generating = project.active_job == "world" or (
+            project.status == "generating_3d" and project.active_job != "staged_world"
+        )
     html = render_world_page(
         title=project.name,
         asset_base=f"/v/{token}",
-        marble_url=project.world_marble_url,
+        marble_url=marble,
         has_staged=bool(project.staged_key),
+        staged_source=staged_source,
+        preview=preview,
+        generating=generating,
     )
     return HTMLResponse(html)
 

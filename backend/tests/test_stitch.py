@@ -142,6 +142,13 @@ def test_synthetic_loop_is_two_to_one(tmp_path: Path):
         assert dx < width * 0.02, f"{color} longitude off by {dx:.1f}px"
         assert abs(y - expected_y) < height * 0.03, f"{color} latitude off by {y - expected_y:.1f}px"
 
+    # A 16-shot ring does not photograph the poles. The caps must still be a
+    # smooth fill, and the longitude cut has to agree.
+    assert float(panorama[:6].mean()) > 20, "zenith cap is black"
+    assert float(panorama[-6:].mean()) > 20, "nadir cap is black"
+    seam = np.abs(panorama[:, 0].astype(np.float32) - panorama[:, -1].astype(np.float32))
+    assert float(seam.mean()) < 4.0, f"left/right edges differ by {seam.mean():.2f}"
+
     artifact_dir = os.environ.get("STITCH_ARTIFACT_DIR")
     if artifact_dir:
         destination = Path(artifact_dir)

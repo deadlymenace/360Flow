@@ -20,6 +20,12 @@ export interface Project {
   world_thumbnail_url: string | null;
   world_splat_url: string | null;
   world_mesh_url: string | null;
+  world_preview_url: string | null;
+  staged_world_marble_url: string | null;
+  staged_world_preview_url: string | null;
+  staged_world_viewer_url: string | null;
+  staging_notes: string | null;
+  active_job: string | null;
   disclosure: string | null;
 }
 
@@ -43,6 +49,8 @@ export interface StatusResponse {
   has_staged?: boolean;
   staging_provider?: string | null;
   world_provider?: string | null;
+  world_preview_url?: string | null;
+  active_job?: string | null;
   disclosure?: string | null;
 }
 
@@ -52,12 +60,14 @@ export interface StageStatus {
   provider: string;
   has_staged: boolean;
   disclosure: string | null;
+  notes: string | null;
   error: string | null;
 }
 
 export interface WorldAssets {
   viewer_url: string;
   marble_url: string | null;
+  preview_url: string | null;
   splat_url: string | null;
   mesh_url: string | null;
   thumbnail_url: string | null;
@@ -69,6 +79,7 @@ export interface WorldStatus {
   error: string | null;
   disclosure: string | null;
   assets: WorldAssets | null;
+  staged_assets: WorldAssets | null;
 }
 
 export interface CaptureSegment {

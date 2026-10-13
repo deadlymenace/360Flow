@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, select
+from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from config import Settings, get_settings
@@ -46,6 +46,34 @@ class ProjectRow(Base):
     world_mesh_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     world_thumbnail_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     world_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    world_preview_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    world_preview_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    staged_world_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    staged_world_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    staged_world_marble_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staged_world_preview_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staged_world_splat_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staged_world_mesh_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staged_world_thumbnail_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staged_world_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    staging_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active_job: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+
+_EXTRA_COLUMNS = {
+    "world_preview_url": "TEXT",
+    "world_preview_id": "VARCHAR(64)",
+    "staged_world_provider": "VARCHAR(32)",
+    "staged_world_id": "VARCHAR(64)",
+    "staged_world_marble_url": "TEXT",
+    "staged_world_preview_url": "TEXT",
+    "staged_world_splat_url": "TEXT",
+    "staged_world_mesh_url": "TEXT",
+    "staged_world_thumbnail_url": "TEXT",
+    "staged_world_operation_id": "VARCHAR(64)",
+    "staging_notes": "TEXT",
+    "active_job": "VARCHAR(32)",
+}
 
 
 @dataclass
@@ -72,6 +100,18 @@ class ProjectRecord:
     world_mesh_url: str | None
     world_thumbnail_url: str | None
     world_operation_id: str | None
+    world_preview_url: str | None
+    world_preview_id: str | None
+    staged_world_provider: str | None
+    staged_world_id: str | None
+    staged_world_marble_url: str | None
+    staged_world_preview_url: str | None
+    staged_world_splat_url: str | None
+    staged_world_mesh_url: str | None
+    staged_world_thumbnail_url: str | None
+    staged_world_operation_id: str | None
+    staging_notes: str | None
+    active_job: str | None
 
 
 _engine = None
@@ -88,7 +128,16 @@ def init_db(settings: Settings | None = None) -> None:
         connect_args["check_same_thread"] = False
     _engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
     Base.metadata.create_all(_engine)
+    _ensure_columns(_engine)
     _Session = sessionmaker(bind=_engine, expire_on_commit=False)
+
+
+def _ensure_columns(engine) -> None:
+    existing = {column["name"] for column in inspect(engine).get_columns("projects")}
+    with engine.begin() as conn:
+        for name, ddl in _EXTRA_COLUMNS.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE projects ADD COLUMN {name} {ddl}"))
 
 
 def dispose_db() -> None:
@@ -139,6 +188,18 @@ def _record(row: ProjectRow) -> ProjectRecord:
         world_mesh_url=row.world_mesh_url,
         world_thumbnail_url=row.world_thumbnail_url,
         world_operation_id=row.world_operation_id,
+        world_preview_url=row.world_preview_url,
+        world_preview_id=row.world_preview_id,
+        staged_world_provider=row.staged_world_provider,
+        staged_world_id=row.staged_world_id,
+        staged_world_marble_url=row.staged_world_marble_url,
+        staged_world_preview_url=row.staged_world_preview_url,
+        staged_world_splat_url=row.staged_world_splat_url,
+        staged_world_mesh_url=row.staged_world_mesh_url,
+        staged_world_thumbnail_url=row.staged_world_thumbnail_url,
+        staged_world_operation_id=row.staged_world_operation_id,
+        staging_notes=row.staging_notes,
+        active_job=row.active_job,
     )
 
 
@@ -195,7 +256,14 @@ def fail_interrupted_jobs() -> int:
         rows = session.scalars(select(ProjectRow).where(ProjectRow.status.in_(TRANSIENT_STATUSES))).all()
         now = datetime.now(timezone.utc)
         for row in rows:
+            previous = row.status
             row.status = "failed"
+            if not row.active_job:
+                row.active_job = {
+                    "stitching": "stitch",
+                    "staging": "stage",
+                    "generating_3d": "world",
+                }.get(previous, "stitch")
             row.error = "Processing was interrupted by a server restart. Retry from the app."
             row.updated_at = now
         return len(rows)

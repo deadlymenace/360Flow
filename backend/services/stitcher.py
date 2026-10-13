@@ -8,8 +8,10 @@ circle.
 
 This pipeline instead projects each photo onto a shared equirectangular canvas
 with a pinhole camera at the captured yaw. Overlaps are feather-blended, the
-loop is 360° by construction, and the uncovered poles are filled so the JPEG
-is exactly 2:1 (the aspect World Labs expects for ``is_pano``).
+loop is 360° by construction. A ring of ultra-wide photos does not cover
+the zenith or nadir, so those caps are inpainted in pole-centered images
+(no black poles) and the left/right edges are sealed so the equirect wraps.
+The JPEG is exactly 2:1, which World Labs expects for ``is_pano``.
 """
 
 from __future__ import annotations
@@ -367,6 +369,7 @@ def _project_equirect(
     composed = np.zeros_like(acc)
     composed[valid] = acc[valid] / weight_acc[valid, None]
     panorama = _fill_poles(composed, valid)
+    panorama = _seal_seam(panorama)
     return np.clip(np.round(panorama), 0, 255).astype(np.uint8)
 
 
@@ -503,34 +506,171 @@ def _feather(map_x: np.ndarray, map_y: np.ndarray, width: int, height: int) -> n
 
 
 def _fill_poles(composed: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """Extend the captured band to the poles so the frame is a full 2:1 equirect.
+    """Inpaint the zenith and nadir, which a single photo ring does not see.
 
-    Real phone photos only cover the lens's vertical field, not 180°. The
-    poles are a blurred continuation of the top and bottom captured rows.
+    Phone ultra-wide shots cover roughly ±50° of latitude, so the equirect
+    poles would otherwise stay black. Each cap is filled in a square centered
+    on the pole, where the ceiling or floor is an ordinary disk instead of a
+    pinched equirectangular smear, then written back. Left and right edges
+    meet because that disk has no longitude cut.
     """
-    height = composed.shape[0]
-    row_fraction = valid.mean(axis=1)
-    content = np.where(row_fraction > 0.15)[0]
-    if len(content) == 0:
-        return composed
-    top = int(content[0])
-    bottom = int(content[-1])
     filled = composed.copy()
-    if top > 0:
-        filled[:top] = composed[top]
-    if bottom < height - 1:
-        filled[bottom + 1 :] = composed[bottom]
-    blurred = cv2.GaussianBlur(filled, (0, 0), sigmaX=24, sigmaY=18)
-    band = np.zeros((height,), dtype=np.float32)
-    band[top : bottom + 1] = 1.0
-    ramp = 24
-    for offset in range(ramp):
-        fade = 1.0 - (offset + 1) / ramp
-        above = top - offset - 1
-        below = bottom + offset + 1
-        if above >= 0:
-            band[above] = fade
-        if below < height:
-            band[below] = fade
-    alpha = band[:, None, None]
-    return composed * alpha + blurred * (1.0 - alpha)
+    _inpaint_pole_cap(filled, valid, zenith=True)
+    _inpaint_pole_cap(filled, valid, zenith=False)
+    return _inpaint_remaining_holes(filled, valid)
+
+
+def _inpaint_pole_cap(image: np.ndarray, valid: np.ndarray, *, zenith: bool) -> None:
+    height, width = image.shape[:2]
+    row_fraction = valid.mean(axis=1)
+    covered = np.where(row_fraction > 0.2)[0]
+    if len(covered) == 0:
+        return
+    if zenith:
+        boundary = int(covered[0])
+        if boundary <= 1:
+            return
+        lat_bound = np.pi / 2 - (boundary + 0.5) / height * np.pi
+        cap_radius = float(np.pi / 2 - lat_bound + np.radians(8))
+        row_limit = min(height, int(np.ceil(cap_radius / np.pi * height)) + 2)
+        rows = np.arange(0, row_limit)
+        lat = np.pi / 2 - (rows + 0.5) / height * np.pi
+    else:
+        boundary = int(covered[-1])
+        if boundary >= height - 2:
+            return
+        lat_bound = np.pi / 2 - (boundary + 0.5) / height * np.pi
+        cap_radius = float(lat_bound + np.pi / 2 + np.radians(8))
+        row_start = max(0, int(np.floor((np.pi - cap_radius) / np.pi * height)) - 2)
+        rows = np.arange(row_start, height)
+        lat = np.pi / 2 - (rows + 0.5) / height * np.pi
+    cap_radius = max(cap_radius, np.radians(4))
+    size = 192
+    cap, hole = _render_cap(image, valid, cap_radius, zenith=zenith, size=size)
+    if int(hole.sum()) < 8:
+        return
+    painted = _inpaint_uint8(cap, hole)
+    cols = np.arange(width)
+    lon = (cols + 0.5) / width * 2 * np.pi - np.pi
+    lon_grid, lat_grid = np.meshgrid(lon, lat)
+    ang = (np.pi / 2 - lat_grid) if zenith else (lat_grid + np.pi / 2)
+    radius = np.clip(ang / cap_radius, 0, 1.25)
+    hypot = radius / 2.0
+    nx = np.sin(lon_grid) * hypot
+    ny = -np.cos(lon_grid) * hypot
+    map_x = ((nx + 0.5) * size - 0.5).astype(np.float32)
+    map_y = ((ny + 0.5) * size - 0.5).astype(np.float32)
+    sampled = cv2.remap(
+        painted,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT_101,
+    ).astype(np.float32)
+    region_valid = valid[rows[0] : rows[-1] + 1]
+    hole_eq = ((~region_valid) & (radius <= 1.0)).astype(np.float32)
+    alpha = _blur_wrap_x(hole_eq, 3.5)
+    alpha = alpha[..., None]
+    region = image[rows[0] : rows[-1] + 1]
+    image[rows[0] : rows[-1] + 1] = region * (1.0 - alpha) + sampled * alpha
+
+
+def _render_cap(
+    image: np.ndarray,
+    valid: np.ndarray,
+    cap_radius: float,
+    *,
+    zenith: bool,
+    size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    ys, xs = np.mgrid[0:size, 0:size]
+    nx = (xs + 0.5) / size - 0.5
+    ny = (ys + 0.5) / size - 0.5
+    radius = np.hypot(nx, ny) * 2.0
+    ang = radius * cap_radius
+    lon = np.arctan2(nx, -ny)
+    lat = (np.pi / 2 - ang) if zenith else (-np.pi / 2 + ang)
+    cap = _sample_equirect(image, lon, lat)
+    known = _sample_equirect(valid.astype(np.float32), lon, lat) > 0.5
+    hole = (radius <= 1.0) & ~known
+    return cap, hole
+
+
+def _sample_equirect(image: np.ndarray, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    map_x = np.mod((lon + np.pi) / (2 * np.pi) * width, width).astype(np.float32)
+    map_y = np.clip((np.pi / 2 - lat) / np.pi * height, 0, height - 1).astype(np.float32)
+    source = image.astype(np.float32) if image.dtype != np.float32 else image
+    return cv2.remap(
+        source,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+
+def _inpaint_uint8(image: np.ndarray, hole: np.ndarray) -> np.ndarray:
+    rgb = np.clip(np.round(image), 0, 255).astype(np.uint8)
+    mask = hole.astype(np.uint8) * 255
+    if int(mask.sum()) == 0:
+        return rgb
+    try:
+        return cv2.inpaint(rgb, mask, 7, cv2.INPAINT_TELEA)
+    except cv2.error:
+        logger.warning("Pole inpaint failed; using a blurred cap")
+        blurred = cv2.GaussianBlur(rgb, (0, 0), 12)
+        rgb[hole] = blurred[hole]
+        return rgb
+
+
+def _inpaint_remaining_holes(image: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Fill any pixels the caps missed, wrapping so the seam is not a wall."""
+    hole = ~valid
+    if not bool(hole.any()):
+        return image
+    # Caps already covered the poles. Ignore pixels whose row is mostly empty;
+    # those belong to the caps. Remaining holes are gaps inside the band.
+    row_fraction = valid.mean(axis=1)
+    band = row_fraction > 0.2
+    hole = hole & band[:, None]
+    if not bool(hole.any()):
+        return image
+    pad = 24
+    rgb = np.clip(np.round(image), 0, 255).astype(np.uint8)
+    mask = hole.astype(np.uint8) * 255
+    padded = np.concatenate([rgb[:, -pad:], rgb, rgb[:, :pad]], axis=1)
+    mask_pad = np.concatenate([mask[:, -pad:], mask, mask[:, :pad]], axis=1)
+    try:
+        painted = cv2.inpaint(padded, mask_pad, 5, cv2.INPAINT_TELEA)
+    except cv2.error:
+        return image
+    cropped = painted[:, pad:-pad].astype(np.float32)
+    out = image.copy()
+    out[hole] = cropped[hole]
+    return out
+
+
+def _blur_wrap_x(image: np.ndarray, sigma: float) -> np.ndarray:
+    pad = int(sigma * 3) + 1
+    padded = np.concatenate([image[:, -pad:], image, image[:, :pad]], axis=1)
+    blurred = cv2.GaussianBlur(padded, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    return blurred[:, pad:-pad]
+
+
+def _seal_seam(image: np.ndarray, width: int = 16) -> np.ndarray:
+    """Spread any left/right step so column 0 and the last column match.
+
+    Marble treats a 2:1 image as a panorama only when those edges meet.
+    A zero step is left unchanged.
+    """
+    height, width_px = image.shape[:2]
+    width = min(width, max(2, width_px // 8))
+    if width_px < width * 2 or height == 0:
+        return image
+    out = image.copy()
+    delta = out[:, 0] - out[:, -1]
+    fade = np.linspace(1.0, 0.0, width, endpoint=False, dtype=np.float32)
+    out[:, :width] -= delta[:, None, :] * fade[None, :, None] * 0.5
+    out[:, -width:] += delta[:, None, :] * fade[::-1][None, :, None] * 0.5
+    return out

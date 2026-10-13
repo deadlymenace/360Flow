@@ -126,6 +126,18 @@ async def upload_images(
         world_mesh_url=None,
         world_thumbnail_url=None,
         world_operation_id=None,
+        world_preview_url=None,
+        world_preview_id=None,
+        staged_world_provider=None,
+        staged_world_id=None,
+        staged_world_marble_url=None,
+        staged_world_preview_url=None,
+        staged_world_splat_url=None,
+        staged_world_mesh_url=None,
+        staged_world_thumbnail_url=None,
+        staged_world_operation_id=None,
+        staging_notes=None,
+        active_job="stitch",
     )
     logger.info("Project %s: stored %d images", project_id, count)
     await enqueue(run_stitch(project_id))
@@ -145,12 +157,16 @@ async def retry_project(project_id: str):
         raise HTTPException(status_code=400, detail="Only a failed project can be retried")
     storage = get_storage()
     uploads = storage.list_keys(f"uploads/{project_id}/")
-    if project.staged_key:
-        await enqueue(run_world(project_id))
-        return {"status": "generating_3d"}
-    if project.panorama_key and project.staging_prompt:
+    job = project.active_job
+    if job == "stage":
         await enqueue(run_stage(project_id))
         return {"status": "staging"}
+    if job == "staged_world":
+        await enqueue(run_world(project_id, source="staged"))
+        return {"status": "generating_3d"}
+    if job == "world":
+        await enqueue(run_world(project_id, source="original"))
+        return {"status": "generating_3d"}
     if not uploads:
         raise HTTPException(status_code=400, detail="No uploaded images to retry")
     await enqueue(run_stitch(project_id))
@@ -192,25 +208,29 @@ async def get_stage_status(project_id: str):
     project = _require(project_id)
     provider = project.staging_provider
     if provider is None:
-        provider = "nanobanana" if get_settings().nanobanana_api_key else "nanobanana_mock"
+        provider = "gemini" if get_settings().gemini_api_key else "gemini_mock"
     return {
         "status": project.status,
         "prompt": project.staging_prompt,
         "provider": provider,
         "has_staged": bool(project.staged_key),
         "disclosure": DISCLOSURE_TEXT if project.staged_key else None,
+        "notes": project.staging_notes,
         "error": project.error,
     }
 
 
 @router.post("/projects/{project_id}/generate-3d")
-async def generate_3d(project_id: str):
+async def generate_3d(project_id: str, source: str = Query(default="original")):
+    if source not in {"original", "staged"}:
+        raise HTTPException(status_code=400, detail="source must be original or staged")
     project = _require(project_id)
-    if not project.staged_key:
-        raise HTTPException(status_code=400, detail="Stage the panorama before generating a 3D world")
+    if source == "original" and not project.panorama_key:
+        raise HTTPException(status_code=400, detail="No panorama available for a 3D world")
+    if source == "staged" and not project.staged_key:
+        raise HTTPException(status_code=400, detail="Stage the panorama before generating a 3D world from it")
     _reject_if_busy(project.status)
-    update_project(project_id, status="generating_3d", error=None)
-    await enqueue(run_world(project_id))
+    await enqueue(run_world(project_id, source=source))
     latest = get_project(project_id)
     return {"status": latest.status if latest else "generating_3d"}
 
@@ -221,19 +241,31 @@ async def get_generate_3d_status(project_id: str, request: Request):
     provider = project.world_provider
     if provider is None:
         provider = "worldlabs" if get_settings().worldlabs_api_key else "worldlabs_mock"
+    share = to_project(project, request).share_url or ""
     assets = None
-    if project.status == "complete":
-        share = to_project(project, request).share_url or ""
+    if project.panorama_key and (project.world_provider or project.world_marble_url or project.world_preview_url):
         assets = {
             "viewer_url": f"{share}/world",
             "marble_url": project.world_marble_url,
+            "preview_url": project.world_preview_url,
             "splat_url": project.world_splat_url,
             "mesh_url": project.world_mesh_url,
             "thumbnail_url": project.world_thumbnail_url,
         }
+    staged_assets = None
+    if project.staged_key and (project.staged_world_provider or project.staged_world_marble_url):
+        staged_assets = {
+            "viewer_url": f"{share}/world?source=staged",
+            "marble_url": project.staged_world_marble_url,
+            "preview_url": project.staged_world_preview_url,
+            "splat_url": project.staged_world_splat_url,
+            "mesh_url": project.staged_world_mesh_url,
+            "thumbnail_url": project.staged_world_thumbnail_url,
+        }
     return {
         "status": project.status,
         "assets": assets,
+        "staged_assets": staged_assets,
         "provider": provider,
         "error": project.error,
         "disclosure": DISCLOSURE_TEXT if project.staged_key else None,

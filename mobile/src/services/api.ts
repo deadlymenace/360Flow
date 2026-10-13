@@ -147,10 +147,13 @@ class APIService {
     return res.json();
   }
 
-  async startGenerate3D(projectId: string): Promise<void> {
-    const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/generate-3d`, {
-      method: 'POST',
-    });
+  async startGenerate3D(projectId: string, source: 'original' | 'staged' = 'original'): Promise<void> {
+    const res = await fetchWithTimeout(
+      `${this.baseUrl}/projects/${projectId}/generate-3d?source=${source}`,
+      {
+        method: 'POST',
+      },
+    );
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Start 3D generation failed: ${res.status} ${text}`);

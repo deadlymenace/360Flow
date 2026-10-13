@@ -1,16 +1,16 @@
 # 360Flow
 
-A mobile app for real estate professionals that captures 360° panoramas from phone photos, applies AI virtual staging, and generates navigable 3D worlds.
+A mobile app for real estate professionals that captures 360° panoramas from phone photos, generates a navigable 3D walkthrough, and can optionally add AI virtual staging.
 
 The working app is the Expo project in `mobile/`. The API is the FastAPI service in `backend/`. The SwiftUI app in `ios/` is the earlier native prototype and is not part of this pipeline.
 
 ## Flow
 
 1. On an iPhone 11 or newer, the app captures 16 portrait ultra-wide photos at 22.5° steps and records each shot's yaw and horizontal field of view.
-2. The API stitches those photos into a 2:1 equirectangular JPEG and keeps that original.
-3. The app and the public share page show the panorama in a 360° viewer.
-4. A text prompt or a furniture preset asks NanoBanana to add furniture and decor. The original stays stored. Every staged view and every exported staged JPEG carries the label **Virtually staged (AI)** and can be compared with the original.
-5. World Labs Marble turns the staged panorama into a navigable 3D world (`is_pano`). The app and the share page open that world when Marble returns a link.
+2. The API stitches those photos into an exact 2:1 equirectangular JPEG. The left and right edges are sealed so they match. A 16-shot ring covers about ±54° of latitude, so the zenith and nadir are inpainted caps, not photographed ceiling and floor. Optional upward and downward shots can be added later if the ceiling and floor need real geometry.
+3. The app and the public share page show the panorama immediately.
+4. World Labs Marble builds a 3D walkthrough from that original panorama (`is_pano`). A fast draft (`marble-1.0-draft`, about 20 seconds) is stored first, then the full world (`marble-1.1`, about 5 minutes).
+5. Staging is optional. A prompt or furniture preset asks Gemini to add furniture and decor on five overlapping views, keeping the original ceiling and floor. The unstaged panorama stays stored. Every staged view, every staged 3D world, and every exported staged JPEG carries the label **Virtually staged (AI)** and can be compared with the original. A staged panorama can get its own 3D world.
 
 ## Run it locally
 
@@ -79,40 +79,53 @@ An iOS build that you can install through TestFlight needs an Apple Developer ac
 
 | Field | Empty key | Key set |
 | --- | --- | --- |
-| `staging` | `mock` | `nanobanana` |
+| `staging` | `mock` | `gemini` |
 | `world` | `mock` | `worldlabs` |
 | `storage` | `local` | `r2` |
 | `database` | `sqlite` | `postgres` |
 | `auth` | `open` | `api-key` |
 
-Project records use `nanobanana_mock` / `nanobanana` and `worldlabs_mock` / `worldlabs`.
+Project records use `gemini_mock` / `gemini` and `worldlabs_mock` / `worldlabs`.
 
-Leave `NANOBANANA_API_KEY` unset and staging applies a local color grade. It does not add furniture. Set the key and the API calls [NanoBanana 2](https://nanobananaapi.ai/) (`POST /api/v1/nanobanana/generate-2`, then poll `record-info`). NanoBanana has to download the panorama, so the image URL must be a presigned R2 URL or `PUBLIC_BASE_URL` on a public host. A key with neither of those fails the job and names `PUBLIC_BASE_URL` or a presigned URL in the error. It does not silently fall back to the mock.
+Leave `GEMINI_API_KEY` unset and staging applies a local color grade. It does not add furniture. Set the key and the API calls the [Gemini image API](https://ai.google.dev/gemini-api/docs/image-generation): `POST https://generativelanguage.googleapis.com/v1/models/{model}:generateContent` with header `x-goog-api-key`, inline JPEG bytes, and `responseModalities` of `TEXT` and `IMAGE`. The default model is `gemini-nano-banana-2.1` (Nano Banana 2.1). `gemini-3.1-flash-image` (Nano Banana 2) is deprecated and has no published shutdown date; new projects should stay on 2.1. Override with `GEMINI_MODEL` if you need a different id. A key that the API rejects fails the staging job and names Gemini in the error. It does not silently fall back to the mock.
 
-Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the staged room on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean staged JPEG and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true` and `WORLDLABS_MODEL` (default `marble-1.1`). Worlds are public when `WORLDLABS_PUBLIC` is true, so the Marble link can be shared.
+Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the panorama on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean panorama (the original, or the unlabeled staged JPEG for a staged world) and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true`. The draft model `marble-1.0-draft` runs first. Its URL is saved as a preview while `marble-1.1` (`WORLDLABS_MODEL`) continues. A draft failure is logged and the full model still runs. Set `WORLDLABS_DRAFT_MODEL` to `off` to skip the draft. Worlds are public when `WORLDLABS_PUBLIC` is true, so the Marble link can be shared.
 
 ## Staging label and preservation
 
 The unstaged panorama is stored at `panoramas/{id}.jpg` and is never overwritten by staging. The clean staged JPEG is stored at `staged/{id}.jpg`.
 
 - In the app, Original / Compare / Staged switches the 360 viewer. Staged and Compare show **Virtually staged (AI)**.
-- The public page `/v/{share_token}` has the same modes and the same label. `/v/{share_token}/world` keeps the label when the source was staged.
+- The public page `/v/{share_token}` has the same modes and the same label. `/v/{share_token}/world` is the original walkthrough and hides the label. `/v/{share_token}/world?source=staged` keeps the label.
 - `GET /v/{token}/staged.jpg` and the in-app export download that JPEG with the label burned into a bar along the bottom.
 - The sphere texture (`/v/{token}/texture.jpg`) is the clean staged JPEG so the bar is not smeared across the south pole. The on-screen label is still shown.
 
 The user's prompt only chooses style and furniture. `build_staging_prompt` in `backend/services/disclosure.py` always puts a fixed instruction first: preserve walls, windows, doors, glass, floors, ceilings, and fixtures, and only add movable furniture and decor. Presets in the app describe furniture only.
 
-This is best effort. NanoBanana can still change architecture even when the prompt forbids it. The original panorama stays available so a person can compare and discard a bad result. The product does not claim the model guarantees preservation.
+This is best effort. Gemini can still change architecture even when the prompt forbids it. Each view is checked against the original edges; a view that moves walls or windows is retried once and then kept as the original photo, with a note on the project. The original panorama stays available so a person can compare and discard a bad result. The product does not claim the model guarantees preservation.
+
+## Ceiling, floor, and the seam
+
+Marble expects an exact 2:1 equirectangular image whose left and right edges match. The stitcher writes that aspect and spreads any left/right difference across a short band so the edges meet.
+
+A ring of 16 portrait ultra-wide photos leaves the zenith and nadir unphotographed (about ±54° of latitude is covered). Those caps are filled with a pole-centered inpaint so the poles are not black. The fill is a smooth continuation of the nearest photographed rows. It is not a picture of the ceiling or the floor. Adding optional shots aimed up and down would capture that geometry; the stitcher can already place a photo by pitch, and the capture flow does not take those shots yet.
 
 ## Deploy on Railway
 
-The service root is the repository root. Railway should build the root `Dockerfile` (`railway.toml` sets `dockerfilePath` and the `/health` check).
+The service root is the repository root. The image is the root `Dockerfile`. `.railway/railway.ts` records the `/health` check for Railway's config-as-code. Railway does not read that file during a normal deploy. After `railway` is linked, review and apply it:
 
-1. Create a Railway project from this repo and confirm the service uses that Dockerfile.
+```bash
+railway config plan
+railway config apply
+```
+
+`railway.toml` is removed because Railway stops honoring it on 2026-12-01 and it blocks the new config file. Review the plan before apply. If the service name in the plan does not match the service already in the project, applying can delete resources. Restart policy is set in the dashboard; the current DSL does not include it.
+
+1. Create a Railway project from this repo and confirm the service builds the root Dockerfile.
 2. Add a Postgres plugin and set `DATABASE_URL` to its connection string. `postgres://` URLs are accepted.
-3. Set `PUBLIC_BASE_URL` to the public Railway URL, with no trailing slash. Share links and NanoBanana both use it.
+3. Set `PUBLIC_BASE_URL` to the public Railway URL, with no trailing slash. Share links use it.
 4. Set `API_KEY` if the API should require `X-API-Key`. Share pages stay open.
-5. Set `NANOBANANA_API_KEY` and `WORLDLABS_API_KEY` when those accounts exist. Until then the health check reports `mock` for that step.
+5. Set `GEMINI_API_KEY` and `WORLDLABS_API_KEY` when those accounts exist. Until then the health check reports `mock` for that step.
 6. Optional: mount a volume at `/data` when you are still on local disk. `STORAGE_DIR` is already `/data` in the image.
 
 ## Cloudflare R2
@@ -128,7 +141,7 @@ S3_SECRET_ACCESS_KEY=<secret>
 S3_REGION=auto
 ```
 
-All three of bucket, access key, and secret must be set. The API then stores uploads, the original panorama, and the staged image in R2 and presigns the original for NanoBanana. Leave them empty and files stay on local disk.
+All three of bucket, access key, and secret must be set. The API then stores uploads, the original panorama, and the staged image in R2. Leave them empty and files stay on local disk. Gemini receives image bytes directly, so staging does not need a public image URL.
 
 ## Environment variables
 
@@ -136,7 +149,7 @@ Backend (`backend/.env.example`):
 
 | Variable | Purpose |
 | --- | --- |
-| `PUBLIC_BASE_URL` | Public origin for share links and NanoBanana image fetch |
+| `PUBLIC_BASE_URL` | Public origin for share links |
 | `API_KEY` | Shared secret for `/api/v1`. Blank leaves the API open |
 | `DATABASE_URL` | Postgres URL. Blank uses SQLite |
 | `STORAGE_DIR` | Local files. Docker uses `/data` |
@@ -146,10 +159,12 @@ Backend (`backend/.env.example`):
 | `S3_SECRET_ACCESS_KEY` | R2 secret |
 | `S3_REGION` | `auto` for R2 |
 | `CORS_ORIGINS` | Comma-separated origins, or `*` |
-| `NANOBANANA_API_KEY` | Blank uses the staging mock |
-| `NANOBANANA_RESOLUTION` | `1K`, `2K`, or `4K` (default `2K`) |
+| `GEMINI_API_KEY` | Blank uses the staging mock |
+| `GEMINI_MODEL` | Default `gemini-nano-banana-2.1` |
+| `GEMINI_IMAGE_SIZE` | `1K`, `2K`, or `4K` (default `1K`) |
 | `WORLDLABS_API_KEY` | Blank uses the world mock |
-| `WORLDLABS_MODEL` | Default `marble-1.1` |
+| `WORLDLABS_DRAFT_MODEL` | Default `marble-1.0-draft`. `off` skips the fast preview |
+| `WORLDLABS_MODEL` | Full world. Default `marble-1.1` |
 | `WORLDLABS_PUBLIC` | Default `true` so the Marble link is shareable |
 | `STITCH_CONCURRENCY` | Stitch and generation jobs at once |
 | `JOBS_INLINE` | Await jobs inside the request. Tests only |
@@ -168,8 +183,8 @@ Mobile (`mobile/.env.example`):
 
 ## What you need to supply
 
-- A [NanoBanana](https://nanobananaapi.ai/) API key, if staging should add furniture instead of the color-grade mock.
-- A [World Labs](https://docs.worldlabs.ai/api) API key (and credits), if the 3D step should return a real Marble world.
+- A [Gemini](https://ai.google.dev/gemini-api/docs/image-generation) API key (`GEMINI_API_KEY`), if staging should add furniture instead of the color-grade mock.
+- A [World Labs](https://docs.worldlabs.ai/api) API key (`WORLDLABS_API_KEY`) and credits, if the 3D step should return a real Marble world. The draft model runs first, then the full model.
 - A Railway account for the API, and a public URL to put in `PUBLIC_BASE_URL`.
 - A Cloudflare R2 bucket and token for photo storage. Local disk works for a single server with a `/data` volume.
 - An Apple Developer account to ship the iPhone app through TestFlight. Ultra-wide capture is iPhone 11 and newer.
@@ -181,5 +196,5 @@ backend/          FastAPI API, stitcher, staging, World Labs, share viewer
 mobile/           Expo app: capture, 360 viewer, staging, 3D, share
 ios/              Legacy SwiftUI prototype
 Dockerfile        Railway image (context is the repo root)
-railway.toml      Dockerfile builder and /health check
+.railway/railway.ts  Health check for `railway config apply`
 ```

@@ -37,6 +37,12 @@ class Project(BaseModel):
     world_thumbnail_url: Optional[str] = None
     world_splat_url: Optional[str] = None
     world_mesh_url: Optional[str] = None
+    world_preview_url: Optional[str] = None
+    staged_world_marble_url: Optional[str] = None
+    staged_world_preview_url: Optional[str] = None
+    staged_world_viewer_url: Optional[str] = None
+    staging_notes: Optional[str] = None
+    active_job: Optional[str] = None
     disclosure: Optional[str] = None
 
 

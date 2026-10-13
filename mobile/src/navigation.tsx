@@ -37,7 +37,7 @@ export type RootStackParamList = {
     retry?: boolean;
   };
   Panorama: { projectId: string; projectName: string };
-  World: { projectId: string; projectName: string };
+  World: { projectId: string; projectName: string; source?: 'original' | 'staged' };
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();

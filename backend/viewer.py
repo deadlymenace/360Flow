@@ -57,6 +57,7 @@ const HAS_STAGED = __HAS_STAGED__;
 const INITIAL = __INITIAL__;
 const KIND = __KIND__;
 const MARBLE = __MARBLE__;
+const STAGED_WORLD = __STAGED_WORLD__;
 const BASE = __BASE__;
 const statusEl = document.getElementById("status");
 const chip = document.getElementById("chip");
@@ -67,7 +68,7 @@ function setChip(show) {
 }
 
 if (MARBLE) {
-  setChip(true);
+  setChip(STAGED_WORLD);
   if (statusEl) statusEl.classList.add("hide");
 } else {
   const canvas = document.getElementById("c");
@@ -303,7 +304,9 @@ def _controls(asset_base: str, has_staged: bool, has_world: bool, embed: bool) -
         if has_staged:
             parts.append(f'<a class="btn" href="{base}/staged.jpg?download=1">Download staged</a>')
         if has_world:
-            parts.append(f'<a class="btn" href="{base}/world">Open 3D world</a>')
+            parts.append(f'<a class="btn" href="{base}/world">Open 3D walkthrough</a>')
+            if has_staged:
+                parts.append(f'<a class="btn" href="{base}/world?source=staged">Open staged 3D</a>')
     return "\n".join(parts)
 
 
@@ -319,6 +322,7 @@ def render_pano_page(
     has_world: bool,
     initial: str,
     embed: bool,
+    world_note: str = "",
 ) -> str:
     if initial not in {"original", "staged", "compare"}:
         initial = "original"
@@ -327,6 +331,8 @@ def render_pano_page(
     note = ""
     if not embed:
         note = '<div class="title">%s</div>' % escape(title)
+        if world_note:
+            note += '<div class="note">%s</div>' % escape(world_note)
     chip_class = "" if has_staged and initial != "original" else "hide"
     page = (
         _PAGE.replace("__TITLE__", escape(title))
@@ -341,6 +347,7 @@ def render_pano_page(
         .replace("__INITIAL__", '"' + initial + '"')
         .replace("__KIND__", '"pano"')
         .replace("__MARBLE__", "null")
+        .replace("__STAGED_WORLD__", "false")
     )
     return _finish(page, asset_base=asset_base)
 
@@ -351,6 +358,9 @@ def render_world_page(
     asset_base: str,
     marble_url: str | None,
     has_staged: bool,
+    staged_source: bool = False,
+    preview: bool = False,
+    generating: bool = False,
 ) -> str:
     safe_title = escape(title)
     base = escape(asset_base, quote=True)
@@ -360,21 +370,39 @@ def render_world_page(
             f'<iframe class="world" src="{safe_url}" allow="fullscreen; xr-spatial-tracking" '
             f'allowfullscreen title="3D world"></iframe>'
         )
+        if staged_source:
+            lead = "Navigable 3D world of the virtually staged room."
+        elif preview:
+            lead = "Fast 3D preview. The full walkthrough is still generating."
+        else:
+            lead = "Navigable 3D walkthrough."
         note = (
-            f'<div class="note">Navigable 3D world. '
+            f'<div class="note">{lead} '
             f'<a class="btn" href="{safe_url}">Open in Marble</a> '
             f'<a class="btn" href="{base}/?view=compare">Compare panorama</a></div>'
         )
         marble_js = "true"
     else:
         canvas = '<canvas id="c"></canvas>'
+        if staged_source:
+            message = "360° preview of the virtually staged room. A 3D walkthrough of the staged room has not been generated yet."
+        elif generating:
+            message = "The 3D walkthrough is generating. This is the panorama while it runs."
+        else:
+            message = "360° preview of this room. A navigable 3D world has not been generated yet."
         note = (
-            '<div class="note">360° preview of this room. A navigable 3D world has not been '
-            f'generated yet. <a class="btn" href="{base}/?view=compare">Compare with the original panorama</a></div>'
+            f'<div class="note">{message} '
+            f'<a class="btn" href="{base}/?view=compare">Compare with the original panorama</a></div>'
         )
         marble_js = "null"
-    chip_class = "" if has_staged else "hide"
+    chip_class = "" if staged_source else "hide"
     controls = f'<a class="btn" href="{base}/">Back to panorama</a>'
+    if has_staged:
+        if staged_source:
+            controls = f'<a class="btn" href="{base}/world">Original 3D</a> ' + controls
+        else:
+            controls = f'<a class="btn" href="{base}/world?source=staged">Staged 3D</a> ' + controls
+        controls = f'<a class="btn" href="{base}/?view=compare">Compare</a> ' + controls
     if marble_url:
         controls = f'<a class="btn" href="{escape(marble_url, quote=True)}">Open in Marble</a> ' + controls
     page = (
@@ -386,9 +414,10 @@ def render_world_page(
         .replace("__NOTE__", note)
         .replace("__BAR_CLASS__", "")
         .replace("__CONTROLS__", controls)
-        .replace("__HAS_STAGED__", "true" if has_staged else "false")
-        .replace("__INITIAL__", '"staged"' if has_staged else '"original"')
+        .replace("__HAS_STAGED__", "true" if staged_source else "false")
+        .replace("__INITIAL__", '"staged"' if staged_source else '"original"')
         .replace("__KIND__", '"world"')
         .replace("__MARBLE__", marble_js)
+        .replace("__STAGED_WORLD__", "true" if staged_source else "false")
     )
     return _finish(page, asset_base=asset_base)

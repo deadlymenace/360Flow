@@ -87,7 +87,11 @@ def test_full_pipeline_with_mocks(client):
     )
     assert uploaded.status_code == 200, uploaded.text
     status = client.get(f"/api/v1/projects/{project_id}/status").json()
-    assert status["status"] == "stitched", status
+    assert status["status"] == "complete", status
+    assert status["has_original"] is True
+    assert status["has_staged"] is False
+    assert status["disclosure"] is None
+    assert status["world_provider"] == "worldlabs_mock"
 
     original = client.get(f"/api/v1/projects/{project_id}/panorama")
     assert original.status_code == 200
@@ -95,6 +99,22 @@ def test_full_pipeline_with_mocks(client):
     decoded = cv2.imdecode(np.frombuffer(original_bytes, np.uint8), cv2.IMREAD_COLOR)
     assert decoded.shape[1] == decoded.shape[0] * 2
     assert not _has_disclosure_bar(decoded)
+    assert float(decoded[:6].mean()) > 20
+    assert float(decoded[-6:].mean()) > 20
+
+    world_status = client.get(f"/api/v1/projects/{project_id}/generate-3d/status").json()
+    assert world_status["status"] == "complete", world_status
+    assert world_status["provider"] == "worldlabs_mock"
+    assert world_status["assets"]["viewer_url"].endswith("/world")
+    assert world_status["assets"]["marble_url"] is None
+    assert world_status["disclosure"] is None
+    assert world_status["staged_assets"] is None
+
+    world_page = client.get(f"/v/{token}/world")
+    assert world_page.status_code == 200
+    assert 'class="chip hide"' in world_page.text
+    assert "navigable 3D world has not been generated" in world_page.text
+    assert "Open 3D walkthrough" in client.get(f"/v/{token}").text
 
     staged = client.post(
         f"/api/v1/projects/{project_id}/stage",
@@ -103,7 +123,7 @@ def test_full_pipeline_with_mocks(client):
     assert staged.status_code == 200, staged.text
     stage_status = client.get(f"/api/v1/projects/{project_id}/stage/status").json()
     assert stage_status["status"] == "staged", stage_status
-    assert stage_status["provider"] == "nanobanana_mock"
+    assert stage_status["provider"] == "gemini_mock"
     assert stage_status["disclosure"] == DISCLOSURE_TEXT
 
     untouched = client.get(f"/api/v1/projects/{project_id}/panorama").content
@@ -113,14 +133,14 @@ def test_full_pipeline_with_mocks(client):
     assert _has_disclosure_bar(labeled_image)
     assert labeled.content != original_bytes
 
-    world = client.post(f"/api/v1/projects/{project_id}/generate-3d")
-    assert world.status_code == 200, world.text
-    world_status = client.get(f"/api/v1/projects/{project_id}/generate-3d/status").json()
-    assert world_status["status"] == "complete", world_status
-    assert world_status["provider"] == "worldlabs_mock"
-    assert world_status["assets"]["viewer_url"].endswith("/world")
-    assert world_status["assets"]["marble_url"] is None
-    assert world_status["disclosure"] == DISCLOSURE_TEXT
+    staged_world = client.post(f"/api/v1/projects/{project_id}/generate-3d?source=staged")
+    assert staged_world.status_code == 200, staged_world.text
+    staged_status = client.get(f"/api/v1/projects/{project_id}/generate-3d/status").json()
+    assert staged_status["status"] == "complete", staged_status
+    assert staged_status["disclosure"] == DISCLOSURE_TEXT
+    assert staged_status["assets"]["viewer_url"].endswith("/world")
+    assert staged_status["staged_assets"]["viewer_url"].endswith("/world?source=staged")
+    assert staged_status["staged_assets"]["marble_url"] is None
 
     page = client.get(f"/v/{token}?view=staged")
     assert page.status_code == 200
@@ -140,10 +160,12 @@ def test_full_pipeline_with_mocks(client):
     )
     assert not _has_disclosure_bar(public_original)
 
-    world_page = client.get(f"/v/{token}/world")
-    assert world_page.status_code == 200
-    assert DISCLOSURE_TEXT in world_page.text
-    assert "navigable 3D world has not been generated" in world_page.text
+    original_world = client.get(f"/v/{token}/world")
+    assert 'class="chip hide"' in original_world.text
+    staged_page = client.get(f"/v/{token}/world?source=staged")
+    assert staged_page.status_code == 200
+    assert 'class="chip "' in staged_page.text
+    assert DISCLOSURE_TEXT in staged_page.text
 
 
 def test_api_key_protects_api_and_not_the_share_page(client, monkeypatch):
@@ -161,10 +183,31 @@ def test_api_key_protects_api_and_not_the_share_page(client, monkeypatch):
     assert client.get(f"/v/{created['share_token']}").status_code == 404
 
 
-def test_nanobanana_without_public_url_fails_clearly(client, monkeypatch):
-    monkeypatch.setenv("NANOBANANA_API_KEY", "test-key")
-    monkeypatch.setenv("PUBLIC_BASE_URL", "http://localhost:8000")
-    created = client.post("/api/v1/projects", json={"name": "Needs URL"}).json()
+def test_gemini_http_error_fails_the_job(client, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    class _Response:
+        status_code = 401
+
+        def json(self):
+            return {"error": {"message": "API key not valid"}}
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            assert kwargs["headers"]["x-goog-api-key"] == "test-key"
+            return _Response()
+
+    monkeypatch.setattr("services.staging.httpx.AsyncClient", _Client)
+    created = client.post("/api/v1/projects", json={"name": "Needs Gemini"}).json()
     project_id = created["id"]
     files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
     uploaded = client.post(
@@ -173,9 +216,10 @@ def test_nanobanana_without_public_url_fails_clearly(client, monkeypatch):
         data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})},
     )
     assert uploaded.status_code == 200, uploaded.text
-    assert client.get(f"/api/v1/projects/{project_id}/status").json()["status"] == "stitched"
+    assert client.get(f"/api/v1/projects/{project_id}/status").json()["status"] == "complete"
     staged = client.post(f"/api/v1/projects/{project_id}/stage", json={"prompt": "a sofa"})
     assert staged.status_code == 200
     body = client.get(f"/api/v1/projects/{project_id}/stage/status").json()
     assert body["status"] == "failed"
-    assert "PUBLIC_BASE_URL" in body["error"] or "presigned" in body["error"]
+    assert "Gemini" in body["error"]
+    assert "test-key" not in body["error"]
