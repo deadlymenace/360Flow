@@ -71,7 +71,9 @@ if (MARBLE) {
   if (statusEl) statusEl.classList.add("hide");
 } else {
   const canvas = document.getElementById("c");
-  const gl = canvas.getContext("webgl", { antialias: true, alpha: false });
+  const gl =
+    canvas.getContext("webgl2", { antialias: true, alpha: false }) ||
+    canvas.getContext("webgl", { antialias: true, alpha: false });
   if (!gl) {
     statusEl.textContent = "This browser cannot show the 360° viewer.";
   } else {
@@ -91,11 +93,27 @@ function loadImage(url) {
   });
 }
 
+function isPowerOfTwo(value) {
+  return value > 0 && (value & (value - 1)) === 0;
+}
+
+function textureSource(gl, image) {
+  const webgl2 = typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext;
+  if (webgl2 || (isPowerOfTwo(image.width) && isPowerOfTwo(image.height))) return image;
+  // WebGL 1 samples a non-power-of-two texture as black when wrap is REPEAT.
+  const canvas2d = document.createElement("canvas");
+  canvas2d.width = 1 << Math.ceil(Math.log2(image.width));
+  canvas2d.height = 1 << Math.ceil(Math.log2(image.height));
+  const ctx = canvas2d.getContext("2d");
+  ctx.drawImage(image, 0, 0, canvas2d.width, canvas2d.height);
+  return canvas2d;
+}
+
 function makeTexture(gl, image) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textureSource(gl, image));
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -209,7 +227,7 @@ async function boot(gl, canvas) {
   const buttons = Array.from(document.querySelectorAll("[data-mode]"));
   function applyMode(mode) {
     if (mode === "staged" && HAS_STAGED) mix = 1;
-    else if (mode === "compare" && HAS_STAGED) mix = slider ? Number(slider.value) / 100 : 0.5;
+    else if (mode === "compare" && HAS_STAGED) mix = 0.5;
     else mix = 0;
     if (slider) slider.value = String(Math.round(mix * 100));
     buttons.forEach((btn) => btn.classList.toggle("active", btn.dataset.mode === mode));
