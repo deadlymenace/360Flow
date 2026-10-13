@@ -120,6 +120,16 @@ class DailyUsageRow(Base):
     count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class RateWindowRow(Base):
+    """Fixed-window counters shared by every replica through the database."""
+
+    __tablename__ = "rate_windows"
+
+    bucket: Mapped[str] = mapped_column(String(128), primary_key=True)
+    window_start: Mapped[int] = mapped_column(Integer, primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class PendingWorldDeleteRow(Base):
     __tablename__ = "pending_world_deletes"
 
@@ -638,6 +648,50 @@ class _EnqueueStop(Exception):
         self.outcome = outcome
 
 
+_BUMP_RATE_WINDOW = text(
+    """
+    INSERT INTO rate_windows (bucket, window_start, count)
+    VALUES (:bucket, :window_start, 1)
+    ON CONFLICT (bucket, window_start)
+    DO UPDATE SET count = rate_windows.count + 1
+    WHERE rate_windows.count < :limit
+    RETURNING count
+    """
+)
+
+
+def bump_rate_window(
+    session: Session,
+    bucket: str,
+    limit: int,
+    window_seconds: int,
+    now: datetime | None = None,
+) -> bool:
+    """Count one hit in a fixed window. False when this window is already full.
+
+    The row lives in the database, so every replica shares the same count.
+    """
+    if limit <= 0:
+        return True
+    window_seconds = max(1, int(window_seconds))
+    current = now or datetime.now(timezone.utc)
+    window_start = int(current.timestamp()) // window_seconds
+    row = session.execute(
+        _BUMP_RATE_WINDOW,
+        {"bucket": bucket[:128], "window_start": window_start, "limit": limit},
+    ).first()
+    session.execute(
+        text("DELETE FROM rate_windows WHERE window_start < :cutoff"),
+        {"cutoff": window_start - 2},
+    )
+    return row is not None
+
+
+def allow_shared_rate(bucket: str, limit: int, window_seconds: int) -> bool:
+    with session_scope() as session:
+        return bump_rate_window(session, bucket, limit, window_seconds)
+
+
 def bump_quota(session: Session, device_id: str, kind: str, limit: int) -> bool:
     """Atomically count one use. False when the row is already at ``limit``."""
     if limit <= 0:
@@ -660,6 +714,27 @@ def consume_daily_quota(device_id: str | None, kind: str, limit: int) -> bool:
         return True
     with session_scope() as session:
         return bump_quota(session, device_id, kind, limit)
+
+
+_RELEASE_QUOTA = text(
+    """
+    UPDATE daily_usage
+    SET count = count - 1
+    WHERE device_id = :device_id AND day = :day AND kind = :kind AND count > 0
+    RETURNING count
+    """
+)
+
+
+def release_world_quota(session: Session, device_id: str | None, day: str) -> None:
+    """Give back one world charge from ``day``. No row means nothing was charged."""
+    settings = get_settings()
+    if not settings.worldlabs_api_key:
+        return
+    if device_id and settings.worldlabs_daily_limit > 0:
+        session.execute(_RELEASE_QUOTA, {"device_id": device_id, "day": day, "kind": "worldlabs"})
+    if settings.global_daily_worlds_cap > 0:
+        session.execute(_RELEASE_QUOTA, {"device_id": GLOBAL_QUOTA_DEVICE, "day": day, "kind": "worldlabs"})
 
 
 def charge_world_quota(session: Session, device_id: str | None) -> bool:
@@ -900,13 +975,39 @@ def claim_delayed_job(job_id: str) -> JobRecord | None:
         return _job_record(row) if row else None
 
 
+def _quota_day(when: datetime | None) -> str:
+    current = _aware(when) if when is not None else datetime.now(timezone.utc)
+    return current.astimezone(timezone.utc).date().isoformat()
+
+
+def _unpaid_world_job(job: JobRow, project: ProjectRow) -> bool:
+    """True when this delayed job never got an accepted worlds:generate call."""
+    if job.kind not in {"world", "staged_world"}:
+        return False
+    if job.operation_id or job.operation_phase in {"draft", "full"}:
+        return False
+    if job.kind == "staged_world":
+        started = project.staged_world_operation_id or project.staged_world_id or project.staged_world_preview_id
+    else:
+        started = project.world_operation_id or project.world_id or project.world_preview_id
+    return not started
+
+
 def cancel_delayed_project(project_id: str) -> str | None:
-    """Drop a delayed 3D job and leave the panorama in place. None if it was not delayed."""
+    """Drop a delayed 3D job and leave the panorama in place. None if it was not delayed.
+
+    A job that was delayed before World Labs accepted a generation returns the
+    quota unit charged at enqueue. A job that already has an operation does not.
+    """
     with session_scope() as session:
         row = session.get(ProjectRow, project_id)
         if row is None or row.status != "delayed":
             return None
+        refunded = False
         for job in _open_jobs(session, project_id):
+            if not refunded and _unpaid_world_job(job, row):
+                release_world_quota(session, row.owner_device_id, _quota_day(job.created_at))
+                refunded = True
             session.delete(job)
         row.status = "stitched" if row.panorama_key else "created"
         row.active_job = None

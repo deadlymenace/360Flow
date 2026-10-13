@@ -96,22 +96,22 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health(x_api_key: str | None = Header(default=None)):
+        if not _admin_key_matches(x_api_key):
+            return {"status": "ok"}
         current = get_settings()
-        body = {
+        remaining = await world_credits_balance()
+        threshold = current.worldlabs_low_credit_threshold
+        return {
             "status": "ok",
             "storage": current.storage_backend_name,
             "database": current.database_backend_name,
             "staging": current.staging_mode,
             "world": current.world_mode,
             "auth": current.auth_mode,
-            "admin": bool(current.api_key),
+            "admin": True,
+            "worldlabs_credits": remaining,
+            "worldlabs_low_balance": remaining is not None and remaining < threshold,
         }
-        if _admin_key_matches(x_api_key):
-            remaining = await world_credits_balance()
-            body["worldlabs_credits"] = remaining
-            threshold = current.worldlabs_low_credit_threshold
-            body["worldlabs_low_balance"] = remaining is not None and remaining < threshold
-        return body
 
     return app
 

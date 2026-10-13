@@ -19,11 +19,15 @@ from viewer import render_pano_page, render_world_page
 
 router = APIRouter()
 
+# Invalid, expired, and rotated share tokens all use this body. A different
+# sentence would tell a caller which of those happened.
+_SHARE_MISSING = "Not found"
+
 
 def _public_project(token: str) -> ProjectRecord:
     project = get_by_share_token(token)
     if project is None:
-        raise HTTPException(status_code=404, detail="Shared project not found")
+        raise HTTPException(status_code=404, detail=_SHARE_MISSING)
     return project
 
 

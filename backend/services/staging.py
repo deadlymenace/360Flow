@@ -15,7 +15,7 @@ import httpx
 import numpy as np
 
 from config import get_settings
-from services.disclosure import build_staging_prompt, decode_image, encode_jpeg, fit_equirect
+from services.disclosure import build_staging_prompt, decode_image, encode_jpeg, fit_equirect, style_content_part
 from services.equirect_views import (
     PerspectiveView,
     reproject_views,
@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models/{model}:generateContent"
 STRUCTURE_MIN = 0.45
 QUOTA_MESSAGE = "AI staging is unavailable right now (provider quota)"
+
+
+class GeminiTextOnly(Exception):
+    """A 200 response that described the edit instead of returning an image."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 class StagingProviderError(Exception):
@@ -64,17 +72,20 @@ def gemini_client_message(status_code: int, body: object) -> str | None:
     return None
 
 
-def build_gemini_request(prompt: str, jpeg_bytes: bytes, image_size: str) -> dict:
+def build_gemini_request(instructions: str, style_part: str, jpeg_bytes: bytes, image_size: str) -> dict:
     """REST body for Nano Banana image editing on the Gemini API.
 
     Documented at https://ai.google.dev/gemini-api/docs/image-generation
     (generateContent, responseModalities TEXT+IMAGE, inline image bytes).
+    The style string is its own part so it is not concatenated into the rules.
     """
     return {
         "contents": [
             {
+                "role": "user",
                 "parts": [
-                    {"text": prompt},
+                    {"text": instructions},
+                    {"text": style_part},
                     {
                         "inline_data": {
                             "mime_type": "image/jpeg",
@@ -95,6 +106,8 @@ def build_gemini_request(prompt: str, jpeg_bytes: bytes, image_size: str) -> dic
 
 
 def extract_gemini_image(body: dict) -> bytes:
+    if not isinstance(body, dict):
+        raise GeminiTextOnly("Gemini did not return an image")
     candidates = body.get("candidates") or []
     texts: list[str] = []
     for candidate in candidates:
@@ -105,8 +118,8 @@ def extract_gemini_image(body: dict) -> bytes:
                 return base64.b64decode(inline["data"])
             if part.get("text"):
                 texts.append(str(part["text"]))
-    detail = " ".join(texts).strip()
-    raise RuntimeError(detail or "Gemini did not return an image")
+    detail = " ".join(texts).strip()[:500]
+    raise GeminiTextOnly(detail or "Gemini did not return an image")
 
 
 async def stage_image(image_bytes: bytes, user_prompt: str) -> tuple[bytes, str, str | None]:
@@ -123,9 +136,10 @@ async def stage_image(image_bytes: bytes, user_prompt: str) -> tuple[bytes, str,
 
     edited: list[PerspectiveView] = []
     notes: list[str] = []
+    style_part = style_content_part(user_prompt)
     for view in views:
-        prompt = build_staging_prompt(user_prompt, perspective=True, yaw_deg=view.yaw_deg)
-        image, note = await _edit_view(view, prompt, settings)
+        instructions = build_staging_prompt(perspective=True, yaw_deg=view.yaw_deg)
+        image, note = await _edit_view(view, instructions, style_part, settings)
         edited.append(PerspectiveView(view.yaw_deg, view.hfov_deg, image))
         if note:
             notes.append(note)
@@ -136,7 +150,8 @@ async def stage_image(image_bytes: bytes, user_prompt: str) -> tuple[bytes, str,
 
 async def _edit_view(
     view: PerspectiveView,
-    prompt: str,
+    instructions: str,
+    style_part: str,
     settings,
 ) -> tuple[np.ndarray, str | None]:
     original = view.image
@@ -144,19 +159,27 @@ async def _edit_view(
     async def produce(text: str) -> np.ndarray:
         if not settings.gemini_api_key:
             return apply_mock_grade(original)
-        raw = await _gemini_edit(settings.gemini_api_key, settings.gemini_model, text, original, settings.gemini_image_size)
+        raw = await _gemini_edit(
+            settings.gemini_api_key,
+            settings.gemini_model,
+            text,
+            style_part,
+            original,
+            settings.gemini_image_size,
+        )
         image = decode_image(raw)
         if image.shape[:2] != original.shape[:2]:
             image = cv2.resize(image, (original.shape[1], original.shape[0]), interpolation=cv2.INTER_AREA)
         return image
 
-    edited = await produce(prompt)
+    edited = await produce(instructions)
     # The structure score is the gate. A prompt cannot waive it.
     if structure_score(original, edited) >= STRUCTURE_MIN:
         return edited, None
     logger.info("Structure check failed at yaw %.0f°, retrying", view.yaw_deg)
     retried = await produce(
-        prompt + "\nThe previous edit changed the architecture. Restore walls, windows, floors, and fixtures exactly."
+        instructions
+        + "\nThe previous edit changed the architecture. Restore walls, windows, floors, and fixtures exactly."
     )
     if structure_score(original, retried) >= STRUCTURE_MIN:
         return retried, None
@@ -166,24 +189,42 @@ async def _edit_view(
     )
 
 
-async def _gemini_edit(api_key: str, model: str, prompt: str, image_bgr: np.ndarray, image_size: str) -> bytes:
-    payload = build_gemini_request(prompt, encode_jpeg(image_bgr, quality=90), image_size)
+async def _gemini_edit(
+    api_key: str,
+    model: str,
+    instructions: str,
+    style_part: str,
+    image_bgr: np.ndarray,
+    image_size: str,
+) -> bytes:
+    payload = build_gemini_request(instructions, style_part, encode_jpeg(image_bgr, quality=90), image_size)
     timeout = httpx.Timeout(30.0, read=120.0)
     url = GEMINI_URL.format(model=model)
+    last_detail = "Gemini did not return an image"
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            url,
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=payload,
-        )
-    if response.status_code >= 400:
-        body = _response_body(response)
-        message = _gemini_error_message(body)
-        detail = f"HTTP {response.status_code}: {message}"
-        logger.error("Gemini staging request failed: %s", detail)
-        client_message = gemini_client_message(response.status_code, body) or "Staging failed. Try again."
-        raise StagingProviderError(client_message, detail)
-    return extract_gemini_image(response.json())
+        for attempt in range(2):
+            response = await client.post(
+                url,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                json=payload,
+            )
+            if response.status_code >= 400:
+                body = _response_body(response)
+                message = _gemini_error_message(body)
+                detail = f"HTTP {response.status_code}: {message}"
+                logger.error("Gemini staging request failed: %s", detail)
+                client_message = gemini_client_message(response.status_code, body) or "Staging failed. Try again."
+                raise StagingProviderError(client_message, detail)
+            try:
+                return extract_gemini_image(response.json())
+            except GeminiTextOnly as exc:
+                last_detail = exc.detail or last_detail
+                if attempt == 0:
+                    logger.info("Gemini returned text only; retrying this view once")
+                    continue
+                logger.error("Gemini returned text only again: %s", last_detail)
+                raise StagingProviderError("Staging failed. Try again.", last_detail) from exc
+    raise StagingProviderError("Staging failed. Try again.", last_detail)
 
 
 def _response_body(response: httpx.Response) -> object:

@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from auth import _admin_key_matches
 from config import get_settings
-from db import device_id_for_token
+from db import allow_shared_rate, device_id_for_token
 from ratelimit import limiter
 
 _UPLOAD_OVERHEAD = 256 * 1024
@@ -163,7 +163,8 @@ class GuardMiddleware:
             await _send_json(send, 429, {"detail": "Too many requests"})
             return
         if path == "/health" and headers.get("x-api-key"):
-            if not limiter.allow(_bucket(headers, ip), settings.rate_limit_per_minute, 60):
+            # The counter is a database row so replicas share one limit.
+            if not allow_shared_rate(_bucket(headers, ip), settings.rate_limit_per_minute, 60):
                 await _send_json(send, 429, {"detail": "Too many requests"})
                 return
 

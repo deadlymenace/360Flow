@@ -275,6 +275,70 @@ def test_delayed_tour_can_be_retried_or_cancelled(client, monkeypatch):
     assert removed.status_code == 204
 
 
+def test_cancelling_before_a_paid_call_refunds_the_world_quota(client, monkeypatch):
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from db import GLOBAL_QUOTA_DEVICE, DailyUsageRow, JobRow, device_id_for_token, session_scope
+
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setenv("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", "1")
+    monkeypatch.setenv("GLOBAL_DAILY_WORLDS_CAP", "100")
+    token = client.raw.post("/api/v1/devices").json()["token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    owner = device_id_for_token(token)
+    assert owner
+
+    async def out_of_credits(*args, **kwargs):
+        raise ProviderFailure(WORLD_CREDITS_MESSAGE, "out of credits (remaining 0, marble-1.0-draft needs 150)", 402)
+
+    monkeypatch.setattr(pipeline, "generate_world", out_of_credits)
+
+    def usage(device_id: str) -> int:
+        day = datetime.now(timezone.utc).date().isoformat()
+        with session_scope() as session:
+            row = session.get(DailyUsageRow, (device_id, day, "worldlabs"))
+            return 0 if row is None else row.count
+
+    created = client.raw.post("/api/v1/projects", json={"name": "Refund"}, headers=headers).json()
+    project_id = created["id"]
+    key = panorama_key(project_id)
+    get_storage().put_bytes(key, b"panorama", "image/jpeg")
+    update_project(project_id, status="stitched", panorama_key=key, active_job=None)
+    before_global = usage(GLOBAL_QUOTA_DEVICE)
+
+    first = client.raw.post(f"/api/v1/projects/{project_id}/generate-3d", headers=headers)
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "delayed"
+    assert usage(owner) == 1
+    assert usage(GLOBAL_QUOTA_DEVICE) == before_global + 1
+
+    blocked = client.raw.post(f"/api/v1/projects/{project_id}/generate-3d", headers=headers)
+    assert blocked.status_code == 429
+    assert "Daily 3D limit" in blocked.json()["detail"]
+
+    cancelled = client.raw.post(f"/api/v1/projects/{project_id}/cancel", headers=headers)
+    assert cancelled.status_code == 200, cancelled.text
+    assert usage(owner) == 0
+    assert usage(GLOBAL_QUOTA_DEVICE) == before_global
+
+    second = client.raw.post(f"/api/v1/projects/{project_id}/generate-3d", headers=headers)
+    assert second.status_code == 200, second.text
+    assert usage(owner) == 1
+    with session_scope() as session:
+        job = session.scalar(select(JobRow).where(JobRow.project_id == project_id, JobRow.status == "delayed"))
+        assert job is not None and job.operation_id is None
+        job.operation_id = "op-paid"
+        job.operation_phase = "draft"
+    paid_cancel = client.raw.post(f"/api/v1/projects/{project_id}/cancel", headers=headers)
+    assert paid_cancel.status_code == 200, paid_cancel.text
+    assert usage(owner) == 1
+    assert usage(GLOBAL_QUOTA_DEVICE) == before_global + 1
+    refused = client.raw.post(f"/api/v1/projects/{project_id}/generate-3d", headers=headers)
+    assert refused.status_code == 429
+
+
 def test_delayed_world_fails_after_the_wait_cap(client):
     from datetime import datetime, timedelta, timezone
 

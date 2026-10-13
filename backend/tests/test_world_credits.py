@@ -235,13 +235,17 @@ def test_admin_health_shows_the_credit_balance(client, monkeypatch):
 
     monkeypatch.setattr("main.world_credits_balance", balance)
     public = client.get("/health").json()
-    assert "worldlabs_credits" not in public
+    assert public == {"status": "ok"}
     wrong = client.raw.get("/health", headers={"X-API-Key": "nope"}).json()
-    assert "worldlabs_credits" not in wrong
+    assert wrong == {"status": "ok"}
     admin = client.raw.get("/health", headers={"X-API-Key": "secret-key"}).json()
     assert admin["worldlabs_credits"] == 1800
     assert admin["worldlabs_low_balance"] is True
-    assert "worldlabs_low_balance" not in public
+    assert admin["storage"] == "local"
+    assert admin["database"] == "sqlite"
+    assert admin["staging"] == "mock"
+    assert admin["world"] == "mock"
+    assert admin["admin"] is True
 
     async def healthy():
         return 9000.0

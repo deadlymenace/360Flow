@@ -30,13 +30,7 @@ def _has_disclosure_bar(image: np.ndarray) -> bool:
 
 def test_health(client):
     body = client.get("/health").json()
-    assert body["status"] == "ok"
-    assert body["storage"] == "local"
-    assert body["database"] == "sqlite"
-    assert body["staging"] == "mock"
-    assert body["world"] == "mock"
-    assert body["auth"] == "device"
-    assert body["admin"] is False
+    assert body == {"status": "ok"}
 
 
 def test_project_survives_reopen(client):
@@ -294,7 +288,8 @@ def test_staged_view_stays_private_until_the_owner_publishes(client):
 def test_device_token_and_admin_key(client, monkeypatch):
     assert client.raw.get("/api/v1/projects").status_code == 401
     monkeypatch.setenv("API_KEY", "secret-key")
-    assert client.get("/health").json()["admin"] is True
+    assert client.get("/health").json() == {"status": "ok"}
+    assert client.raw.get("/health", headers={"X-API-Key": "secret-key"}).json()["admin"] is True
     assert client.raw.get("/api/v1/projects", headers={"X-API-Key": "wrong-key"}).status_code == 401
     allowed = client.raw.get("/api/v1/projects", headers={"X-API-Key": "secret-key"})
     assert allowed.status_code == 200

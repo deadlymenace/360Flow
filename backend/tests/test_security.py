@@ -283,6 +283,49 @@ def test_share_links_expire_and_rotate_refreshes_them(client):
     assert client.get(f"/v/{created['share_token']}").status_code == 404
 
 
+def test_share_404s_match_for_invalid_expired_and_revoked_tokens(client):
+    from datetime import datetime, timedelta, timezone
+
+    from db import update_project
+    from storage import get_storage, panorama_key
+
+    expired_project = client.post("/api/v1/projects", json={"name": "Expired link"}).json()
+    revoked_project = client.post("/api/v1/projects", json={"name": "Revoked link"}).json()
+    for project in (expired_project, revoked_project):
+        key = panorama_key(project["id"])
+        get_storage().put_bytes(key, _real_jpeg(), "image/jpeg")
+        update_project(project["id"], panorama_key=key, status="stitched")
+        assert client.get(f"/v/{project['share_token']}").status_code == 200
+
+    update_project(
+        expired_project["id"],
+        share_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    rotated = client.post(f"/api/v1/projects/{revoked_project['id']}/share/rotate").json()
+    assert client.get(f"/v/{rotated['share_token']}").status_code == 200
+
+    def snap(token: str, suffix: str = ""):
+        response = client.raw.get(f"/v/{token}{suffix}")
+        return (
+            response.status_code,
+            response.content,
+            response.headers.get("content-type"),
+            response.headers.get("x-robots-tag"),
+            response.headers.get("content-security-policy"),
+        )
+
+    unknown = "not-a-real-share-token"
+    expired = expired_project["share_token"]
+    revoked = revoked_project["share_token"]
+    for suffix in ("", "/world", "/panorama.jpg", "/staged.jpg"):
+        missed = snap(unknown, suffix)
+        assert missed == snap(expired, suffix) == snap(revoked, suffix)
+        assert missed[0] == 404
+        assert b"expired" not in missed[1].lower()
+        assert b"revoked" not in missed[1].lower()
+        assert b"not ready" not in missed[1].lower()
+
+
 def test_failed_world_deletes_are_retried(client, monkeypatch):
     from db import pending_world_delete_ids, update_project
     from services.world_gen import delete_worlds, retry_pending_world_deletes
@@ -514,8 +557,13 @@ def test_staging_failure_without_a_provider_message_is_failed(client, monkeypatc
 
 
 def test_health_admin_key_attempts_are_rate_limited(client, monkeypatch):
+    from sqlalchemy import delete
+
+    from db import RateWindowRow, session_scope
     from ratelimit import limiter
 
+    with session_scope() as session:
+        session.execute(delete(RateWindowRow))
     limiter.reset()
     monkeypatch.setenv("API_KEY", "secret-key")
     monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "2")
@@ -523,9 +571,14 @@ def test_health_admin_key_attempts_are_rate_limited(client, monkeypatch):
     assert client.raw.get("/health", headers={"X-API-Key": "nope"}).status_code == 200
     blocked = client.raw.get("/health", headers={"X-API-Key": "nope"})
     assert blocked.status_code == 429
+    limiter.reset()
+    still_blocked = client.raw.get("/health", headers={"X-API-Key": "nope"})
+    assert still_blocked.status_code == 429
     public = client.raw.get("/health")
     assert public.status_code == 200
-    limiter.reset()
+    assert public.json() == {"status": "ok"}
+    with session_scope() as session:
+        session.execute(delete(RateWindowRow))
 
 
 def _real_jpeg() -> bytes:

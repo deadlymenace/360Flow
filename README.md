@@ -75,7 +75,7 @@ An iOS build that you can install through TestFlight needs an Apple Developer ac
 
 ## Mock providers and real APIs
 
-`GET /health` reports which path is active:
+`GET /health` returns `{"status": "ok"}`. The same request with the operator `X-API-Key` reports which path is active:
 
 | Field | Empty key | Key set |
 | --- | --- | --- |
@@ -100,7 +100,7 @@ The unstaged panorama is stored at `panoramas/{id}.jpg` and is never overwritten
 - After publish, `GET /v/{token}/staged.jpg` downloads the JPEG with the label burned into a bar along the bottom. Before publish, that URL is 404. The in-app export uses the private preview URL, so the owner can save the labeled JPEG first.
 - After publish, the sphere texture (`/v/{token}/texture.jpg`) is the clean staged JPEG so the bar is not smeared across the south pole. The on-screen label is still shown. The owner preview uses the same clean texture.
 
-The user's prompt only chooses style and furniture. `build_staging_prompt` in `backend/services/disclosure.py` always puts a fixed instruction first: preserve walls, windows, doors, glass, floors, ceilings, and fixtures, and only add movable furniture and decor. Presets in the app describe furniture only.
+The user's prompt only chooses style and furniture. `build_staging_prompt` in `backend/services/disclosure.py` is the fixed instruction: preserve walls, windows, doors, glass, floors, ceilings, and fixtures, and only add movable furniture and decor. The style text is a separate quoted content part, length-capped, and is not concatenated into those rules. Presets in the app describe furniture only. A view where Gemini answers with text and no image is retried once; a second text-only answer fails that staging run.
 
 This is best effort. Gemini can still change architecture even when the prompt forbids it. Each view is checked against the original edges; a view that moves walls or windows is retried once and then kept as the original photo, with a note on the project. The original panorama stays available so a person can compare and discard a bad result. The product does not claim the model guarantees preservation.
 
@@ -200,7 +200,7 @@ Before the first upload, the app shows a consent screen. Agreeing lets the app s
 
 `/docs` and `/openapi.json` stay off unless `ENABLE_DOCS=true`. Share pages send `X-Content-Type-Options`, `Referrer-Policy`, `Strict-Transport-Security`, `X-Robots-Tag: noindex`, and a Content-Security-Policy. `frame-ancestors` is `'none'` unless the URL has `embed=1` and `EMBED_FRAME_ANCESTORS` lists parents. An empty list keeps `'none'`. Share links are built from `PUBLIC_BASE_URL` only and expire after `SHARE_LINK_TTL_DAYS` (default 30). Rotating a link starts a new window. Invalid request bodies return `422` with `Invalid request` and do not echo the submitted values.
 
-Paid Gemini and World Labs calls are capped per device per day (`GEMINI_JOBS_PER_DEVICE_PER_DAY`, `WORLDLABS_JOBS_PER_DEVICE_PER_DAY`). `GLOBAL_DAILY_WORLDS_CAP` limits paid worlds across every device. The count is an atomic increment, and it is taken when the job is queued. The world that starts automatically after upload counts against both caps. A project has one open job. Replacing a capture queues the old Marble worlds for deletion before their ids are cleared. A tour that is waiting on credits can be retried or cancelled, and it fails after `WORLD_DELAY_MAX_HOURS` or `WORLD_DELAY_MAX_ATTEMPTS`. A Marble delete that fails is stored and retried in the background. Client IP for rate limits comes from the rightmost trusted `X-Forwarded-For` hop (`TRUSTED_PROXY_COUNT`, default 1 for Railway). Failed authentication is limited by that IP, including `X-API-Key` attempts on `/health`.
+Paid Gemini and World Labs calls are capped per device per day (`GEMINI_JOBS_PER_DEVICE_PER_DAY`, `WORLDLABS_JOBS_PER_DEVICE_PER_DAY`). `GLOBAL_DAILY_WORLDS_CAP` limits paid worlds across every device. The count is an atomic increment, and it is taken when the job is queued. The world that starts automatically after upload counts against both caps. A project has one open job. Replacing a capture queues the old Marble worlds for deletion before their ids are cleared. A tour that is waiting on credits can be retried or cancelled, and it fails after `WORLD_DELAY_MAX_HOURS` or `WORLD_DELAY_MAX_ATTEMPTS`. Cancelling it before World Labs has accepted a generation refunds that daily quota unit. `X-API-Key` attempts on `/health` share one database rate limit across replicas. The public `/health` body is only `{"status": "ok"}`. A Marble delete that fails is stored and retried in the background. Client IP for rate limits comes from the rightmost trusted `X-Forwarded-For` hop (`TRUSTED_PROXY_COUNT`, default 1 for Railway). Failed authentication is limited by that IP, including `X-API-Key` attempts on `/health`.
 
 ## What you need to supply
 
