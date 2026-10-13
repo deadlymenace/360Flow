@@ -190,8 +190,9 @@ def _hfov_from_exif(path: Path) -> float | None:
         from PIL import Image
 
         with Image.open(path) as handle:
-            exif = handle.getexif()
-            focal_35 = exif.get(0xA405) if exif else None
+            from services.uploads import focal_35mm_from_image
+
+            focal_35 = focal_35mm_from_image(handle)
             if not focal_35:
                 return None
             width, height = handle.size

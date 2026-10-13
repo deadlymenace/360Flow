@@ -109,20 +109,47 @@ export default function HomeScreen({ navigation }: Props) {
     }
   };
 
+  const confirmDelete = (project: Project) => {
+    Alert.alert(
+      'Delete this capture?',
+      'This removes the photos, panorama, staged image, 3D walkthrough, and share link from 360Flow. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await api.deleteProject(project.id);
+              setProjects((current) => current.filter((item) => item.id !== project.id));
+            } catch (e: any) {
+              Alert.alert('Could not delete', e.message || 'Try again');
+            }
+          },
+        },
+      ],
+    );
+  };
+
   const renderProject = ({ item }: { item: Project }) => (
-    <TouchableOpacity style={styles.projectRow} onPress={() => handleProjectPress(item)}>
-      <View style={styles.projectInfo}>
+    <View style={styles.projectRow}>
+      <TouchableOpacity style={styles.projectInfo} onPress={() => handleProjectPress(item)}>
         <Text style={styles.projectName}>{item.name}</Text>
         <Text style={styles.projectMeta}>
           {item.image_count} photos · {new Date(item.created_at).toLocaleDateString()}
         </Text>
+      </TouchableOpacity>
+      <View style={styles.rowActions}>
+        <View style={[styles.statusBadge, { backgroundColor: getStatusColor(item.status) + '20' }]}>
+          <Text style={[styles.statusText, { color: getStatusColor(item.status) }]}>
+            {getStatusLabel(item.status)}
+          </Text>
+        </View>
+        <TouchableOpacity onPress={() => confirmDelete(item)} accessibilityLabel={`Delete ${item.name}`}>
+          <Text style={styles.deleteText}>Delete</Text>
+        </TouchableOpacity>
       </View>
-      <View style={[styles.statusBadge, { backgroundColor: getStatusColor(item.status) + '20' }]}>
-        <Text style={[styles.statusText, { color: getStatusColor(item.status) }]}>
-          {getStatusLabel(item.status)}
-        </Text>
-      </View>
-    </TouchableOpacity>
+    </View>
   );
 
   return (
@@ -299,6 +326,15 @@ const styles = StyleSheet.create({
   statusText: {
     fontSize: 12,
     fontWeight: '600',
+  },
+  rowActions: {
+    alignItems: 'flex-end',
+    gap: 8,
+  },
+  deleteText: {
+    color: '#F44336',
+    fontSize: 13,
+    fontWeight: '700',
   },
   modalOverlay: {
     flex: 1,

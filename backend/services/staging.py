@@ -28,6 +28,35 @@ logger = logging.getLogger(__name__)
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1/models/{model}:generateContent"
 STRUCTURE_MIN = 0.45
+QUOTA_MESSAGE = "AI staging is unavailable right now (provider quota)"
+
+
+class StagingProviderError(Exception):
+    """Staging failure whose message is safe to show to the client."""
+
+    def __init__(self, client_message: str) -> None:
+        super().__init__(client_message)
+        self.client_message = client_message
+
+
+def gemini_client_message(status_code: int, body: object) -> str | None:
+    """Map provider quota failures to one client sentence. Other errors stay generic."""
+    status_name = ""
+    message = ""
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            status_name = str(error.get("status") or "")
+            message = str(error.get("message") or "")
+    lowered = f"{status_name} {message}".lower()
+    if (
+        status_code == 429
+        or status_name == "RESOURCE_EXHAUSTED"
+        or "resource_exhausted" in lowered
+        or "quota" in lowered
+    ):
+        return QUOTA_MESSAGE
+    return None
 
 
 def build_gemini_request(prompt: str, jpeg_bytes: bytes, image_size: str) -> dict:
@@ -142,17 +171,26 @@ async def _gemini_edit(api_key: str, model: str, prompt: str, image_bgr: np.ndar
             json=payload,
         )
     if response.status_code >= 400:
-        message = _gemini_error(response)
-        raise RuntimeError(f"Gemini rejected the staging request ({response.status_code}): {message}")
+        body = _response_body(response)
+        detail = _gemini_error_message(body)
+        logger.error("Gemini staging request failed (%s): %s", response.status_code, detail)
+        client_message = gemini_client_message(response.status_code, body)
+        if client_message:
+            raise StagingProviderError(client_message)
+        raise RuntimeError(f"Gemini rejected the staging request ({response.status_code}): {detail}")
     return extract_gemini_image(response.json())
 
 
-def _gemini_error(response: httpx.Response) -> str:
+def _response_body(response: httpx.Response) -> object:
     try:
-        body = response.json()
+        return response.json()
     except Exception:
-        return "request failed"
-    error = body.get("error") if isinstance(body, dict) else None
-    if isinstance(error, dict) and error.get("message"):
-        return str(error["message"])[:240]
+        return None
+
+
+def _gemini_error_message(body: object) -> str:
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])[:240]
     return "request failed"

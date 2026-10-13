@@ -9,11 +9,16 @@ import time
 import httpx
 
 from config import get_settings
+from db import forget_world_delete, pending_world_delete_ids, queue_world_deletes
 from services.world_gen_mock import mock_generate_3d
 
 logger = logging.getLogger(__name__)
 
 WORLDLABS_BASE = "https://api.worldlabs.ai"
+# Draft worlds finish in seconds. Full worlds have taken about 9 minutes,
+# so the poll loop waits at least 15 and keeps a few minutes of headroom.
+DRAFT_WORLD_TIMEOUT_S = 4 * 60
+FULL_WORLD_TIMEOUT_S = 20 * 60
 
 
 def generation_models(draft_model: str | None, full_model: str) -> list[str]:
@@ -25,6 +30,12 @@ def generation_models(draft_model: str | None, full_model: str) -> list[str]:
     if draft_model and draft_model != full_model:
         return [draft_model, full_model]
     return [full_model]
+
+
+def world_display_name(project_id: str, *, staged: bool) -> str:
+    """Marble title. Uses the project id so the user's room name is not sent."""
+    name = project_id if not staged else f"{project_id}-staged"
+    return name[:64]
 
 
 def build_world_request(display_name: str, media_asset_id: str, model: str, public: bool) -> dict:
@@ -85,7 +96,7 @@ async def generate_world(image_bytes: bytes, display_name: str, on_preview=None)
         media_id = await _upload_panorama(client, headers, image_bytes)
         final = None
         for index, model in enumerate(models):
-            timeout_s = 4 * 60 if index < len(models) - 1 else 20 * 60
+            timeout_s = DRAFT_WORLD_TIMEOUT_S if index < len(models) - 1 else FULL_WORLD_TIMEOUT_S
             try:
                 parsed = await _generate_model(
                     client, headers, display_name, media_id, model, settings.worldlabs_public, timeout_s
@@ -103,6 +114,62 @@ async def generate_world(image_bytes: bytes, display_name: str, on_preview=None)
         if final is None:
             raise RuntimeError("World Labs did not return a world")
         return final
+
+
+async def delete_worlds(world_ids: list[str | None]) -> None:
+    """Ask Marble to delete worlds this API created.
+
+    A missing key or a mock world is skipped. A World Labs error does not block
+    deleting the local project; the world id is queued and retried. 404 means
+    the world is already gone.
+    """
+    settings = get_settings()
+    ids = list(dict.fromkeys(item for item in world_ids if item))
+    if not ids or not settings.worldlabs_api_key:
+        return
+    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+    timeout = httpx.Timeout(30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for world_id in ids:
+            ok, error = await _delete_one(client, headers, world_id)
+            if ok:
+                forget_world_delete(world_id)
+                continue
+            logger.error("Marble delete for %s failed: %s", world_id, error)
+            queue_world_deletes([world_id], error or "delete failed")
+
+
+async def retry_pending_world_deletes(*, force: bool = False) -> int:
+    """Retry Marble deletes that failed earlier. Returns how many are now gone."""
+    settings = get_settings()
+    ids = pending_world_delete_ids(force=force)
+    if not ids or not settings.worldlabs_api_key:
+        return 0
+    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+    cleared = 0
+    timeout = httpx.Timeout(30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for world_id in ids:
+            ok, error = await _delete_one(client, headers, world_id)
+            if ok:
+                forget_world_delete(world_id)
+                cleared += 1
+                continue
+            logger.error("Marble delete retry for %s failed: %s", world_id, error)
+            queue_world_deletes([world_id], error or "delete failed")
+    return cleared
+
+
+async def _delete_one(client: httpx.AsyncClient, headers: dict, world_id: str) -> tuple[bool, str | None]:
+    url = f"{WORLDLABS_BASE}/marble/v1/worlds/{world_id}"
+    try:
+        response = await client.delete(url, headers=headers)
+    except Exception:
+        logger.exception("Could not delete Marble world %s", world_id)
+        return False, "request failed"
+    if response.status_code in {200, 204, 404}:
+        return True, None
+    return False, f"HTTP {response.status_code}"
 
 
 async def _upload_panorama(client: httpx.AsyncClient, headers: dict, image_bytes: bytes) -> str:

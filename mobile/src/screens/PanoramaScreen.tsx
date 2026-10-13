@@ -29,6 +29,7 @@ export default function PanoramaScreen({ navigation, route }: Props) {
   const [prompt, setPrompt] = useState(STAGING_PRESETS[0].prompt);
   const [submitting, setSubmitting] = useState(false);
   const previousStatus = useRef<string | null>(null);
+  const previousStaging = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -38,13 +39,17 @@ export default function PanoramaScreen({ navigation, route }: Props) {
         if (cancelled) return;
         setProject(latest);
         setError(null);
-        if (previousStatus.current === 'staging' && latest.status === 'staged') {
+        if (previousStaging.current === 'staging' && latest.staging_status === 'staged') {
           setMode('compare');
+        }
+        if (previousStaging.current === 'staging' && latest.staging_status === 'failed') {
+          Alert.alert('Staging failed', latest.staging_error || 'Try again');
         }
         if (latest.status === 'failed' && previousStatus.current && previousStatus.current !== 'failed') {
           Alert.alert('Something went wrong', latest.error || 'Try again from this screen.');
         }
         previousStatus.current = latest.status;
+        previousStaging.current = latest.staging_status;
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load the project');
       }
@@ -64,12 +69,19 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     project?.active_job === 'world' ||
     project?.active_job === 'staged_world' ||
     project?.status === 'generating_3d';
+  const originalDraftReady = Boolean(project?.world_preview_url) && !project?.world_marble_url && buildingWorld;
+  const stagedDraftReady =
+    Boolean(project?.staged_world_preview_url) &&
+    !project?.staged_world_marble_url &&
+    project?.active_job === 'staged_world';
   const activity =
-    project?.active_job === 'stage' || project?.status === 'staging'
+    project?.staging_status === 'staging'
       ? 'Staging the room…'
-      : buildingWorld
-        ? 'Creating the 3D walkthrough…'
-        : null;
+      : originalDraftReady || stagedDraftReady
+        ? 'Draft 3D is ready. The full walkthrough is still generating.'
+        : buildingWorld
+          ? 'Creating the 3D walkthrough…'
+          : null;
 
   const handleStage = async () => {
     const text = prompt.trim();
@@ -78,8 +90,12 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     try {
       await api.startStaging(projectId, text);
       setShowStage(false);
-      previousStatus.current = 'staging';
-      setProject((current) => (current ? { ...current, status: 'staging', staging_prompt: text } : current));
+      previousStaging.current = 'staging';
+      setProject((current) =>
+        current
+          ? { ...current, staging_status: 'staging', staging_error: null, staging_prompt: text }
+          : current,
+      );
     } catch (err) {
       Alert.alert('Staging failed', err instanceof Error ? err.message : 'Try again');
     } finally {
@@ -212,19 +228,22 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             );
           })}
         </View>
-        {project?.status === 'failed' && project.error ? (
-          <Text style={styles.errorDetail}>{project.error}</Text>
+        {project?.error ? <Text style={styles.errorDetail}>{project.error}</Text> : null}
+        {project?.staging_status === 'failed' && project.staging_error ? (
+          <Text style={styles.errorDetail}>{project.staging_error}</Text>
         ) : null}
         <TouchableOpacity
           style={[styles.primary, !project?.has_original && styles.disabled]}
           disabled={!project?.has_original}
           onPress={() => openWorld('original')}
         >
-          <Text style={styles.primaryText}>View 3D walkthrough</Text>
+          <Text style={styles.primaryText}>
+            {project?.world_preview_url && !project?.world_marble_url ? 'View draft 3D' : 'View 3D walkthrough'}
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.secondary, (!project?.has_original || buildingWorld || project?.status === 'staging') && styles.disabled]}
-          disabled={!project?.has_original || submitting || buildingWorld || project?.status === 'staging'}
+          style={[styles.secondary, (!project?.has_original || buildingWorld || project?.staging_status === 'staging') && styles.disabled]}
+          disabled={!project?.has_original || submitting || buildingWorld || project?.staging_status === 'staging'}
           onPress={() => setShowStage(true)}
         >
           <Text style={styles.secondaryText}>{project?.has_staged ? 'Stage again' : 'Optionally stage furniture'}</Text>
@@ -236,7 +255,11 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             onPress={handleStagedWorld}
           >
             <Text style={styles.secondaryText}>
-              {project.status === 'complete' && project.staged_world_viewer_url ? 'View staged 3D' : 'Create staged 3D'}
+              {project.staged_world_preview_url && !project.staged_world_marble_url
+                ? 'View draft staged 3D'
+                : project.staged_world_marble_url || project.staged_world_viewer_url
+                  ? 'View staged 3D'
+                  : 'Create staged 3D'}
             </Text>
           </TouchableOpacity>
         )}
@@ -250,6 +273,31 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             <Text style={styles.link}>Export staged image</Text>
           </TouchableOpacity>
         )}
+        <TouchableOpacity
+          onPress={() => {
+            Alert.alert(
+              'Delete this capture?',
+              'This removes the photos, panorama, staged image, 3D walkthrough, and share link from 360Flow. This cannot be undone.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Delete',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      await api.deleteProject(projectId);
+                      navigation.popToTop();
+                    } catch (err) {
+                      Alert.alert('Could not delete', err instanceof Error ? err.message : 'Try again');
+                    }
+                  },
+                },
+              ],
+            );
+          }}
+        >
+          <Text style={styles.deleteLink}>Delete capture</Text>
+        </TouchableOpacity>
       </View>
 
       <Modal visible={showStage} transparent animationType="slide">
@@ -367,6 +415,7 @@ const styles = StyleSheet.create({
   },
   secondaryText: { color: '#fff', fontWeight: '600' },
   link: { color: '#ffe08a', textAlign: 'center', fontWeight: '600' },
+  deleteLink: { color: '#F44336', textAlign: 'center', fontWeight: '700' },
   disabled: { opacity: 0.4 },
   centered: { flex: 1, backgroundColor: '#1a1a2e', justifyContent: 'center', alignItems: 'center', padding: 24 },
   errorText: { color: '#F44336', fontSize: 18, fontWeight: '700', marginBottom: 8 },

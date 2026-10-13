@@ -4,7 +4,7 @@ import { WebView } from 'react-native-webview';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
 import { api } from '../services/api';
-import { DISCLOSURE_TEXT, Project } from '../models/types';
+import { DISCLOSURE_TEXT, Project, WORLD_GENERATION_WAIT_MS } from '../models/types';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'World'>;
 
@@ -13,14 +13,18 @@ export default function WorldScreen({ navigation, route }: Props) {
   const staged = source === 'staged';
   const [project, setProject] = useState<Project | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [waitedLong, setWaitedLong] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
         const latest = await api.getProject(projectId);
-        if (!cancelled) {
-          setProject(latest);
+        if (cancelled) return;
+        setProject(latest);
+        if (latest.status === 'failed' && latest.error) {
+          setError(latest.error);
+        } else {
           setError(null);
         }
       } catch (err) {
@@ -29,15 +33,23 @@ export default function WorldScreen({ navigation, route }: Props) {
     };
     load();
     const timer = setInterval(load, 3000);
+    const budget = setTimeout(() => setWaitedLong(true), WORLD_GENERATION_WAIT_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      clearTimeout(budget);
     };
   }, [projectId]);
 
-  const viewerUrl = staged
-    ? project?.staged_world_marble_url || project?.staged_world_preview_url || project?.staged_world_viewer_url || null
-    : project?.world_marble_url || project?.world_preview_url || project?.world_viewer_url || null;
+  const fullUrl = staged ? project?.staged_world_marble_url : project?.world_marble_url;
+  const previewUrl = staged ? project?.staged_world_preview_url : project?.world_preview_url;
+  const viewerUrl = fullUrl || previewUrl || (staged ? project?.staged_world_viewer_url : project?.world_viewer_url) || null;
+  const showingDraft = Boolean(previewUrl && !fullUrl);
+  const stillGenerating =
+    project?.status === 'generating_3d' ||
+    ((project?.active_job === 'world' || project?.active_job === 'staged_world') &&
+      project?.status !== 'failed' &&
+      project?.status !== 'complete');
 
   return (
     <View style={styles.container}>
@@ -54,12 +66,24 @@ export default function WorldScreen({ navigation, route }: Props) {
             <ActivityIndicator size="large" color="#6C63FF" />
           </View>
         )}
-        {error && (
+        {error && !viewerUrl && (
           <View style={styles.centered}>
             <Text style={styles.error}>{error}</Text>
           </View>
         )}
-        {viewerUrl && <WebView source={{ uri: viewerUrl }} style={styles.web} />}
+        {viewerUrl && <WebView key={viewerUrl} source={{ uri: viewerUrl }} style={styles.web} />}
+        {showingDraft && stillGenerating && (
+          <View style={styles.draft} pointerEvents="none">
+            <Text style={styles.draftText}>
+              Draft walkthrough. The full 3D world is still generating and can take about 15 minutes.
+            </Text>
+          </View>
+        )}
+        {waitedLong && stillGenerating && !fullUrl && !showingDraft && (
+          <View style={styles.draft} pointerEvents="none">
+            <Text style={styles.draftText}>Still generating the full walkthrough.</Text>
+          </View>
+        )}
         {staged && (
           <View style={styles.chip} pointerEvents="none">
             <Text style={styles.chipText}>{DISCLOSURE_TEXT}</Text>
@@ -87,6 +111,16 @@ const styles = StyleSheet.create({
   web: { flex: 1, backgroundColor: '#000' },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
   error: { color: '#F44336', textAlign: 'center' },
+  draft: {
+    position: 'absolute',
+    left: 16,
+    right: 16,
+    bottom: 16,
+    backgroundColor: 'rgba(14,14,24,0.88)',
+    borderRadius: 12,
+    padding: 12,
+  },
+  draftText: { color: '#fff', fontWeight: '600', textAlign: 'center' },
   chip: {
     position: 'absolute',
     top: 12,

@@ -23,13 +23,16 @@ _PROGRESS = {
 }
 
 
-def share_url(token: str, request: Request | None = None) -> str:
+def share_url(token: str, request: Request | None = None) -> str | None:
+    """Absolute share link from PUBLIC_BASE_URL only.
+
+    The Host header is not used, so a caller cannot choose the link origin.
+    """
+    del request
     base = get_settings().public_base_url
-    if base:
-        return f"{base.rstrip('/')}/v/{token}"
-    if request is not None:
-        return f"{str(request.base_url).rstrip('/')}/v/{token}"
-    return f"/v/{token}"
+    if not base:
+        return None
+    return f"{base.rstrip('/')}/v/{token}"
 
 
 def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
@@ -46,6 +49,7 @@ def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
         staging_prompt=row.staging_prompt,
         share_token=row.share_token,
         share_url=share,
+        share_expires_at=row.share_expires_at,
         has_original=bool(row.panorama_key),
         has_staged=staged,
         staging_provider=row.staging_provider,
@@ -60,6 +64,8 @@ def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
         staged_world_preview_url=row.staged_world_preview_url,
         staged_world_viewer_url=f"{share}/world?source=staged" if staged else None,
         staging_notes=row.staging_notes,
+        staging_status=row.staging_status,
+        staging_error=row.staging_error,
         active_job=row.active_job,
         disclosure=DISCLOSURE_TEXT if staged else None,
     )
@@ -70,10 +76,12 @@ def status_body(row: ProjectRecord, request: Request | None = None) -> dict:
         "status": row.status,
         "progress": _PROGRESS.get(row.status, 0),
         "error": row.error,
-        "share_url": share_url(row.share_token, request),
+        "share_url": share_url(row.share_token),
         "has_original": bool(row.panorama_key),
         "has_staged": bool(row.staged_key),
         "staging_provider": row.staging_provider,
+        "staging_status": row.staging_status,
+        "staging_error": row.staging_error,
         "world_provider": row.world_provider,
         "world_preview_url": row.world_preview_url,
         "active_job": row.active_job,

@@ -33,8 +33,16 @@
 - The original panorama key is never overwritten. Staged bytes live under `staged/{id}.jpg`.
 - Every staged view (app, share page, 3D page) and every exported staged JPEG shows **Virtually staged (AI)** (`DISCLOSURE_TEXT`). The sphere texture is the clean JPEG so the burned bar is not mapped onto the south pole; the HUD chip still shows the words.
 - `build_staging_prompt` puts a fixed preservation instruction first (walls, windows, floors, fixtures) and appends the user's text only as style and furniture. This is best effort: the model can still alter the room. Keep the original so the result can be compared.
-- Staging uses Gemini (`GEMINI_API_KEY`, default model `gemini-nano-banana-2.1`). The panorama is split into five overlapping perspective views, the poles stay the original photograph, and a low edge-recall score retries once or keeps that view. With the key unset, a warm color grade stands in (`gemini_mock`).
-- After a successful stitch the API always starts a World Labs world from the original panorama: `marble-1.0-draft` first (about 20s), then `marble-1.1` (about 5 minutes). The panorama stays viewable while that runs. A staged panorama can get its own world. Staged worlds keep the disclosure label.
+- Staging uses Gemini (`GEMINI_API_KEY`, default model `gemini-3.1-flash-image`). The panorama is split into five overlapping perspective views, the poles stay the original photograph, and a low edge-recall score retries once or keeps that view. With the key unset, a warm color grade stands in (`gemini_mock`). Staging progress is `staging_status`, separate from the project status, so a staging failure leaves a finished panorama and 3D world in place. Quota responses use `AI staging is unavailable right now (provider quota)`.
+- After a successful stitch the API always starts a World Labs world from the original panorama: `marble-1.0-draft` first (about 20s), then `marble-1.1`. Full worlds have taken about 10 minutes; the server polls for 20 minutes and the app keeps polling for at least 15, showing the draft Marble URL while the full world runs. A staged panorama can get its own world. Staged worlds keep the disclosure label.
+
+### Deletion and privacy
+- There are no user accounts. Do not add an account-deletion flow unless accounts are added.
+- Do not put `API_KEY` or `EXPO_PUBLIC_API_KEY` in the app. Devices call `POST /api/v1/devices` and store the token in `expo-secure-store`. Project routes are scoped by `owner_device_id` and return 404 for other devices. `API_KEY` is an operator key checked with `hmac.compare_digest`.
+- Read 35mm focal length from the Exif IFD (`getexif().get_ifd(0x8769)`), tags `FocalLength` (`0x920A`) and `FocalLengthIn35mmFilm` (`0xA405`), before stripping EXIF.
+- Share links expire (`SHARE_LINK_TTL_DAYS`, default 30). `embed=1` uses `EMBED_FRAME_ANCESTORS` instead of `frame-ancestors 'none'`. Paid Gemini and World Labs jobs have per-device daily quotas, including the world that starts after upload. Failed Marble deletes are queued and retried. Client IP is the rightmost trusted `X-Forwarded-For` hop (`TRUSTED_PROXY_COUNT`).
+- `DELETE /api/v1/projects/{id}` removes the row, `uploads/{id}/`, `panoramas/{id}.jpg`, `staged/{id}.jpg`, and `worlds/{id}/` on local disk or R2, and asks World Labs to delete stored world ids. The share token then 404s.
+- The app must show the one-time third-party disclosure (Google Gemini and World Labs) before the first upload. Consent is stored in the app document directory.
 
 ## Conventions
 - Backend uses `uvicorn` with `--host 0.0.0.0`

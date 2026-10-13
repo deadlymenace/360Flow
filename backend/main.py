@@ -1,14 +1,18 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
-from auth import require_api_key
 from config import get_settings
 from db import fail_interrupted_jobs, init_db
+from httpguard import GuardMiddleware
+from routers.devices import router as devices_router
 from routers.projects import router as projects_router
 from routers.share import router as share_router
+from services.world_gen import retry_pending_world_deletes
 from storage import init_storage
 
 
@@ -21,21 +25,54 @@ async def lifespan(app: FastAPI):
     interrupted = fail_interrupted_jobs()
     if interrupted:
         logging.getLogger(__name__).warning("Marked %d interrupted jobs as failed", interrupted)
+    stop = asyncio.Event()
+
+    async def _retry_deletes() -> None:
+        while not stop.is_set():
+            try:
+                await retry_pending_world_deletes()
+            except Exception:
+                logging.getLogger(__name__).exception("World delete retry failed")
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                continue
+
+    task = None
+    if not settings.jobs_inline:
+        task = asyncio.create_task(_retry_deletes())
     yield
+    stop.set()
+    if task is not None:
+        task.cancel()
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="360Flow API", version="0.2.0", lifespan=lifespan)
-    origins = settings.cors_origins
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=origins != ["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+    docs_url = "/docs" if settings.enable_docs else None
+    openapi_url = "/openapi.json" if settings.enable_docs else None
+    app = FastAPI(
+        title="360Flow API",
+        version="0.3.0",
+        lifespan=lifespan,
+        docs_url=docs_url,
+        redoc_url=None,
+        openapi_url=openapi_url,
     )
-    app.include_router(projects_router, prefix="/api/v1", dependencies=[Depends_api_key()])
+    app.add_middleware(GuardMiddleware)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError):
+        logging.getLogger("validation").info(
+            "Rejected invalid %s %s (%d errors)",
+            request.method,
+            request.url.path,
+            len(exc.errors()),
+        )
+        return JSONResponse(status_code=422, content={"detail": "Invalid request"})
+
+    app.include_router(devices_router, prefix="/api/v1")
+    app.include_router(projects_router, prefix="/api/v1")
     app.include_router(share_router)
 
     @app.get("/health")
@@ -48,15 +85,10 @@ def create_app() -> FastAPI:
             "staging": current.staging_mode,
             "world": current.world_mode,
             "auth": current.auth_mode,
+            "admin": bool(current.api_key),
         }
 
     return app
-
-
-def Depends_api_key():
-    from fastapi import Depends
-
-    return Depends(require_api_key)
 
 
 app = create_app()

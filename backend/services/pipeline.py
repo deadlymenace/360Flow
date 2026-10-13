@@ -15,10 +15,16 @@ from pathlib import Path
 
 from config import get_settings
 from db import ProjectRecord, get_project, update_project
-from services.staging import stage_image
+from services.quota import (
+    STAGING_QUOTA_MESSAGE,
+    WORLD_QUOTA_MESSAGE,
+    consume_staging_quota,
+    consume_world_quota,
+)
+from services.staging import StagingProviderError, stage_image
 from services.stitcher import stitch_images
-from services.world_gen import generate_world
-from storage import get_storage, panorama_key, staged_key
+from services.world_gen import delete_worlds, generate_world, world_display_name
+from storage import delete_project_assets, get_storage, panorama_key, staged_key
 
 logger = logging.getLogger(__name__)
 
@@ -91,19 +97,38 @@ async def run_stitch(project_id: str) -> None:
             )
             if not ok or not output.is_file():
                 raise RuntimeError("Stitching failed. Try recapturing with more overlap between photos.")
+            if _deleted(project_id):
+                return
             key = panorama_key(project_id)
             storage.put_file(key, output, "image/jpeg")
-        update_project(project_id, status="stitched", panorama_key=key, error=None, active_job=None)
+        saved = update_project(project_id, status="stitched", panorama_key=key, error=None, active_job=None)
+        if saved is None:
+            delete_project_assets(project_id)
+            return
         logger.info("Project %s stitched", project_id)
     except Exception as exc:
+        if _deleted(project_id):
+            logger.info("Project %s deleted during stitch", project_id)
+            return
         logger.exception("Project %s stitch failed", project_id)
-        update_project(project_id, status="failed", error=_short(exc))
+        update_project(project_id, status="failed", error="Stitching failed. Try again.")
         return
     await run_world(project_id, source="original")
 
 
 async def run_stage(project_id: str) -> None:
-    update_project(project_id, status="staging", error=None, active_job="stage")
+    """Stage without changing the capture status.
+
+    The panorama and 3D world stay available when staging fails. Progress and
+    errors live on staging_status and staging_error.
+    """
+    project = get_project(project_id)
+    if project is None:
+        return
+    if not consume_staging_quota(project.owner_device_id):
+        update_project(project_id, staging_status="failed", staging_error=STAGING_QUOTA_MESSAGE)
+        return
+    update_project(project_id, staging_status="staging", staging_error=None)
     try:
         project = _require(project_id)
         if not project.panorama_key or not project.staging_prompt:
@@ -111,31 +136,52 @@ async def run_stage(project_id: str) -> None:
         storage = get_storage()
         original = storage.get_bytes(project.panorama_key)
         staged_bytes, provider, notes = await stage_image(original, project.staging_prompt)
+        if _deleted(project_id):
+            return
         key = staged_key(project_id)
         storage.put_bytes(key, staged_bytes, "image/jpeg")
-        update_project(
+        saved = update_project(
             project_id,
-            status="staged",
+            staging_status="staged",
             staged_key=key,
             staging_provider=provider,
             staging_notes=notes,
-            active_job=None,
-            error=None,
+            staging_error=None,
         )
+        if saved is None:
+            delete_project_assets(project_id)
+            return
         logger.info("Project %s staged via %s", project_id, provider)
-    except Exception as exc:
-        logger.exception("Project %s staging failed", project_id)
-        update_project(project_id, status="failed", error=_short(exc))
+    except StagingProviderError as exc:
+        _fail_stage(project_id, exc.client_message)
+    except Exception:
+        _fail_stage(project_id, "Staging failed. Try again.")
+
+
+def _fail_stage(project_id: str, message: str) -> None:
+    if _deleted(project_id):
+        logger.info("Project %s deleted during staging", project_id)
+        return
+    logger.exception("Project %s staging failed", project_id)
+    update_project(project_id, staging_status="failed", staging_error=message)
 
 
 async def run_world(project_id: str, source: str = "original") -> None:
     staged_source = source == "staged"
+    existing = get_project(project_id)
+    if existing is None:
+        return
+    if not consume_world_quota(existing.owner_device_id):
+        logger.info("Project %s skipped a paid world; daily quota is spent", project_id)
+        update_project(project_id, error=WORLD_QUOTA_MESSAGE, active_job=None)
+        return
     update_project(
         project_id,
         status="generating_3d",
         error=None,
         active_job="staged_world" if staged_source else "world",
     )
+    created_ids: list[str] = []
     try:
         project = _require(project_id)
         storage = get_storage()
@@ -143,31 +189,43 @@ async def run_world(project_id: str, source: str = "original") -> None:
             if not project.staged_key:
                 raise RuntimeError("Stage the panorama before generating a 3D world from it")
             image = storage.get_bytes(project.staged_key)
-            label = f"{project.name} staged"
         else:
             if not project.panorama_key:
                 raise RuntimeError("No panorama available for a 3D world")
             image = storage.get_bytes(project.panorama_key)
-            label = project.name
+        label = world_display_name(project.id, staged=staged_source)
 
         async def on_preview(result: dict) -> None:
+            world_id = result.get("world_id")
+            if world_id:
+                created_ids.append(world_id)
+            if _deleted(project_id):
+                await delete_worlds([world_id])
+                return
             if staged_source:
                 update_project(
                     project_id,
                     staged_world_preview_url=result.get("marble_url"),
+                    staged_world_preview_id=world_id,
                     staged_world_provider=result.get("provider"),
                 )
             else:
                 update_project(
                     project_id,
                     world_preview_url=result.get("marble_url"),
-                    world_preview_id=result.get("world_id"),
+                    world_preview_id=world_id,
                     world_provider=result.get("provider"),
                 )
 
         result = await generate_world(image, label, on_preview=on_preview)
+        final_id = result.get("world_id")
+        if final_id:
+            created_ids.append(final_id)
+        if _deleted(project_id):
+            await delete_worlds(created_ids)
+            return
         if staged_source:
-            update_project(
+            saved = update_project(
                 project_id,
                 status="complete",
                 staged_world_provider=result.get("provider"),
@@ -181,7 +239,7 @@ async def run_world(project_id: str, source: str = "original") -> None:
                 error=None,
             )
         else:
-            update_project(
+            saved = update_project(
                 project_id,
                 status="complete",
                 world_provider=result.get("provider"),
@@ -194,10 +252,22 @@ async def run_world(project_id: str, source: str = "original") -> None:
                 active_job=None,
                 error=None,
             )
+        if saved is None:
+            await delete_worlds(created_ids)
+            delete_project_assets(project_id)
+            return
         logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
     except Exception as exc:
+        if _deleted(project_id):
+            logger.info("Project %s deleted during world generation", project_id)
+            await delete_worlds(created_ids)
+            return
         logger.exception("Project %s world generation failed", project_id)
-        update_project(project_id, status="failed", error=_short(exc))
+        update_project(project_id, status="failed", error="3D generation failed. Try again.")
+
+
+def _deleted(project_id: str) -> bool:
+    return get_project(project_id) is None
 
 
 def _require(project_id: str) -> ProjectRecord:
@@ -206,7 +276,3 @@ def _require(project_id: str) -> ProjectRecord:
         raise RuntimeError("Project not found")
     return project
 
-
-def _short(exc: Exception) -> str:
-    text = str(exc).strip() or exc.__class__.__name__
-    return text[:500]
