@@ -45,8 +45,10 @@ export default function WorldScreen({ navigation, route }: Props) {
   const previewUrl = staged ? project?.staged_world_preview_url : project?.world_preview_url;
   const viewerUrl = fullUrl || previewUrl || (staged ? project?.staged_world_viewer_url : project?.world_viewer_url) || null;
   const showingDraft = Boolean(previewUrl && !fullUrl);
+  const delayed = project?.status === 'delayed';
   const stillGenerating =
     project?.status === 'generating_3d' ||
+    delayed ||
     ((project?.active_job === 'world' || project?.active_job === 'staged_world') &&
       project?.status !== 'failed' &&
       project?.status !== 'complete');
@@ -66,13 +68,28 @@ export default function WorldScreen({ navigation, route }: Props) {
             <ActivityIndicator size="large" color="#6C63FF" />
           </View>
         )}
-        {error && !viewerUrl && (
+        {delayed && !viewerUrl && (
+          <View style={styles.centered}>
+            <ActivityIndicator size="large" color="#6C63FF" />
+            <Text style={styles.waiting}>
+              {project?.error || "Your 3D tour is delayed, we'll finish it shortly"}
+            </Text>
+          </View>
+        )}
+        {error && !viewerUrl && !delayed && (
           <View style={styles.centered}>
             <Text style={styles.error}>{error}</Text>
           </View>
         )}
         {viewerUrl && <WebView key={viewerUrl} source={{ uri: viewerUrl }} style={styles.web} />}
-        {showingDraft && stillGenerating && (
+        {delayed && viewerUrl && (
+          <View style={styles.draft} pointerEvents="none">
+            <Text style={styles.draftText}>
+              {project?.error || "Your 3D tour is delayed, we'll finish it shortly"}
+            </Text>
+          </View>
+        )}
+        {showingDraft && stillGenerating && !delayed && (
           <View style={styles.draft} pointerEvents="none">
             <Text style={styles.draftText}>
               Draft walkthrough. The full 3D world is still generating and can take about 15 minutes.
@@ -111,6 +128,7 @@ const styles = StyleSheet.create({
   web: { flex: 1, backgroundColor: '#000' },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
   error: { color: '#F44336', textAlign: 'center' },
+  waiting: { color: '#fff', textAlign: 'center', marginTop: 16, lineHeight: 22 },
   draft: {
     position: 'absolute',
     left: 16,

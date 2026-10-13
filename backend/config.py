@@ -91,6 +91,7 @@ class Settings:
     worldlabs_model: str
     worldlabs_draft_model: str | None
     worldlabs_public: bool
+    worldlabs_low_credit_threshold: int
     worker_concurrency: int
     stitch_concurrency: int
     jobs_inline: bool
@@ -184,6 +185,7 @@ def get_settings() -> Settings:
         worldlabs_model=_blank("WORLDLABS_MODEL") or "marble-1.1",
         worldlabs_draft_model=draft_model,
         worldlabs_public=_bool("WORLDLABS_PUBLIC", False),
+        worldlabs_low_credit_threshold=max(0, _int("WORLDLABS_LOW_CREDIT_THRESHOLD", 6000)),
         worker_concurrency=max(1, _int("WORKER_CONCURRENCY", 3)),
         stitch_concurrency=max(1, _int("STITCH_CONCURRENCY", 1)),
         jobs_inline=_bool("JOBS_INLINE", False),

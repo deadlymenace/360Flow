@@ -117,7 +117,7 @@ struct ProcessingView: View {
                 try await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
                 let status = try await APIService.shared.getProjectStatus(projectId: projectId)
 
-                if status.status == "stitched" || status.status == "staged" || status.status == "complete" {
+                if status.status == "stitched" || status.status == "staged" || status.status == "complete" || status.status == "delayed" {
                     // Download the panorama
                     panoramaImage = try await APIService.shared.getPanorama(projectId: projectId)
                     phase = .done

@@ -21,6 +21,8 @@ def _project(token: str):
 
 
 def _world_note(project) -> str:
+    if project.status == "delayed":
+        return "Your 3D tour is delayed, we'll finish it shortly. You can look around this panorama now."
     if project.active_job == "staged_world":
         return "A 3D walkthrough of the staged room is generating."
     if project.world_preview_url and not project.world_marble_url:
@@ -67,6 +69,9 @@ async def view_world(token: str, source: str = Query(default="original")):
         generating = project.active_job == "world" or (
             project.status == "generating_3d" and project.active_job != "staged_world"
         )
+    waiting = ""
+    if project.status == "delayed":
+        waiting = "Your 3D tour is delayed, we'll finish it shortly. You can look around this panorama now."
     html = render_world_page(
         title=project.name,
         asset_base=f"/v/{token}",
@@ -75,6 +80,7 @@ async def view_world(token: str, source: str = Query(default="original")):
         staged_source=staged_source,
         preview=preview,
         generating=generating,
+        waiting=waiting,
     )
     return HTMLResponse(html)
 

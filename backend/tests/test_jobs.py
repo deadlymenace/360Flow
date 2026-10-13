@@ -8,7 +8,7 @@ import time
 
 from db import create_job, fail_interrupted_jobs, update_job, update_project
 import services.pipeline as pipeline
-from services.world_gen import WORLD_CREDITS_MESSAGE, ProviderFailure
+from services.world_gen import WORLD_CREDITS_MESSAGE, WORLD_DELAYED_MESSAGE, ProviderFailure, note_out_of_credits
 from storage import get_storage, panorama_key
 
 
@@ -168,40 +168,73 @@ def test_resume_does_not_recharge_without_an_operation_id(client, monkeypatch):
     assert admin["error"] == body["error"]
 
 
-def test_credit_error_is_stored_for_the_operator(client, monkeypatch):
+def test_out_of_credits_delays_the_tour_until_credits_return(client, monkeypatch):
     created = client.post("/api/v1/projects", json={"name": "Out of credits"}).json()
     project_id = created["id"]
     key = panorama_key(project_id)
     get_storage().put_bytes(key, b"panorama", "image/jpeg")
     update_project(project_id, status="stitched", panorama_key=key, active_job=None)
+    calls = {"n": 0}
 
-    async def boom(*args, **kwargs):
-        raise ProviderFailure(WORLD_CREDITS_MESSAGE, "HTTP 402: account is out of credits", 402)
+    async def generate(image, label, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ProviderFailure(WORLD_CREDITS_MESSAGE, "out of credits (remaining 0, marble-1.1 needs 1500)", 402)
+        assert label == project_id or str(label).startswith(project_id)
+        return {
+            "provider": "worldlabs",
+            "world_id": "world-later",
+            "marble_url": "https://marble.worldlabs.ai/world/world-later",
+            "splat_url": None,
+            "mesh_url": None,
+            "thumbnail_url": None,
+            "operation_id": "op-later",
+        }
 
-    monkeypatch.setattr(pipeline, "generate_world", boom)
+    monkeypatch.setattr(pipeline, "generate_world", generate)
     asyncio.run(pipeline.enqueue_job(project_id, "world"))
 
     body = client.get(f"/api/v1/projects/{project_id}").json()
-    assert body["status"] == "failed"
-    assert body["error"] == WORLD_CREDITS_MESSAGE
+    assert body["status"] == "delayed"
+    assert body["error"] == WORLD_DELAYED_MESSAGE
+    assert body["has_original"] is True
     assert "402" not in body["error"]
+    assert "out of credits" not in body["error"]
     assert body["provider_error"] is None
     status = client.get(f"/api/v1/projects/{project_id}/status").json()
+    assert status["status"] == "delayed"
+    assert status["error"] == WORLD_DELAYED_MESSAGE
     assert "provider_error" not in status
-    assert status["error"] == WORLD_CREDITS_MESSAGE
-    listed = client.get("/api/v1/projects").json()
-    match = next(item for item in listed if item["id"] == project_id)
-    assert match["provider_error"] is None
+    page = client.get(f"/v/{body['share_token']}")
+    assert page.status_code == 200
+    assert "Your 3D tour is delayed" in page.text
+    assert "finish it shortly" in page.text
+    world_page = client.get(f"/v/{body['share_token']}/world")
+    assert "Your 3D tour is delayed" in world_page.text
+    assert "out of credits" not in world_page.text
 
     monkeypatch.setenv("API_KEY", "secret-key")
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    note_out_of_credits()
     admin = client.raw.get(
         f"/api/v1/projects/{project_id}",
         headers={"X-API-Key": "secret-key"},
     ).json()
-    assert admin["provider_error"] == "HTTP 402: account is out of credits"
-    admin_list = client.raw.get("/api/v1/projects", headers={"X-API-Key": "secret-key"}).json()
-    admin_match = next(item for item in admin_list if item["id"] == project_id)
-    assert admin_match["provider_error"] == "HTTP 402: account is out of credits"
+    assert admin["provider_error"].startswith("out of credits")
+    assert admin["error"] == WORLD_DELAYED_MESSAGE
+    assert asyncio.run(pipeline.retry_delayed_worlds()) == 0
+    assert client.get(f"/api/v1/projects/{project_id}").json()["status"] == "delayed"
+
+    async def balance():
+        return 20000.0
+
+    monkeypatch.setattr(pipeline, "world_credits_balance", balance)
+    assert asyncio.run(pipeline.retry_delayed_worlds()) == 1
+    finished = client.get(f"/api/v1/projects/{project_id}").json()
+    assert finished["status"] == "complete"
+    assert finished["world_marble_url"].endswith("/world-later")
+    assert finished["error"] is None
+    assert calls["n"] == 2
 
 
 def test_orphan_transient_project_still_fails_on_startup(client):

@@ -68,14 +68,17 @@ export default function PanoramaScreen({ navigation, route }: Props) {
   const buildingWorld =
     project?.active_job === 'world' ||
     project?.active_job === 'staged_world' ||
-    project?.status === 'generating_3d';
+    project?.status === 'generating_3d' ||
+    project?.status === 'delayed';
   const originalDraftReady = Boolean(project?.world_preview_url) && !project?.world_marble_url && buildingWorld;
   const stagedDraftReady =
     Boolean(project?.staged_world_preview_url) &&
     !project?.staged_world_marble_url &&
     project?.active_job === 'staged_world';
   const activity =
-    project?.staging_status === 'staging'
+    project?.status === 'delayed'
+      ? project.error || "Your 3D tour is delayed, we'll finish it shortly"
+      : project?.staging_status === 'staging'
       ? 'Staging the room…'
       : originalDraftReady || stagedDraftReady
         ? 'Draft 3D is ready. The full walkthrough is still generating.'

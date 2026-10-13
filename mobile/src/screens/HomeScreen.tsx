@@ -87,6 +87,7 @@ export default function HomeScreen({ navigation }: Props) {
       project.status === 'staging' ||
       project.status === 'staged' ||
       project.status === 'generating_3d' ||
+      project.status === 'delayed' ||
       project.status === 'complete' ||
       project.has_original
     ) {

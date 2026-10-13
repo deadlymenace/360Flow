@@ -18,7 +18,7 @@ struct Project: Codable, Identifiable {
     }
 
     var isStitched: Bool {
-        status == "stitched" || status == "staged" || status == "complete"
+        status == "stitched" || status == "staged" || status == "generating_3d" || status == "delayed" || status == "complete"
     }
 
     var statusLabel: String {
@@ -30,6 +30,7 @@ struct Project: Codable, Identifiable {
         case "staging": return "Staging..."
         case "staged": return "Staged"
         case "generating_3d": return "Generating 3D..."
+        case "delayed": return "3D delayed"
         case "complete": return "Complete"
         case "failed": return "Failed"
         default: return status.capitalized

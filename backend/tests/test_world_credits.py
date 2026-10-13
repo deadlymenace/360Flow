@@ -194,6 +194,39 @@ def test_zero_balance_fails_before_generate(monkeypatch):
     assert caught.value.detail.startswith("out of credits (remaining 0")
 
 
+def test_low_balance_is_logged_when_credits_are_fetched(monkeypatch, caplog):
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setenv("WORLDLABS_LOW_CREDIT_THRESHOLD", "6000")
+
+    class _CreditsClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers=None):
+            return _Response(200, {"remaining_credits": 1500})
+
+    monkeypatch.setattr(world_gen.httpx, "AsyncClient", _CreditsClient)
+    with caplog.at_level("WARNING"):
+        assert asyncio.run(world_credits_balance()) == 1500
+    assert any(
+        record.levelname == "WARNING" and "credit balance is low" in record.message and "1500" in record.message
+        for record in caplog.records
+    )
+
+
+def test_low_credit_threshold_defaults_to_6000(monkeypatch):
+    monkeypatch.delenv("WORLDLABS_LOW_CREDIT_THRESHOLD", raising=False)
+    from config import get_settings
+
+    assert get_settings().worldlabs_low_credit_threshold == 6000
+
+
 def test_admin_health_shows_the_credit_balance(client, monkeypatch):
     monkeypatch.setenv("API_KEY", "secret-key")
 
@@ -207,3 +240,13 @@ def test_admin_health_shows_the_credit_balance(client, monkeypatch):
     assert "worldlabs_credits" not in wrong
     admin = client.raw.get("/health", headers={"X-API-Key": "secret-key"}).json()
     assert admin["worldlabs_credits"] == 1800
+    assert admin["worldlabs_low_balance"] is True
+    assert "worldlabs_low_balance" not in public
+
+    async def healthy():
+        return 9000.0
+
+    monkeypatch.setattr("main.world_credits_balance", healthy)
+    topped_up = client.raw.get("/health", headers={"X-API-Key": "secret-key"}).json()
+    assert topped_up["worldlabs_credits"] == 9000
+    assert topped_up["worldlabs_low_balance"] is False

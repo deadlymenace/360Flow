@@ -13,6 +13,7 @@ class ProjectStatus(str, Enum):
     STAGING = "staging"
     STAGED = "staged"
     GENERATING_3D = "generating_3d"
+    DELAYED = "delayed"
     COMPLETE = "complete"
     FAILED = "failed"
 

@@ -22,6 +22,7 @@ FULL_WORLD_TIMEOUT_S = 20 * 60
 
 WORLD_FAILED_MESSAGE = "3D generation failed. Try again."
 WORLD_CREDITS_MESSAGE = "3D generation is unavailable right now (provider credits)."
+WORLD_DELAYED_MESSAGE = "Your 3D tour is delayed, we'll finish it shortly"
 WORLD_PROVIDER_QUOTA_MESSAGE = "3D generation is unavailable right now (provider quota)."
 
 # Pano world generation. Draft is 150; marble-1.0 / marble-1.1 are 1,500.
@@ -76,9 +77,20 @@ def clear_world_credits_cache() -> None:
 
 
 def note_out_of_credits() -> None:
-    """Remember a zero balance so the next job fails before it calls generate."""
+    """Remember a zero balance so the next attempt waits instead of calling generate."""
     global _credit_cache
     _credit_cache = {"at": time.monotonic(), "remaining": 0.0}
+    _warn_if_low(0.0)
+
+
+def _warn_if_low(remaining: float) -> None:
+    threshold = get_settings().worldlabs_low_credit_threshold
+    if remaining < threshold:
+        logger.warning(
+            "World Labs credit balance is low: %s remaining (threshold %s)",
+            remaining,
+            threshold,
+        )
 
 
 def _is_out_of_credits(exc: ProviderFailure) -> bool:
@@ -128,7 +140,9 @@ async def _fetch_credits(api_key: str) -> float | None:
         logger.warning("World Labs credits check did not include remaining_credits")
         return None
     logger.info("World Labs credits remaining: %s", remaining)
-    return float(remaining)
+    value = float(remaining)
+    _warn_if_low(value)
+    return value
 
 
 async def _require_credits(model: str) -> None:

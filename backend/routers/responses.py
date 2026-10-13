@@ -18,6 +18,7 @@ _PROGRESS = {
     "staging": 55,
     "staged": 100,
     "generating_3d": 70,
+    "delayed": 70,
     "complete": 100,
     "failed": 100,
 }

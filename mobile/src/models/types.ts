@@ -39,6 +39,7 @@ export type ProjectStatus =
   | 'staging'
   | 'staged'
   | 'generating_3d'
+  | 'delayed'
   | 'complete'
   | 'failed';
 
@@ -164,6 +165,7 @@ export function getStatusLabel(status: ProjectStatus): string {
     case 'staging': return 'Staging...';
     case 'staged': return 'Staged';
     case 'generating_3d': return 'Generating 3D...';
+    case 'delayed': return '3D delayed';
     case 'complete': return '3D Ready';
     case 'failed': return 'Failed';
   }

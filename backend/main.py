@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from auth import _admin_key_matches
 from config import get_settings
 from db import fail_interrupted_jobs, init_db
-from services.pipeline import resume_durable_jobs
+from services.pipeline import resume_durable_jobs, retry_delayed_worlds
 from httpguard import GuardMiddleware
 from routers.devices import router as devices_router
 from routers.projects import router as projects_router
@@ -27,6 +27,9 @@ async def lifespan(app: FastAPI):
     resumed = await resume_durable_jobs()
     if resumed:
         logging.getLogger(__name__).warning("Resumed %d durable jobs", resumed)
+    released = await retry_delayed_worlds()
+    if released:
+        logging.getLogger(__name__).info("Released %d delayed 3D jobs", released)
     interrupted = fail_interrupted_jobs()
     if interrupted:
         logging.getLogger(__name__).warning("Marked %d interrupted jobs as failed", interrupted)
@@ -38,6 +41,10 @@ async def lifespan(app: FastAPI):
                 await retry_pending_world_deletes()
             except Exception:
                 logging.getLogger(__name__).exception("World delete retry failed")
+            try:
+                await retry_delayed_worlds()
+            except Exception:
+                logging.getLogger(__name__).exception("Delayed world retry failed")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=60)
             except asyncio.TimeoutError:
@@ -93,7 +100,10 @@ def create_app() -> FastAPI:
             "admin": bool(current.api_key),
         }
         if _admin_key_matches(x_api_key):
-            body["worldlabs_credits"] = await world_credits_balance()
+            remaining = await world_credits_balance()
+            body["worldlabs_credits"] = remaining
+            threshold = current.worldlabs_low_credit_threshold
+            body["worldlabs_low_balance"] = remaining is not None and remaining < threshold
         return body
 
     return app

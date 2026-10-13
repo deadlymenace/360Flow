@@ -15,7 +15,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 
 from config import Settings, get_settings
 
-TRANSIENT_STATUSES = ("uploading", "stitching", "staging", "generating_3d")
+TRANSIENT_STATUSES = ("uploading", "stitching", "staging", "generating_3d", "delayed")
 
 
 class Base(DeclarativeBase):
@@ -457,8 +457,22 @@ def claim_resumable_jobs() -> list[JobRecord]:
 
 def resumable_project_ids() -> set[str]:
     with session_scope() as session:
-        rows = session.scalars(select(JobRow.project_id).where(JobRow.status.in_(("pending", "running")))).all()
+        rows = session.scalars(
+            select(JobRow.project_id).where(JobRow.status.in_(("pending", "running", "delayed")))
+        ).all()
         return set(rows)
+
+
+def list_delayed_world_jobs() -> list[JobRecord]:
+    """World jobs waiting for World Labs credits. They are not failed."""
+    with session_scope() as session:
+        rows = session.scalars(
+            select(JobRow).where(
+                JobRow.status == "delayed",
+                JobRow.kind.in_(("world", "staged_world")),
+            )
+        ).all()
+        return [_job_record(row) for row in rows]
 
 
 def get_by_share_token(token: str) -> ProjectRecord | None:
@@ -578,6 +592,7 @@ def fail_interrupted_jobs() -> int:
                         "stitching": "stitch",
                         "staging": "stage",
                         "generating_3d": "world",
+                        "delayed": "world",
                     }.get(previous, "stitch")
                 row.error = "Processing was interrupted by a server restart. Retry from the app."
             if row.staging_status == "staging":

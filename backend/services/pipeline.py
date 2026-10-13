@@ -26,6 +26,7 @@ from db import (
     delete_job,
     get_job,
     get_project,
+    list_delayed_world_jobs,
     update_job,
     update_project,
 )
@@ -40,12 +41,17 @@ from services.stitcher import stitch_images
 from services.world_gen import (
     DRAFT_WORLD_TIMEOUT_S,
     FULL_WORLD_TIMEOUT_S,
+    WORLD_DELAYED_MESSAGE,
     WORLD_FAILED_MESSAGE,
     ProviderFailure,
+    _is_out_of_credits,
     continue_full_world,
+    credits_required,
     delete_worlds,
     generate_world,
+    generation_models,
     poll_world_operation,
+    world_credits_balance,
     world_display_name,
 )
 from storage import delete_project_assets, get_storage, panorama_key, staged_key
@@ -106,7 +112,10 @@ async def enqueue_job(project_id: str, kind: str) -> None:
 
 
 async def resume_durable_jobs() -> int:
-    """Re-queue jobs that were pending or running when the process stopped."""
+    """Re-queue jobs that were pending or running when the process stopped.
+
+    Delayed world jobs stay queued until ``retry_delayed_worlds`` sees credits.
+    """
     jobs = claim_resumable_jobs()
     for job in jobs:
         logger.warning(
@@ -121,6 +130,43 @@ async def resume_durable_jobs() -> int:
     return len(jobs)
 
 
+def _credits_to_resume(job: JobRecord) -> int:
+    """Credits the next paid World Labs call needs. Polling an accepted op is free."""
+    settings = get_settings()
+    if job.operation_id and job.operation_phase == "full":
+        return 0
+    if job.operation_id and job.operation_phase == "draft":
+        return credits_required(settings.worldlabs_model)
+    models = generation_models(settings.worldlabs_draft_model, settings.worldlabs_model)
+    return credits_required(models[0])
+
+
+async def retry_delayed_worlds() -> int:
+    """Start delayed 3D jobs once the balance can pay for each next call."""
+    jobs = list_delayed_world_jobs()
+    if not jobs:
+        return 0
+    settings = get_settings()
+    if settings.worldlabs_api_key:
+        balance = await world_credits_balance()
+        if balance is None:
+            return 0
+    else:
+        balance = float("inf")
+    started = 0
+    for job in jobs:
+        needed = _credits_to_resume(job)
+        if balance < needed:
+            continue
+        update_job(job.id, status="running")
+        await _schedule(job.id)
+        balance -= needed
+        started += 1
+    if started:
+        logger.info("Released %d delayed 3D jobs after credits returned", started)
+    return started
+
+
 async def _schedule(job_id: str) -> None:
     if get_settings().jobs_inline:
         await run_job(job_id)
@@ -132,23 +178,25 @@ async def run_job(job_id: str) -> None:
     job = get_job(job_id)
     if job is None:
         return
-    resume = job.status == "running"
+    resume = job.status in {"running", "delayed"}
     update_job(job_id, status="running")
     follow: str | None = None
+    keep = False
     try:
         if job.kind == "stitch":
             follow = await run_stitch(job.project_id)
         elif job.kind == "stage":
             await run_stage(job.project_id, resume=resume)
         elif job.kind == "world":
-            await run_world(job.project_id, source="original", job_id=job_id, resume=resume)
+            keep = await run_world(job.project_id, source="original", job_id=job_id, resume=resume) == "delayed"
         elif job.kind == "staged_world":
-            await run_world(job.project_id, source="staged", job_id=job_id, resume=resume)
+            keep = await run_world(job.project_id, source="staged", job_id=job_id, resume=resume) == "delayed"
         else:
             logger.error("Unknown job kind %s", job.kind)
     finally:
-        delete_job(job_id)
-    if follow:
+        if not keep:
+            delete_job(job_id)
+    if follow and not keep:
         await enqueue_job(job.project_id, follow)
 
 
@@ -266,7 +314,7 @@ async def run_world(
     job_id: str | None = None,
     *,
     resume: bool = False,
-) -> None:
+) -> str | None:
     staged_source = source == "staged"
     job = get_job(job_id) if job_id else None
     existing = get_project(project_id)
@@ -274,10 +322,9 @@ async def run_world(
         return
     if job and job.operation_phase == "submitting":
         _fail_world(project_id, _INTERRUPTED_WORLD, _INTERRUPTED_WORLD_DETAIL, staged_source)
-        return
+        return None
     if job and job.operation_id and job.operation_phase in {"draft", "full"}:
-        await _resume_world(project_id, job, staged_source)
-        return
+        return await _resume_world(project_id, job, staged_source)
 
     already_started = resume or (
         existing.status == "generating_3d" and existing.active_job in {"world", "staged_world"}
@@ -285,7 +332,7 @@ async def run_world(
     if not already_started and not consume_world_quota(existing.owner_device_id):
         logger.info("Project %s skipped a paid world; daily quota is spent", project_id)
         update_project(project_id, error=WORLD_QUOTA_MESSAGE, active_job=None)
-        return
+        return None
     update_project(
         project_id,
         status="generating_3d",
@@ -322,12 +369,16 @@ async def run_world(
         )
         await _store_world(project_id, result, staged_source, created_ids)
     except ProviderFailure as exc:
+        if _is_out_of_credits(exc):
+            _delay_world(project_id, job_id, exc.detail, staged_source)
+            return "delayed"
         await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
     except Exception:
         await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
+    return None
 
 
-async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) -> None:
+async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) -> str | None:
     """Poll the saved operation. A finished draft continues into the full model."""
     update_project(
         project_id,
@@ -346,7 +397,7 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
             _store_preview(project_id, parsed, staged_source, created_ids)
             if _deleted(project_id):
                 await delete_worlds(created_ids)
-                return
+                return None
             image, label = _world_inputs(project, staged_source)
 
             async def on_submitting(_phase: str) -> None:
@@ -364,9 +415,13 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
             )
         await _store_world(project_id, parsed, staged_source, created_ids)
     except ProviderFailure as exc:
+        if _is_out_of_credits(exc):
+            _delay_world(project_id, job.id, exc.detail, staged_source)
+            return "delayed"
         await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
     except Exception:
         await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
+    return None
 
 
 def _world_inputs(project: ProjectRecord, staged_source: bool) -> tuple[bytes, str]:
@@ -456,6 +511,28 @@ def _remember_operation(project_id: str, job_id: str | None, operation_id: str, 
     field = "staged_world_operation_id" if staged_source else "world_operation_id"
     update_project(project_id, **{field: operation_id[:64]})
     logger.info("Project %s World Labs operation %s (%s)", project_id, operation_id, phase)
+
+
+def _delay_world(project_id: str, job_id: str | None, detail: str, staged_source: bool) -> None:
+    """Keep the panorama and the job. A later credit check runs the job again."""
+    phase = None
+    operation_id = None
+    if job_id:
+        job = get_job(job_id)
+        if job is not None:
+            phase = job.operation_phase
+            operation_id = job.operation_id
+            if phase == "submitting":
+                phase = "draft" if operation_id else None
+            update_job(job_id, status="delayed", operation_phase=phase)
+    logger.error("Project %s 3D delayed: %s", project_id, detail)
+    update_project(
+        project_id,
+        status="delayed",
+        error=WORLD_DELAYED_MESSAGE,
+        provider_error=detail,
+        active_job="staged_world" if staged_source else "world",
+    )
 
 
 def _fail_world(project_id: str, message: str, detail: str | None, staged_source: bool) -> None:

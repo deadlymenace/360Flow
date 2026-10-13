@@ -376,6 +376,7 @@ def render_world_page(
     staged_source: bool = False,
     preview: bool = False,
     generating: bool = False,
+    waiting: str = "",
 ) -> str:
     safe_title = escape(title)
     base = escape(asset_base, quote=True)
@@ -385,7 +386,9 @@ def render_world_page(
             f'<iframe class="world" src="{safe_url}" allow="fullscreen; xr-spatial-tracking" '
             f'allowfullscreen title="3D world"></iframe>'
         )
-        if staged_source:
+        if waiting:
+            lead = waiting
+        elif staged_source:
             lead = "Navigable 3D world of the virtually staged room."
         elif preview:
             lead = "Fast 3D preview. The full walkthrough is still generating."
@@ -399,7 +402,9 @@ def render_world_page(
         marble_js = "true"
     else:
         canvas = '<canvas id="c"></canvas>'
-        if staged_source:
+        if waiting:
+            message = waiting
+        elif staged_source:
             message = "360° preview of the virtually staged room. A 3D walkthrough of the staged room has not been generated yet."
         elif generating:
             message = "The 3D walkthrough is generating. This is the panorama while it runs."
