@@ -181,6 +181,14 @@ Mobile (`mobile/.env.example`):
 | `EXPO_PUBLIC_API_URL` | Backend origin for dev and installed builds |
 | `EXPO_PUBLIC_API_KEY` | Sent as `X-API-Key` when the API is locked |
 
+## Privacy
+
+The app does not create user accounts, so there is no account to delete. Each capture is the stored data: photos, the panorama, a staged image, and the share link.
+
+Before the first upload, the app shows a consent screen. Agreeing lets the app send room photos to the 360Flow API. The API stitches them and sends the panorama to World Labs to build the 3D walkthrough. Virtual staging is optional; choosing it sends the panorama to Google Gemini. Until the person agrees, the upload does not start.
+
+`DELETE /api/v1/projects/{id}` removes that capture. It deletes the database row, the uploaded photos, the panorama, the staged image, and any files stored for that capture on local disk or R2. When `WORLDLABS_API_KEY` is set, it also asks World Labs to delete the original world, the draft world, and a staged world. The share link then returns 404. The same API key that protects the rest of `/api/v1` protects this route. In the app, Delete on the home screen and on the panorama screen asks for confirmation before calling it.
+
 ## What you need to supply
 
 - A [Gemini](https://ai.google.dev/gemini-api/docs/image-generation) API key (`GEMINI_API_KEY`), if staging should add furniture instead of the color-grade mock.

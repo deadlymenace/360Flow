@@ -105,6 +105,31 @@ async def generate_world(image_bytes: bytes, display_name: str, on_preview=None)
         return final
 
 
+async def delete_worlds(world_ids: list[str | None]) -> None:
+    """Ask Marble to delete worlds this API created.
+
+    A missing key, a mock world, or a World Labs error does not block deleting
+    the local project. 404 means the world is already gone.
+    """
+    settings = get_settings()
+    ids = list(dict.fromkeys(item for item in world_ids if item))
+    if not ids or not settings.worldlabs_api_key:
+        return
+    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+    timeout = httpx.Timeout(30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for world_id in ids:
+            url = f"{WORLDLABS_BASE}/marble/v1/worlds/{world_id}"
+            try:
+                response = await client.delete(url, headers=headers)
+            except Exception:
+                logger.exception("Could not delete Marble world %s", world_id)
+                continue
+            if response.status_code in {200, 204, 404}:
+                continue
+            logger.error("Marble delete for %s returned %s", world_id, response.status_code)
+
+
 async def _upload_panorama(client: httpx.AsyncClient, headers: dict, image_bytes: bytes) -> str:
     prepared = await client.post(
         f"{WORLDLABS_BASE}/marble/v1/media-assets:prepare_upload",

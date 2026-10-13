@@ -36,6 +36,11 @@
 - Staging uses Gemini (`GEMINI_API_KEY`, default model `gemini-nano-banana-2.1`). The panorama is split into five overlapping perspective views, the poles stay the original photograph, and a low edge-recall score retries once or keeps that view. With the key unset, a warm color grade stands in (`gemini_mock`).
 - After a successful stitch the API always starts a World Labs world from the original panorama: `marble-1.0-draft` first (about 20s), then `marble-1.1` (about 5 minutes). The panorama stays viewable while that runs. A staged panorama can get its own world. Staged worlds keep the disclosure label.
 
+### Deletion and privacy
+- There are no user accounts. Do not add an account-deletion flow unless accounts are added.
+- `DELETE /api/v1/projects/{id}` removes the row, `uploads/{id}/`, `panoramas/{id}.jpg`, `staged/{id}.jpg`, and `worlds/{id}/` on local disk or R2, and asks World Labs to delete stored world ids. The share token then 404s.
+- The app must show the one-time third-party disclosure (Google Gemini and World Labs) before the first upload. Consent is stored in the app document directory.
+
 ## Conventions
 - Backend uses `uvicorn` with `--host 0.0.0.0`
 - Mobile app uses Expo. `EXPO_PUBLIC_API_URL` is the backend origin for an installed build

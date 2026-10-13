@@ -23,6 +23,26 @@ def staged_key(project_id: str) -> str:
     return f"staged/{project_id}.jpg"
 
 
+def world_asset_prefix(project_id: str) -> str:
+    return f"worlds/{project_id}/"
+
+
+def project_asset_prefixes(project_id: str) -> list[str]:
+    """Every object this API stores for a capture, on local disk or R2."""
+    return [
+        f"uploads/{project_id}/",
+        panorama_key(project_id),
+        staged_key(project_id),
+        world_asset_prefix(project_id),
+    ]
+
+
+def delete_project_assets(project_id: str) -> None:
+    storage = get_storage()
+    for prefix in project_asset_prefixes(project_id):
+        storage.delete_prefix(prefix)
+
+
 def init_storage(settings: Settings | None = None) -> Storage:
     global _storage
     settings = settings or get_settings()

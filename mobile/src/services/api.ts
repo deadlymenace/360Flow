@@ -83,6 +83,11 @@ class APIService {
     return res.json();
   }
 
+  async deleteProject(projectId: string): Promise<void> {
+    const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(`Delete project failed: ${res.status}`);
+  }
+
   async uploadImages(projectId: string, imageUris: string[], options: UploadOptions = {}): Promise<void> {
     const formData = new FormData();
     formData.append(

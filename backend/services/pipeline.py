@@ -18,7 +18,7 @@ from db import ProjectRecord, get_project, update_project
 from services.staging import stage_image
 from services.stitcher import stitch_images
 from services.world_gen import generate_world
-from storage import get_storage, panorama_key, staged_key
+from storage import delete_project_assets, get_storage, panorama_key, staged_key
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +91,19 @@ async def run_stitch(project_id: str) -> None:
             )
             if not ok or not output.is_file():
                 raise RuntimeError("Stitching failed. Try recapturing with more overlap between photos.")
+            if _deleted(project_id):
+                return
             key = panorama_key(project_id)
             storage.put_file(key, output, "image/jpeg")
-        update_project(project_id, status="stitched", panorama_key=key, error=None, active_job=None)
+        saved = update_project(project_id, status="stitched", panorama_key=key, error=None, active_job=None)
+        if saved is None:
+            delete_project_assets(project_id)
+            return
         logger.info("Project %s stitched", project_id)
     except Exception as exc:
+        if _deleted(project_id):
+            logger.info("Project %s deleted during stitch", project_id)
+            return
         logger.exception("Project %s stitch failed", project_id)
         update_project(project_id, status="failed", error=_short(exc))
         return
@@ -111,9 +119,11 @@ async def run_stage(project_id: str) -> None:
         storage = get_storage()
         original = storage.get_bytes(project.panorama_key)
         staged_bytes, provider, notes = await stage_image(original, project.staging_prompt)
+        if _deleted(project_id):
+            return
         key = staged_key(project_id)
         storage.put_bytes(key, staged_bytes, "image/jpeg")
-        update_project(
+        saved = update_project(
             project_id,
             status="staged",
             staged_key=key,
@@ -122,8 +132,14 @@ async def run_stage(project_id: str) -> None:
             active_job=None,
             error=None,
         )
+        if saved is None:
+            delete_project_assets(project_id)
+            return
         logger.info("Project %s staged via %s", project_id, provider)
     except Exception as exc:
+        if _deleted(project_id):
+            logger.info("Project %s deleted during staging", project_id)
+            return
         logger.exception("Project %s staging failed", project_id)
         update_project(project_id, status="failed", error=_short(exc))
 
@@ -166,8 +182,10 @@ async def run_world(project_id: str, source: str = "original") -> None:
                 )
 
         result = await generate_world(image, label, on_preview=on_preview)
+        if _deleted(project_id):
+            return
         if staged_source:
-            update_project(
+            saved = update_project(
                 project_id,
                 status="complete",
                 staged_world_provider=result.get("provider"),
@@ -181,7 +199,7 @@ async def run_world(project_id: str, source: str = "original") -> None:
                 error=None,
             )
         else:
-            update_project(
+            saved = update_project(
                 project_id,
                 status="complete",
                 world_provider=result.get("provider"),
@@ -194,10 +212,20 @@ async def run_world(project_id: str, source: str = "original") -> None:
                 active_job=None,
                 error=None,
             )
+        if saved is None:
+            delete_project_assets(project_id)
+            return
         logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
     except Exception as exc:
+        if _deleted(project_id):
+            logger.info("Project %s deleted during world generation", project_id)
+            return
         logger.exception("Project %s world generation failed", project_id)
         update_project(project_id, status="failed", error=_short(exc))
+
+
+def _deleted(project_id: str) -> bool:
+    return get_project(project_id) is None
 
 
 def _require(project_id: str) -> ProjectRecord:

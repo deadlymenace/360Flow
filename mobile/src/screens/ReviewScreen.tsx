@@ -11,6 +11,7 @@ import {
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
 import { SEGMENT_ANGLE, SEGMENT_COUNT } from '../models/types';
+import { hasAiDisclosureConsent } from '../services/privacy';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const GRID_PADDING = 16;
@@ -27,14 +28,19 @@ export default function ReviewScreen({ navigation, route }: Props) {
 
   const handleUpload = () => {
     const ordered = segments.filter((s) => s.imageUri !== null);
-    navigation.navigate('Processing', {
+    const params = {
       projectId,
       projectName,
       imageUris: ordered.map((s) => s.imageUri as string),
       yaws: ordered.map((s) => s.actualYaw ?? s.id * SEGMENT_ANGLE),
       hfov,
       lens,
-    });
+    };
+    if (hasAiDisclosureConsent()) {
+      navigation.navigate('Processing', params);
+      return;
+    }
+    navigation.navigate('PrivacyConsent', params);
   };
 
   return (

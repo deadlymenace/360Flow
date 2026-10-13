@@ -7,6 +7,7 @@ import CaptureScreen from './screens/CaptureScreen';
 import ReviewScreen from './screens/ReviewScreen';
 import ProcessingScreen from './screens/ProcessingScreen';
 import PanoramaScreen from './screens/PanoramaScreen';
+import PrivacyConsentScreen from './screens/PrivacyConsentScreen';
 import WorldScreen from './screens/WorldScreen';
 
 export type ViewerMode = 'original' | 'staged' | 'compare';
@@ -36,6 +37,14 @@ export type RootStackParamList = {
     lens?: string;
     retry?: boolean;
   };
+  PrivacyConsent: {
+    projectId: string;
+    projectName: string;
+    imageUris: string[];
+    yaws: number[];
+    hfov?: number;
+    lens?: string;
+  };
   Panorama: { projectId: string; projectName: string };
   World: { projectId: string; projectName: string; source?: 'original' | 'staged' };
 };
@@ -56,6 +65,7 @@ export default function Navigation() {
         <Stack.Screen name="Capture" component={CaptureScreen} />
         <Stack.Screen name="Review" component={ReviewScreen} />
         <Stack.Screen name="Processing" component={ProcessingScreen} />
+        <Stack.Screen name="PrivacyConsent" component={PrivacyConsentScreen} />
         <Stack.Screen name="Panorama" component={PanoramaScreen} />
         <Stack.Screen name="World" component={WorldScreen} />
       </Stack.Navigator>
