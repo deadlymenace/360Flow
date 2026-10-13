@@ -93,6 +93,8 @@ class PendingWorldDeleteRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+# Types in this map are sent as raw DDL to both SQLite and Postgres.
+# TIMESTAMP is valid in both. DATETIME is not a Postgres type and crashes startup.
 _EXTRA_COLUMNS = {
     "world_preview_url": "TEXT",
     "world_preview_id": "VARCHAR(64)",
@@ -110,7 +112,7 @@ _EXTRA_COLUMNS = {
     "active_job": "VARCHAR(32)",
     "owner_device_id": "VARCHAR(36)",
     "staged_world_preview_id": "VARCHAR(64)",
-    "share_expires_at": "DATETIME",
+    "share_expires_at": "TIMESTAMP",
 }
 
 
