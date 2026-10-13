@@ -6,8 +6,9 @@ import json
 import logging
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import Response
 
-from db import TRANSIENT_STATUSES, get_project, update_project
+from db import TRANSIENT_STATUSES, delete_project, get_project, update_project
 from db import create_project as create_project_row
 from db import list_projects as list_project_rows
 from models.project import CreateProjectRequest, Project, StageRequest, UploadMetadata
@@ -15,7 +16,8 @@ from routers.responses import jpeg_response, labeled_jpeg, status_body, to_proje
 from services.disclosure import DISCLOSURE_TEXT
 from services.pipeline import enqueue, run_stage, run_stitch, run_world
 from services.uploads import normalize_upload
-from storage import get_storage, panorama_key, staged_key, upload_key
+from services.world_gen import delete_worlds
+from storage import delete_project_assets, get_storage, panorama_key, staged_key, upload_key
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,17 @@ async def list_projects(request: Request) -> list[Project]:
 @router.get("/projects/{project_id}")
 async def get_one(project_id: str, request: Request) -> Project:
     return to_project(_require(project_id), request)
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+async def remove_project(project_id: str) -> Response:
+    """Delete the capture, its files, hosted worlds, and its share link."""
+    project = _require(project_id)
+    await delete_worlds([project.world_id, project.world_preview_id, project.staged_world_id])
+    delete_project_assets(project_id)
+    if not delete_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    return Response(status_code=204)
 
 
 @router.post("/projects/{project_id}/upload")

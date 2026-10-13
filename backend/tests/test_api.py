@@ -183,6 +183,104 @@ def test_api_key_protects_api_and_not_the_share_page(client, monkeypatch):
     assert client.get(f"/v/{created['share_token']}").status_code == 404
 
 
+def test_delete_project_removes_files_row_and_share_link(client):
+    created = client.post("/api/v1/projects", json={"name": "To Delete"}).json()
+    project_id = created["id"]
+    token = created["share_token"]
+    other = client.post("/api/v1/projects", json={"name": "Keep"}).json()
+    files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+    uploaded = client.post(
+        f"/api/v1/projects/{project_id}/upload",
+        files=files,
+        data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+
+    from db import update_project
+    from storage import get_storage, panorama_key, staged_key, upload_key
+
+    update_project(project_id, world_id="world-full", world_preview_id="world-draft", staged_world_id="world-staged")
+    storage = get_storage()
+    storage.put_bytes(staged_key(project_id), b"staged-bytes", "image/jpeg")
+    storage.put_bytes(f"worlds/{project_id}/mesh.glb", b"mesh-bytes", "model/gltf-binary")
+    storage.put_bytes(upload_key(other["id"], 0), b"keep-me", "image/jpeg")
+    assert storage.exists(panorama_key(project_id))
+    assert storage.list_keys(f"uploads/{project_id}/")
+
+    deleted = client.delete(f"/api/v1/projects/{project_id}")
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert client.get(f"/api/v1/projects/{project_id}").status_code == 404
+    assert client.get(f"/v/{token}").status_code == 404
+    assert client.get(f"/v/{token}/world").status_code == 404
+    assert client.get(f"/v/{token}/panorama.jpg").status_code == 404
+    listed = client.get("/api/v1/projects").json()
+    assert all(item["id"] != project_id for item in listed)
+    assert any(item["id"] == other["id"] for item in listed)
+    assert not storage.exists(panorama_key(project_id))
+    assert not storage.exists(staged_key(project_id))
+    assert storage.list_keys(f"uploads/{project_id}/") == []
+    assert storage.list_keys(f"worlds/{project_id}/") == []
+    assert storage.exists(upload_key(other["id"], 0))
+
+
+def test_delete_missing_project_is_404(client):
+    missing = client.delete("/api/v1/projects/does-not-exist")
+    assert missing.status_code == 404
+
+
+def test_delete_requires_api_key_and_notifies_world_labs(client, monkeypatch):
+    monkeypatch.setenv("API_KEY", "secret-key")
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    deleted_urls: list[str] = []
+
+    class _Response:
+        status_code = 200
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def delete(self, url, headers=None):
+            assert headers["WLT-Api-Key"] == "wl-test"
+            deleted_urls.append(url)
+            return _Response()
+
+    monkeypatch.setattr("services.world_gen.httpx.AsyncClient", _Client)
+    created = client.post(
+        "/api/v1/projects",
+        headers={"X-API-Key": "secret-key"},
+        json={"name": "Locked room"},
+    ).json()
+    from db import update_project
+
+    update_project(
+        created["id"],
+        world_id="world-full",
+        world_preview_id="world-full",
+        staged_world_id="world-staged",
+    )
+    assert client.delete(f"/api/v1/projects/{created['id']}").status_code == 401
+    removed = client.delete(
+        f"/api/v1/projects/{created['id']}",
+        headers={"X-API-Key": "secret-key"},
+    )
+    assert removed.status_code == 204
+    assert client.get(f"/v/{created['share_token']}").status_code == 404
+    assert sorted(deleted_urls) == sorted(
+        [
+            "https://api.worldlabs.ai/marble/v1/worlds/world-full",
+            "https://api.worldlabs.ai/marble/v1/worlds/world-staged",
+        ]
+    )
+
+
 def test_gemini_http_error_fails_the_job(client, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
 

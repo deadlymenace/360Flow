@@ -232,6 +232,16 @@ def get_project(project_id: str) -> ProjectRecord | None:
         return _record(row) if row else None
 
 
+def delete_project(project_id: str) -> bool:
+    """Remove the project row. Share-token lookup then returns nothing."""
+    with session_scope() as session:
+        row = session.get(ProjectRow, project_id)
+        if row is None:
+            return False
+        session.delete(row)
+        return True
+
+
 def get_by_share_token(token: str) -> ProjectRecord | None:
     with session_scope() as session:
         row = session.scalar(select(ProjectRow).where(ProjectRow.share_token == token))

@@ -250,6 +250,31 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             <Text style={styles.link}>Export staged image</Text>
           </TouchableOpacity>
         )}
+        <TouchableOpacity
+          onPress={() => {
+            Alert.alert(
+              'Delete this capture?',
+              'This removes the photos, panorama, staged image, 3D walkthrough, and share link from 360Flow. This cannot be undone.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                {
+                  text: 'Delete',
+                  style: 'destructive',
+                  onPress: async () => {
+                    try {
+                      await api.deleteProject(projectId);
+                      navigation.popToTop();
+                    } catch (err) {
+                      Alert.alert('Could not delete', err instanceof Error ? err.message : 'Try again');
+                    }
+                  },
+                },
+              ],
+            );
+          }}
+        >
+          <Text style={styles.deleteLink}>Delete capture</Text>
+        </TouchableOpacity>
       </View>
 
       <Modal visible={showStage} transparent animationType="slide">
@@ -367,6 +392,7 @@ const styles = StyleSheet.create({
   },
   secondaryText: { color: '#fff', fontWeight: '600' },
   link: { color: '#ffe08a', textAlign: 'center', fontWeight: '600' },
+  deleteLink: { color: '#F44336', textAlign: 'center', fontWeight: '700' },
   disabled: { opacity: 0.4 },
   centered: { flex: 1, backgroundColor: '#1a1a2e', justifyContent: 'center', alignItems: 'center', padding: 24 },
   errorText: { color: '#F44336', fontSize: 18, fontWeight: '700', marginBottom: 8 },
