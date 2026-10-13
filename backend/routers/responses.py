@@ -23,13 +23,16 @@ _PROGRESS = {
 }
 
 
-def share_url(token: str, request: Request | None = None) -> str:
+def share_url(token: str, request: Request | None = None) -> str | None:
+    """Absolute share link from PUBLIC_BASE_URL only.
+
+    The Host header is not used, so a caller cannot choose the link origin.
+    """
+    del request
     base = get_settings().public_base_url
-    if base:
-        return f"{base.rstrip('/')}/v/{token}"
-    if request is not None:
-        return f"{str(request.base_url).rstrip('/')}/v/{token}"
-    return f"/v/{token}"
+    if not base:
+        return None
+    return f"{base.rstrip('/')}/v/{token}"
 
 
 def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
@@ -70,7 +73,7 @@ def status_body(row: ProjectRecord, request: Request | None = None) -> dict:
         "status": row.status,
         "progress": _PROGRESS.get(row.status, 0),
         "error": row.error,
-        "share_url": share_url(row.share_token, request),
+        "share_url": share_url(row.share_token),
         "has_original": bool(row.panorama_key),
         "has_staged": bool(row.staged_key),
         "staging_provider": row.staging_provider,

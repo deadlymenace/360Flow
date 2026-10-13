@@ -31,7 +31,10 @@
       "edgeToEdgeEnabled": true,
       "usesCleartextTraffic": true,
       "package": "com.threesixtyflow.app",
-      "permissions": ["CAMERA", "HIGH_SAMPLING_RATE_SENSORS"]
+      "permissions": [
+        "CAMERA",
+        "HIGH_SAMPLING_RATE_SENSORS"
+      ]
     },
     "plugins": [
       [
@@ -45,7 +48,8 @@
         {
           "motionPermission": "360Flow uses motion sensors to guide you through a 360° rotation."
         }
-      ]
+      ],
+      "expo-secure-store"
     ]
   }
 }

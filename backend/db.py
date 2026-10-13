@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +22,14 @@ class Base(DeclarativeBase):
     pass
 
 
+class DeviceRow(Base):
+    __tablename__ = "devices"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class ProjectRow(Base):
     __tablename__ = "projects"
 
@@ -35,6 +44,7 @@ class ProjectRow(Base):
     staging_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     world_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     share_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    owner_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     hfov_deg: Mapped[float | None] = mapped_column(Float, nullable=True)
     yaws_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     lens: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -56,6 +66,7 @@ class ProjectRow(Base):
     staged_world_mesh_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     staged_world_thumbnail_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     staged_world_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    staged_world_preview_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     staging_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     active_job: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
@@ -73,6 +84,8 @@ _EXTRA_COLUMNS = {
     "staged_world_operation_id": "VARCHAR(64)",
     "staging_notes": "TEXT",
     "active_job": "VARCHAR(32)",
+    "owner_device_id": "VARCHAR(36)",
+    "staged_world_preview_id": "VARCHAR(64)",
 }
 
 
@@ -89,6 +102,7 @@ class ProjectRecord:
     staging_provider: str | None
     world_provider: str | None
     share_token: str
+    owner_device_id: str | None
     hfov_deg: float | None
     yaws_json: str | None
     lens: str | None
@@ -110,6 +124,7 @@ class ProjectRecord:
     staged_world_mesh_url: str | None
     staged_world_thumbnail_url: str | None
     staged_world_operation_id: str | None
+    staged_world_preview_id: str | None
     staging_notes: str | None
     active_job: str | None
 
@@ -177,6 +192,7 @@ def _record(row: ProjectRow) -> ProjectRecord:
         staging_provider=row.staging_provider,
         world_provider=row.world_provider,
         share_token=row.share_token,
+        owner_device_id=row.owner_device_id,
         hfov_deg=row.hfov_deg,
         yaws_json=row.yaws_json,
         lens=row.lens,
@@ -198,12 +214,36 @@ def _record(row: ProjectRow) -> ProjectRecord:
         staged_world_mesh_url=row.staged_world_mesh_url,
         staged_world_thumbnail_url=row.staged_world_thumbnail_url,
         staged_world_operation_id=row.staged_world_operation_id,
+        staged_world_preview_id=row.staged_world_preview_id,
         staging_notes=row.staging_notes,
         active_job=row.active_job,
     )
 
 
-def create_project(name: str) -> ProjectRecord:
+def hash_device_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_device() -> tuple[str, str]:
+    """Return (device id, raw token). Only the hash is stored."""
+    now = datetime.now(timezone.utc)
+    device_id = str(uuid4())
+    token = secrets.token_urlsafe(32)
+    row = DeviceRow(id=device_id, token_hash=hash_device_token(token), created_at=now)
+    with session_scope() as session:
+        session.add(row)
+        session.flush()
+    return device_id, token
+
+
+def device_id_for_token(token: str) -> str | None:
+    digest = hash_device_token(token)
+    with session_scope() as session:
+        row = session.scalar(select(DeviceRow).where(DeviceRow.token_hash == digest))
+        return row.id if row else None
+
+
+def create_project(name: str, owner_device_id: str | None = None) -> ProjectRecord:
     now = datetime.now(timezone.utc)
     row = ProjectRow(
         id=str(uuid4()),
@@ -213,6 +253,7 @@ def create_project(name: str) -> ProjectRecord:
         updated_at=now,
         image_count=0,
         share_token=secrets.token_urlsafe(16),
+        owner_device_id=owner_device_id,
     )
     with session_scope() as session:
         session.add(row)
@@ -220,10 +261,17 @@ def create_project(name: str) -> ProjectRecord:
         return _record(row)
 
 
-def list_projects() -> list[ProjectRecord]:
+def list_projects(owner_device_id: str | None = None, *, admin: bool = False) -> list[ProjectRecord]:
     with session_scope() as session:
-        rows = session.scalars(select(ProjectRow).order_by(ProjectRow.created_at.desc())).all()
+        query = select(ProjectRow).order_by(ProjectRow.created_at.desc())
+        if not admin:
+            query = query.where(ProjectRow.owner_device_id == owner_device_id)
+        rows = session.scalars(query).all()
         return [_record(row) for row in rows]
+
+
+def rotate_share_token(project_id: str) -> ProjectRecord | None:
+    return update_project(project_id, share_token=secrets.token_urlsafe(16))
 
 
 def get_project(project_id: str) -> ProjectRecord | None:
