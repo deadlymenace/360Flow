@@ -68,14 +68,18 @@ export default function ProcessingScreen({ navigation, route }: Props) {
   };
 
   const startPolling = () => {
-    pollingRef.current = setInterval(async () => {
+    let settled = false;
+    const tick = async () => {
+      if (settled) return;
       try {
         const status = await api.getStatus(projectId);
-        if (status.status === 'stitched' || status.status === 'staged' || status.status === 'complete') {
+        if (status.has_original) {
+          settled = true;
           if (pollingRef.current) clearInterval(pollingRef.current);
           setPhase('done');
           HapticFeedback.success();
         } else if (status.status === 'failed') {
+          settled = true;
           if (pollingRef.current) clearInterval(pollingRef.current);
           setPhase('error');
           setErrorMsg(status.error || 'Stitching failed');
@@ -84,7 +88,9 @@ export default function ProcessingScreen({ navigation, route }: Props) {
       } catch (e: any) {
         console.warn('Polling error:', e.message);
       }
-    }, 2000);
+    };
+    tick();
+    pollingRef.current = setInterval(tick, 2000);
   };
 
   const handleRetry = () => {
@@ -117,7 +123,7 @@ export default function ProcessingScreen({ navigation, route }: Props) {
         <View style={styles.centered}>
           <ActivityIndicator size="large" color="#6C63FF" style={styles.spinner} />
           <Text style={styles.phaseTitle}>Stitching your panorama...</Text>
-          <Text style={styles.subtitle}>This may take a moment</Text>
+          <Text style={styles.subtitle}>The panorama opens as soon as it is ready. The 3D walkthrough continues in the background.</Text>
         </View>
       )}
 
@@ -127,6 +133,7 @@ export default function ProcessingScreen({ navigation, route }: Props) {
             <Text style={styles.successCheck}>✓</Text>
           </View>
           <Text style={styles.phaseTitle}>Panorama ready!</Text>
+          <Text style={styles.subtitle}>You can look around now. The 3D walkthrough keeps generating.</Text>
           <TouchableOpacity style={styles.viewButton} onPress={handleViewPanorama}>
             <Text style={styles.viewButtonText}>View Panorama →</Text>
           </TouchableOpacity>

@@ -13,7 +13,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from config import get_settings, is_public_base_url
+from config import get_settings
 from db import ProjectRecord, get_project, update_project
 from services.staging import stage_image
 from services.stitcher import stitch_images
@@ -62,21 +62,8 @@ async def enqueue(coro) -> None:
     runner.submit(coro)
 
 
-def public_original_url(project: ProjectRecord) -> str | None:
-    """URL NanoBanana can fetch. Presigned R2 first, then a public share URL."""
-    if not project.panorama_key:
-        return None
-    signed = get_storage().presign_get(project.panorama_key, expires=7200)
-    if signed:
-        return signed
-    base = get_settings().public_base_url
-    if is_public_base_url(base):
-        return f"{base.rstrip('/')}/v/{project.share_token}/panorama.jpg"
-    return None
-
-
 async def run_stitch(project_id: str) -> None:
-    update_project(project_id, status="stitching", error=None)
+    update_project(project_id, status="stitching", error=None, active_job="stitch")
     try:
         project = _require(project_id)
         storage = get_storage()
@@ -106,56 +93,108 @@ async def run_stitch(project_id: str) -> None:
                 raise RuntimeError("Stitching failed. Try recapturing with more overlap between photos.")
             key = panorama_key(project_id)
             storage.put_file(key, output, "image/jpeg")
-        update_project(project_id, status="stitched", panorama_key=key, error=None)
+        update_project(project_id, status="stitched", panorama_key=key, error=None, active_job=None)
         logger.info("Project %s stitched", project_id)
     except Exception as exc:
         logger.exception("Project %s stitch failed", project_id)
         update_project(project_id, status="failed", error=_short(exc))
+        return
+    await run_world(project_id, source="original")
 
 
 async def run_stage(project_id: str) -> None:
-    update_project(project_id, status="staging", error=None)
+    update_project(project_id, status="staging", error=None, active_job="stage")
     try:
         project = _require(project_id)
         if not project.panorama_key or not project.staging_prompt:
             raise RuntimeError("No panorama available to stage")
         storage = get_storage()
         original = storage.get_bytes(project.panorama_key)
-        staged_bytes, provider = await stage_image(
-            original,
-            project.staging_prompt,
-            public_original_url(project),
-        )
+        staged_bytes, provider, notes = await stage_image(original, project.staging_prompt)
         key = staged_key(project_id)
         storage.put_bytes(key, staged_bytes, "image/jpeg")
-        update_project(project_id, status="staged", staged_key=key, staging_provider=provider, error=None)
+        update_project(
+            project_id,
+            status="staged",
+            staged_key=key,
+            staging_provider=provider,
+            staging_notes=notes,
+            active_job=None,
+            error=None,
+        )
         logger.info("Project %s staged via %s", project_id, provider)
     except Exception as exc:
         logger.exception("Project %s staging failed", project_id)
         update_project(project_id, status="failed", error=_short(exc))
 
 
-async def run_world(project_id: str) -> None:
-    update_project(project_id, status="generating_3d", error=None)
+async def run_world(project_id: str, source: str = "original") -> None:
+    staged_source = source == "staged"
+    update_project(
+        project_id,
+        status="generating_3d",
+        error=None,
+        active_job="staged_world" if staged_source else "world",
+    )
     try:
         project = _require(project_id)
-        if not project.staged_key:
-            raise RuntimeError("Stage the panorama before generating a 3D world")
-        image = get_storage().get_bytes(project.staged_key)
-        result = await generate_world(image, project.name)
-        update_project(
-            project_id,
-            status="complete",
-            world_provider=result.get("provider"),
-            world_id=result.get("world_id"),
-            world_marble_url=result.get("marble_url"),
-            world_splat_url=result.get("splat_url"),
-            world_mesh_url=result.get("mesh_url"),
-            world_thumbnail_url=result.get("thumbnail_url"),
-            world_operation_id=result.get("operation_id"),
-            error=None,
-        )
-        logger.info("Project %s world ready via %s", project_id, result.get("provider"))
+        storage = get_storage()
+        if staged_source:
+            if not project.staged_key:
+                raise RuntimeError("Stage the panorama before generating a 3D world from it")
+            image = storage.get_bytes(project.staged_key)
+            label = f"{project.name} staged"
+        else:
+            if not project.panorama_key:
+                raise RuntimeError("No panorama available for a 3D world")
+            image = storage.get_bytes(project.panorama_key)
+            label = project.name
+
+        async def on_preview(result: dict) -> None:
+            if staged_source:
+                update_project(
+                    project_id,
+                    staged_world_preview_url=result.get("marble_url"),
+                    staged_world_provider=result.get("provider"),
+                )
+            else:
+                update_project(
+                    project_id,
+                    world_preview_url=result.get("marble_url"),
+                    world_preview_id=result.get("world_id"),
+                    world_provider=result.get("provider"),
+                )
+
+        result = await generate_world(image, label, on_preview=on_preview)
+        if staged_source:
+            update_project(
+                project_id,
+                status="complete",
+                staged_world_provider=result.get("provider"),
+                staged_world_id=result.get("world_id"),
+                staged_world_marble_url=result.get("marble_url"),
+                staged_world_splat_url=result.get("splat_url"),
+                staged_world_mesh_url=result.get("mesh_url"),
+                staged_world_thumbnail_url=result.get("thumbnail_url"),
+                staged_world_operation_id=result.get("operation_id"),
+                active_job=None,
+                error=None,
+            )
+        else:
+            update_project(
+                project_id,
+                status="complete",
+                world_provider=result.get("provider"),
+                world_id=result.get("world_id"),
+                world_marble_url=result.get("marble_url"),
+                world_splat_url=result.get("splat_url"),
+                world_mesh_url=result.get("mesh_url"),
+                world_thumbnail_url=result.get("thumbnail_url"),
+                world_operation_id=result.get("operation_id"),
+                active_job=None,
+                error=None,
+            )
+        logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
     except Exception as exc:
         logger.exception("Project %s world generation failed", project_id)
         update_project(project_id, status="failed", error=_short(exc))

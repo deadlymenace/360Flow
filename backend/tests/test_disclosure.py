@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 
 from services.disclosure import DISCLOSURE_TEXT, apply_disclosure_label, build_staging_prompt
-from services.world_gen import build_world_request
+from services.staging import build_gemini_request
+from services.world_gen import build_world_request, generation_models
 
 
 def _has_disclosure_bar(image: np.ndarray) -> bool:
@@ -32,6 +33,33 @@ def test_prompt_preserves_architecture_and_appends_style():
     assert "only add" in lowered
     assert "ignore that part" in lowered
     assert "Style and furniture to add: paint the walls red and add a linen sofa" in prompt
+
+
+def test_perspective_prompt_still_preserves_architecture():
+    prompt = build_staging_prompt("a linen sofa", perspective=True)
+    assert prompt.index("PRESERVE EXACTLY") < prompt.index("a linen sofa")
+    assert "one view of a real room" in prompt
+
+
+def test_gemini_request_matches_generate_content():
+    body = build_gemini_request("add a sofa", b"jpeg-bytes", "1K")
+    parts = body["contents"][0]["parts"]
+    assert parts[0]["text"] == "add a sofa"
+    assert parts[1]["inline_data"]["mime_type"] == "image/jpeg"
+    assert parts[1]["inline_data"]["data"]
+    config = body["generationConfig"]
+    assert config["responseModalities"] == ["TEXT", "IMAGE"]
+    assert config["imageConfig"]["aspectRatio"] == "4:3"
+    assert config["imageConfig"]["imageSize"] == "1K"
+    from config import get_settings
+
+    assert get_settings().gemini_model == "gemini-nano-banana-2.1"
+
+
+def test_generation_runs_draft_then_full_model():
+    assert generation_models("marble-1.0-draft", "marble-1.1") == ["marble-1.0-draft", "marble-1.1"]
+    assert generation_models(None, "marble-1.1") == ["marble-1.1"]
+    assert generation_models("marble-1.1", "marble-1.1") == ["marble-1.1"]
 
 
 def test_world_request_marks_equirect_as_pano():

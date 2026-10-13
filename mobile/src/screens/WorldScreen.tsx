@@ -9,25 +9,35 @@ import { DISCLOSURE_TEXT, Project } from '../models/types';
 type Props = NativeStackScreenProps<RootStackParamList, 'World'>;
 
 export default function WorldScreen({ navigation, route }: Props) {
-  const { projectId, projectName } = route.params;
+  const { projectId, projectName, source = 'original' } = route.params;
+  const staged = source === 'staged';
   const [project, setProject] = useState<Project | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    api.getProject(projectId)
-      .then((latest) => {
-        if (!cancelled) setProject(latest);
-      })
-      .catch((err: Error) => {
-        if (!cancelled) setError(err.message);
-      });
+    const load = async () => {
+      try {
+        const latest = await api.getProject(projectId);
+        if (!cancelled) {
+          setProject(latest);
+          setError(null);
+        }
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load the world');
+      }
+    };
+    load();
+    const timer = setInterval(load, 3000);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
   }, [projectId]);
 
-  const viewerUrl = project?.world_marble_url || project?.world_viewer_url || null;
+  const viewerUrl = staged
+    ? project?.staged_world_marble_url || project?.staged_world_preview_url || project?.staged_world_viewer_url || null
+    : project?.world_marble_url || project?.world_preview_url || project?.world_viewer_url || null;
 
   return (
     <View style={styles.container}>
@@ -50,7 +60,7 @@ export default function WorldScreen({ navigation, route }: Props) {
           </View>
         )}
         {viewerUrl && <WebView source={{ uri: viewerUrl }} style={styles.web} />}
-        {project?.has_staged && (
+        {staged && (
           <View style={styles.chip} pointerEvents="none">
             <Text style={styles.chipText}>{DISCLOSURE_TEXT}</Text>
           </View>

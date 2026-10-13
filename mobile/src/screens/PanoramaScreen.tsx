@@ -60,11 +60,15 @@ export default function PanoramaScreen({ navigation, route }: Props) {
   const shareUrl = project?.share_url;
   const viewerUrl = shareUrl ? `${shareUrl}?view=${mode}&embed=1` : null;
   const showDisclosure = Boolean(project?.has_staged) && mode !== 'original';
+  const buildingWorld =
+    project?.active_job === 'world' ||
+    project?.active_job === 'staged_world' ||
+    project?.status === 'generating_3d';
   const activity =
-    project?.status === 'staging'
+    project?.active_job === 'stage' || project?.status === 'staging'
       ? 'Staging the room…'
-      : project?.status === 'generating_3d'
-        ? 'Generating the 3D world…'
+      : buildingWorld
+        ? 'Creating the 3D walkthrough…'
         : null;
 
   const handleStage = async () => {
@@ -83,18 +87,37 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     }
   };
 
-  const handleWorld = async () => {
-    if (project?.status === 'complete') {
-      navigation.navigate('World', { projectId, projectName });
+  const openWorld = (source: 'original' | 'staged') => {
+    navigation.navigate('World', { projectId, projectName, source });
+  };
+
+  const handleStagedWorld = async () => {
+    const stagedWorldFinished = project?.status === 'complete' && Boolean(project.staged_world_viewer_url);
+    if (project?.active_job === 'staged_world' || stagedWorldFinished) {
+      openWorld('staged');
       return;
     }
     setSubmitting(true);
     try {
-      await api.startGenerate3D(projectId);
+      await api.startGenerate3D(projectId, 'staged');
       previousStatus.current = 'generating_3d';
-      setProject((current) => (current ? { ...current, status: 'generating_3d' } : current));
+      setProject((current) =>
+        current ? { ...current, status: 'generating_3d', active_job: 'staged_world' } : current,
+      );
+      openWorld('staged');
     } catch (err) {
       Alert.alert('3D generation failed', err instanceof Error ? err.message : 'Try again');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRetry = async () => {
+    setSubmitting(true);
+    try {
+      await api.retry(projectId);
+    } catch (err) {
+      Alert.alert('Retry failed', err instanceof Error ? err.message : 'Try again');
     } finally {
       setSubmitting(false);
     }
@@ -189,22 +212,39 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             );
           })}
         </View>
+        {project?.status === 'failed' && project.error ? (
+          <Text style={styles.errorDetail}>{project.error}</Text>
+        ) : null}
         <TouchableOpacity
           style={[styles.primary, !project?.has_original && styles.disabled]}
-          disabled={!project?.has_original || submitting || Boolean(activity)}
-          onPress={() => setShowStage(true)}
+          disabled={!project?.has_original}
+          onPress={() => openWorld('original')}
         >
-          <Text style={styles.primaryText}>{project?.has_staged ? 'Stage again' : 'Stage this room'}</Text>
+          <Text style={styles.primaryText}>View 3D walkthrough</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.secondary, !project?.has_staged && styles.disabled]}
-          disabled={!project?.has_staged || submitting || project?.status === 'staging'}
-          onPress={handleWorld}
+          style={[styles.secondary, (!project?.has_original || buildingWorld || project?.status === 'staging') && styles.disabled]}
+          disabled={!project?.has_original || submitting || buildingWorld || project?.status === 'staging'}
+          onPress={() => setShowStage(true)}
         >
-          <Text style={styles.secondaryText}>
-            {project?.status === 'complete' ? 'View 3D world' : 'Create 3D world'}
-          </Text>
+          <Text style={styles.secondaryText}>{project?.has_staged ? 'Stage again' : 'Optionally stage furniture'}</Text>
         </TouchableOpacity>
+        {project?.has_staged && (
+          <TouchableOpacity
+            style={[styles.secondary, (submitting || buildingWorld) && styles.disabled]}
+            disabled={submitting || buildingWorld}
+            onPress={handleStagedWorld}
+          >
+            <Text style={styles.secondaryText}>
+              {project.status === 'complete' && project.staged_world_viewer_url ? 'View staged 3D' : 'Create staged 3D'}
+            </Text>
+          </TouchableOpacity>
+        )}
+        {project?.status === 'failed' && (
+          <TouchableOpacity onPress={handleRetry} disabled={submitting}>
+            <Text style={styles.link}>Retry</Text>
+          </TouchableOpacity>
+        )}
         {project?.has_staged && (
           <TouchableOpacity onPress={handleExportStaged}>
             <Text style={styles.link}>Export staged image</Text>

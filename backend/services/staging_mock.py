@@ -1,8 +1,8 @@
-"""Preview stand-in used when NANOBANANA_API_KEY is not set.
+"""Preview stand-in used when GEMINI_API_KEY is not set.
 
 The mock does not add furniture. It applies a warm grade so before/after is
-visible, waits the configured delay, and reports provider ``nanobanana_mock``.
-The original file is left untouched by the caller.
+visible and waits the configured delay. The caller reports provider
+``gemini_mock``. The original file is left untouched by the caller.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ async def mock_stage(panorama_path: str, prompt: str) -> dict:
         "status": "staged",
         "staged_image_path": panorama_path,
         "prompt_used": prompt,
-        "provider": "nanobanana_mock",
+        "provider": "gemini_mock",
     }
 
 
