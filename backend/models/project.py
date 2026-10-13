@@ -28,6 +28,7 @@ class Project(BaseModel):
     staging_prompt: Optional[str] = None
     share_token: str
     share_url: Optional[str] = None
+    share_expires_at: Optional[datetime] = None
     has_original: bool = False
     has_staged: bool = False
     staging_provider: Optional[str] = None

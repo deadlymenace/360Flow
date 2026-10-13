@@ -324,6 +324,92 @@ def test_gemini_http_error_fails_the_job(client, monkeypatch):
     assert project["staging_status"] == "failed"
 
 
+def _device(client):
+    token = client.raw.post("/api/v1/devices").json()["token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_paid_world_autostart_respects_the_daily_quota(client, monkeypatch):
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setenv("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", "1")
+    calls = {"n": 0}
+
+    async def fake_generate(*args, **kwargs):
+        calls["n"] += 1
+        return {
+            "provider": "worldlabs",
+            "world_id": "world-1",
+            "marble_url": "https://marble.worldlabs.ai/world/world-1",
+            "splat_url": None,
+            "mesh_url": None,
+            "thumbnail_url": None,
+            "operation_id": "op-1",
+        }
+
+    monkeypatch.setattr("services.pipeline.generate_world", fake_generate)
+    headers = _device(client)
+
+    def upload(name: str) -> str:
+        created = client.raw.post("/api/v1/projects", headers=headers, json={"name": name}).json()
+        files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+        response = client.raw.post(
+            f"/api/v1/projects/{created['id']}/upload",
+            headers=headers,
+            files=files,
+            data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})},
+        )
+        assert response.status_code == 200, response.text
+        return created["id"]
+
+    first = upload("Quota one")
+    assert client.raw.get(f"/api/v1/projects/{first}", headers=headers).json()["status"] == "complete"
+    second = upload("Quota two")
+    body = client.raw.get(f"/api/v1/projects/{second}", headers=headers).json()
+    assert body["status"] == "stitched"
+    assert body["has_original"] is True
+    assert body["error"] == "Daily 3D limit reached. Try again tomorrow."
+    assert calls["n"] == 1
+    again = client.raw.post(f"/api/v1/projects/{second}/generate-3d", headers=headers)
+    assert again.status_code == 429
+
+
+def test_paid_staging_respects_the_daily_quota(client, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test")
+    monkeypatch.setenv("GEMINI_JOBS_PER_DEVICE_PER_DAY", "1")
+
+    async def fake_stage(image_bytes, prompt):
+        return image_bytes, "gemini", None
+
+    monkeypatch.setattr("services.pipeline.stage_image", fake_stage)
+    headers = _device(client)
+    created = client.raw.post("/api/v1/projects", headers=headers, json={"name": "Stage quota"}).json()
+    files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+    uploaded = client.raw.post(
+        f"/api/v1/projects/{created['id']}/upload",
+        headers=headers,
+        files=files,
+        data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    first = client.raw.post(
+        f"/api/v1/projects/{created['id']}/stage",
+        headers=headers,
+        json={"prompt": "a sofa"},
+    )
+    assert first.status_code == 200, first.text
+    assert client.raw.get(f"/api/v1/projects/{created['id']}/stage/status", headers=headers).json()["status"] == "staged"
+    second = client.raw.post(
+        f"/api/v1/projects/{created['id']}/stage",
+        headers=headers,
+        json={"prompt": "a lamp"},
+    )
+    assert second.status_code == 429
+    assert second.json()["detail"] == "Daily AI staging limit reached. Try again tomorrow."
+    project = client.raw.get(f"/api/v1/projects/{created['id']}", headers=headers).json()
+    assert project["status"] == "complete"
+    assert project["has_original"] is True
+
+
 def test_gemini_quota_does_not_fail_the_project(client, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
 

@@ -15,6 +15,12 @@ from pathlib import Path
 
 from config import get_settings
 from db import ProjectRecord, get_project, update_project
+from services.quota import (
+    STAGING_QUOTA_MESSAGE,
+    WORLD_QUOTA_MESSAGE,
+    consume_staging_quota,
+    consume_world_quota,
+)
 from services.staging import StagingProviderError, stage_image
 from services.stitcher import stitch_images
 from services.world_gen import delete_worlds, generate_world, world_display_name
@@ -116,6 +122,12 @@ async def run_stage(project_id: str) -> None:
     The panorama and 3D world stay available when staging fails. Progress and
     errors live on staging_status and staging_error.
     """
+    project = get_project(project_id)
+    if project is None:
+        return
+    if not consume_staging_quota(project.owner_device_id):
+        update_project(project_id, staging_status="failed", staging_error=STAGING_QUOTA_MESSAGE)
+        return
     update_project(project_id, staging_status="staging", staging_error=None)
     try:
         project = _require(project_id)
@@ -156,6 +168,13 @@ def _fail_stage(project_id: str, message: str) -> None:
 
 async def run_world(project_id: str, source: str = "original") -> None:
     staged_source = source == "staged"
+    existing = get_project(project_id)
+    if existing is None:
+        return
+    if not consume_world_quota(existing.owner_device_id):
+        logger.info("Project %s skipped a paid world; daily quota is spent", project_id)
+        update_project(project_id, error=WORLD_QUOTA_MESSAGE, active_job=None)
+        return
     update_project(
         project_id,
         status="generating_3d",

@@ -15,6 +15,7 @@ from db import list_projects as list_project_rows
 from models.project import CreateProjectRequest, Project, StageRequest, UploadMetadata
 from routers.responses import jpeg_response, labeled_jpeg, status_body, to_project
 from services.disclosure import DISCLOSURE_TEXT
+from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
 from services.pipeline import enqueue, run_stage, run_stitch, run_world
 from services.uploads import normalize_upload
 from services.world_gen import delete_worlds
@@ -33,18 +34,24 @@ router.dependencies.append(Depends(_bind_caller))
 
 
 async def _read_limited(upload: UploadFile, limit: int) -> bytes:
+    declared = getattr(upload, "size", None)
+    if declared is not None and declared > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Each image must be at most {limit // (1024 * 1024)} MB",
+        )
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = await upload.read(1024 * 1024)
+        chunk = await upload.read(64 * 1024)
         if not chunk:
             break
-        total += len(chunk)
-        if total > limit:
+        if total + len(chunk) > limit:
             raise HTTPException(
                 status_code=413,
                 detail=f"Each image must be at most {limit // (1024 * 1024)} MB",
             )
+        total += len(chunk)
         chunks.append(chunk)
     if total == 0:
         raise HTTPException(status_code=400, detail="Empty image upload")
@@ -266,6 +273,8 @@ async def stage_project(project_id: str, req: StageRequest, request: Request):
     project = _require(project_id, request)
     if not project.panorama_key:
         raise HTTPException(status_code=400, detail="No panorama available to stage")
+    if staging_quota_blocks(project.owner_device_id):
+        raise HTTPException(status_code=429, detail=STAGING_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
     if project.staging_status == "staging" and not get_settings().jobs_inline:
         raise HTTPException(status_code=409, detail="This project is already processing")
@@ -307,6 +316,8 @@ async def generate_3d(project_id: str, request: Request, source: str = Query(def
         raise HTTPException(status_code=400, detail="No panorama available for a 3D world")
     if source == "staged" and not project.staged_key:
         raise HTTPException(status_code=400, detail="Stage the panorama before generating a 3D world from it")
+    if world_quota_blocks(project.owner_device_id):
+        raise HTTPException(status_code=429, detail=WORLD_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
     await enqueue(run_world(project_id, source=source))
     latest = get_project(project_id)

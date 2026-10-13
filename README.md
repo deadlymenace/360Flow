@@ -162,6 +162,8 @@ Backend (`backend/.env.example`):
 | `GEMINI_API_KEY` | Blank uses the staging mock |
 | `GEMINI_MODEL` | Default `gemini-3.1-flash-image` |
 | `GEMINI_IMAGE_SIZE` | `1K`, `2K`, or `4K` (default `1K`) |
+| `GEMINI_JOBS_PER_DEVICE_PER_DAY` | Paid staging cap. Default 20. `0` disables it |
+| `WORLDLABS_JOBS_PER_DEVICE_PER_DAY` | Paid world cap, including the automatic world. Default 10. `0` disables it |
 | `WORLDLABS_API_KEY` | Blank uses the world mock |
 | `WORLDLABS_DRAFT_MODEL` | Default `marble-1.0-draft`. `off` skips the fast preview |
 | `WORLDLABS_MODEL` | Full world. Default `marble-1.1` |
@@ -173,6 +175,9 @@ Backend (`backend/.env.example`):
 | `MAX_IMAGE_BYTES` | Per-image upload cap (default 12 MB) |
 | `MIN_IMAGES` / `MAX_IMAGES` | Upload count bounds (2–24). The app still sends 16 |
 | `LOG_LEVEL` | Uvicorn/app log level |
+| `TRUSTED_PROXY_COUNT` | X-Forwarded-For hops to trust. Default 1 (Railway) |
+| `SHARE_LINK_TTL_DAYS` | Share link lifetime. Default 30. `0` does not expire |
+| `EMBED_FRAME_ANCESTORS` | Parents allowed when `embed=1`. Empty allows any |
 
 Mobile (`mobile/.env.example`):
 
@@ -188,7 +193,9 @@ Before the first upload, the app shows a consent screen. Agreeing lets the app s
 
 `DELETE /api/v1/projects/{id}` removes that capture for the device that owns it. Another device gets 404. It deletes the database row, the uploaded photos, the panorama, the staged image, and any files stored for that capture on local disk or R2. When `WORLDLABS_API_KEY` is set, it also asks World Labs to delete the full world, the draft world, and the staged pair. The share link then returns 404. `POST /api/v1/projects/{id}/share/rotate` issues a new share token and retires the old one. In the app, Delete on the home screen and on the panorama screen asks for confirmation before calling it.
 
-`/docs` and `/openapi.json` stay off unless `ENABLE_DOCS=true`. Share pages send `X-Content-Type-Options`, `Referrer-Policy`, and a Content-Security-Policy that includes `frame-ancestors 'none'`. Share links are built from `PUBLIC_BASE_URL` only.
+`/docs` and `/openapi.json` stay off unless `ENABLE_DOCS=true`. Share pages send `X-Content-Type-Options`, `Referrer-Policy`, `Strict-Transport-Security`, `X-Robots-Tag: noindex`, and a Content-Security-Policy. `frame-ancestors` is `'none'` unless the URL has `embed=1`, which uses `EMBED_FRAME_ANCESTORS` (any parent when that list is empty). Share links are built from `PUBLIC_BASE_URL` only and expire after `SHARE_LINK_TTL_DAYS` (default 30). Rotating a link starts a new window. Invalid request bodies return `422` with `Invalid request` and do not echo the submitted values.
+
+Paid Gemini and World Labs calls are capped per device per day (`GEMINI_JOBS_PER_DEVICE_PER_DAY`, `WORLDLABS_JOBS_PER_DEVICE_PER_DAY`). The world that starts automatically after upload counts against that cap. A Marble delete that fails is stored and retried in the background. Client IP for rate limits comes from the rightmost trusted `X-Forwarded-For` hop (`TRUSTED_PROXY_COUNT`, default 1 for Railway). Failed authentication is limited by that IP.
 
 ## What you need to supply
 

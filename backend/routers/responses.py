@@ -49,6 +49,7 @@ def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
         staging_prompt=row.staging_prompt,
         share_token=row.share_token,
         share_url=share,
+        share_expires_at=row.share_expires_at,
         has_original=bool(row.panorama_key),
         has_staged=staged,
         staging_provider=row.staging_provider,

@@ -228,9 +228,7 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             );
           })}
         </View>
-        {project?.status === 'failed' && project.error ? (
-          <Text style={styles.errorDetail}>{project.error}</Text>
-        ) : null}
+        {project?.error ? <Text style={styles.errorDetail}>{project.error}</Text> : null}
         {project?.staging_status === 'failed' && project.staging_error ? (
           <Text style={styles.errorDetail}>{project.staging_error}</Text>
         ) : null}

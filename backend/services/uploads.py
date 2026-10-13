@@ -19,6 +19,8 @@ _SOF_MARKERS = {
     0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
 }
+_EXIF_IFD = 0x8769
+_FOCAL_LENGTH = 0x920A
 _FOCAL_35MM = 0xA405
 
 
@@ -70,9 +72,30 @@ def _reject_dimensions(width: int, height: int, max_pixels: int) -> None:
         raise HTTPException(status_code=400, detail="Image dimensions are too large")
 
 
-def _focal_35mm(image: Image.Image) -> int | None:
+def _exif_ifd(image: Image.Image) -> dict:
+    """Phone photos store focal length in the Exif IFD, not in IFD0."""
     exif = image.getexif()
-    raw = exif.get(_FOCAL_35MM) if exif else None
+    if not exif:
+        return {}
+    try:
+        return exif.get_ifd(_EXIF_IFD)
+    except Exception:
+        return {}
+
+
+def read_focal_tags(image: Image.Image) -> tuple[object | None, int | None]:
+    """Return ``(FocalLength, FocalLengthIn35mmFilm)`` from the Exif IFD."""
+    ifd = _exif_ifd(image)
+    focal = ifd.get(_FOCAL_LENGTH) if ifd else None
+    raw_35 = ifd.get(_FOCAL_35MM) if ifd else None
+    return focal, _positive_int(raw_35)
+
+
+def focal_35mm_from_image(image: Image.Image) -> int | None:
+    return read_focal_tags(image)[1]
+
+
+def _positive_int(raw: object) -> int | None:
     if not raw:
         return None
     try:
@@ -88,15 +111,19 @@ def normalize_upload(data: bytes, *, max_pixels: int = MAX_IMAGE_PIXELS) -> byte
     Image.MAX_IMAGE_PIXELS = max_pixels
     try:
         with Image.open(io.BytesIO(data)) as image:
-            focal = _focal_35mm(image)
+            focal, focal_35 = read_focal_tags(image)
             image = ImageOps.exif_transpose(image)
             image = image.convert("RGB")
             _reject_dimensions(image.width, image.height, max_pixels)
             output = io.BytesIO()
             save_kwargs: dict = {"format": "JPEG", "quality": 92}
-            if focal:
+            if focal_35 or focal:
                 preserved = Image.Exif()
-                preserved[_FOCAL_35MM] = focal
+                ifd = preserved.get_ifd(_EXIF_IFD)
+                if focal_35:
+                    ifd[_FOCAL_35MM] = focal_35
+                if focal:
+                    ifd[_FOCAL_LENGTH] = focal
                 save_kwargs["exif"] = preserved
             image.save(output, **save_kwargs)
             return output.getvalue()

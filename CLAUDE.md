@@ -39,6 +39,8 @@
 ### Deletion and privacy
 - There are no user accounts. Do not add an account-deletion flow unless accounts are added.
 - Do not put `API_KEY` or `EXPO_PUBLIC_API_KEY` in the app. Devices call `POST /api/v1/devices` and store the token in `expo-secure-store`. Project routes are scoped by `owner_device_id` and return 404 for other devices. `API_KEY` is an operator key checked with `hmac.compare_digest`.
+- Read 35mm focal length from the Exif IFD (`getexif().get_ifd(0x8769)`), tags `FocalLength` (`0x920A`) and `FocalLengthIn35mmFilm` (`0xA405`), before stripping EXIF.
+- Share links expire (`SHARE_LINK_TTL_DAYS`, default 30). `embed=1` uses `EMBED_FRAME_ANCESTORS` instead of `frame-ancestors 'none'`. Paid Gemini and World Labs jobs have per-device daily quotas, including the world that starts after upload. Failed Marble deletes are queued and retried. Client IP is the rightmost trusted `X-Forwarded-For` hop (`TRUSTED_PROXY_COUNT`).
 - `DELETE /api/v1/projects/{id}` removes the row, `uploads/{id}/`, `panoramas/{id}.jpg`, `staged/{id}.jpg`, and `worlds/{id}/` on local disk or R2, and asks World Labs to delete stored world ids. The share token then 404s.
 - The app must show the one-time third-party disclosure (Google Gemini and World Labs) before the first upload. Consent is stored in the app document directory.
 

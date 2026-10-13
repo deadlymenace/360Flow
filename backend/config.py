@@ -78,6 +78,11 @@ class Settings:
     enable_docs: bool
     rate_limit_per_minute: int
     device_registrations_per_hour: int
+    trusted_proxy_count: int
+    gemini_daily_limit: int
+    worldlabs_daily_limit: int
+    share_link_ttl_days: int
+    embed_frame_ancestors: list[str]
     max_image_pixels: int
     gemini_api_key: str | None
     gemini_model: str
@@ -146,6 +151,11 @@ def get_settings() -> Settings:
     else:
         draft_model = draft.strip()
 
+    ancestors = []
+    for item in os.environ.get("EMBED_FRAME_ANCESTORS", "").replace(",", " ").split():
+        if item in {"*", "'self'"} or item.startswith("https://") or item.startswith("http://"):
+            ancestors.append(item)
+
     return Settings(
         database_url=database_url,
         storage_dir=storage_dir,
@@ -160,6 +170,11 @@ def get_settings() -> Settings:
         enable_docs=_bool("ENABLE_DOCS", False),
         rate_limit_per_minute=max(1, _int("RATE_LIMIT_PER_MINUTE", 120)),
         device_registrations_per_hour=max(1, _int("DEVICE_REGISTRATIONS_PER_HOUR", 30)),
+        trusted_proxy_count=max(0, _int("TRUSTED_PROXY_COUNT", 1)),
+        gemini_daily_limit=max(0, _int("GEMINI_JOBS_PER_DEVICE_PER_DAY", 20)),
+        worldlabs_daily_limit=max(0, _int("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", 10)),
+        share_link_ttl_days=max(0, _int("SHARE_LINK_TTL_DAYS", 30)),
+        embed_frame_ancestors=ancestors,
         max_image_pixels=max(1, _int("MAX_IMAGE_PIXELS", 24_000_000)),
         gemini_api_key=_blank("GEMINI_API_KEY"),
         gemini_model=_blank("GEMINI_MODEL") or "gemini-3.1-flash-image",
