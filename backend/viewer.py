@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from html import escape
 
 from services.disclosure import DISCLOSURE_TEXT
+
+_PLACEHOLDER = re.compile(r"__[A-Z0-9_]+__")
 
 _PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -310,8 +313,17 @@ def _controls(asset_base: str, has_staged: bool, has_world: bool, embed: bool) -
     return "\n".join(parts)
 
 
-def _finish(page: str, *, asset_base: str) -> str:
-    return page.replace("__BASE__", '"' + escape(asset_base, quote=True) + '"')
+def _fill(values: dict[str, str]) -> str:
+    """Substitute template placeholders once.
+
+    Replacement text is not scanned again, so a project name cannot inject
+    another placeholder such as __CONTROLS__.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        return values.get(match.group(0), "")
+
+    return _PLACEHOLDER.sub(replace, _PAGE)
 
 
 def render_pano_page(
@@ -334,22 +346,25 @@ def render_pano_page(
         if world_note:
             note += '<div class="note">%s</div>' % escape(world_note)
     chip_class = "" if has_staged and initial != "original" else "hide"
-    page = (
-        _PAGE.replace("__TITLE__", escape(title))
-        .replace("__CANVAS__", '<canvas id="c"></canvas>')
-        .replace("__TITLE_HTML__", note)
-        .replace("__DISCLOSURE__", DISCLOSURE_TEXT)
-        .replace("__CHIP_CLASS__", chip_class)
-        .replace("__NOTE__", "")
-        .replace("__BAR_CLASS__", "hide" if embed and not has_staged else "")
-        .replace("__CONTROLS__", _controls(asset_base, has_staged, has_world, embed))
-        .replace("__HAS_STAGED__", "true" if has_staged else "false")
-        .replace("__INITIAL__", '"' + initial + '"')
-        .replace("__KIND__", '"pano"')
-        .replace("__MARBLE__", "null")
-        .replace("__STAGED_WORLD__", "false")
+    safe_title = escape(title)
+    return _fill(
+        {
+            "__TITLE__": safe_title,
+            "__CANVAS__": '<canvas id="c"></canvas>',
+            "__TITLE_HTML__": note,
+            "__DISCLOSURE__": escape(DISCLOSURE_TEXT),
+            "__CHIP_CLASS__": chip_class,
+            "__NOTE__": "",
+            "__BAR_CLASS__": "hide" if embed and not has_staged else "",
+            "__CONTROLS__": _controls(asset_base, has_staged, has_world, embed),
+            "__HAS_STAGED__": "true" if has_staged else "false",
+            "__INITIAL__": '"' + initial + '"',
+            "__KIND__": '"pano"',
+            "__MARBLE__": "null",
+            "__STAGED_WORLD__": "false",
+            "__BASE__": '"' + escape(asset_base, quote=True) + '"',
+        }
     )
-    return _finish(page, asset_base=asset_base)
 
 
 def render_world_page(
@@ -405,19 +420,21 @@ def render_world_page(
         controls = f'<a class="btn" href="{base}/?view=compare">Compare</a> ' + controls
     if marble_url:
         controls = f'<a class="btn" href="{escape(marble_url, quote=True)}">Open in Marble</a> ' + controls
-    page = (
-        _PAGE.replace("__TITLE__", safe_title)
-        .replace("__CANVAS__", canvas)
-        .replace("__TITLE_HTML__", f'<div class="title">{safe_title}</div>')
-        .replace("__DISCLOSURE__", DISCLOSURE_TEXT)
-        .replace("__CHIP_CLASS__", chip_class)
-        .replace("__NOTE__", note)
-        .replace("__BAR_CLASS__", "")
-        .replace("__CONTROLS__", controls)
-        .replace("__HAS_STAGED__", "true" if staged_source else "false")
-        .replace("__INITIAL__", '"staged"' if staged_source else '"original"')
-        .replace("__KIND__", '"world"')
-        .replace("__MARBLE__", marble_js)
-        .replace("__STAGED_WORLD__", "true" if staged_source else "false")
+    return _fill(
+        {
+            "__TITLE__": safe_title,
+            "__CANVAS__": canvas,
+            "__TITLE_HTML__": f'<div class="title">{safe_title}</div>',
+            "__DISCLOSURE__": escape(DISCLOSURE_TEXT),
+            "__CHIP_CLASS__": chip_class,
+            "__NOTE__": note,
+            "__BAR_CLASS__": "",
+            "__CONTROLS__": controls,
+            "__HAS_STAGED__": "true" if staged_source else "false",
+            "__INITIAL__": '"staged"' if staged_source else '"original"',
+            "__KIND__": '"world"',
+            "__MARBLE__": marble_js,
+            "__STAGED_WORLD__": "true" if staged_source else "false",
+            "__BASE__": '"' + escape(asset_base, quote=True) + '"',
+        }
     )
-    return _finish(page, asset_base=asset_base)

@@ -49,7 +49,7 @@ npx expo start
 
 `EXPO_PUBLIC_API_URL` is the backend origin, with or without `/api/v1`. For a phone on the same Wi-Fi, set it to `http://<your-lan-ip>:8000`. When that variable is empty, Expo Go falls back to the debugger host on port 8000, then `localhost`.
 
-If the backend has `API_KEY` set, put the same value in `EXPO_PUBLIC_API_KEY`. The app sends it as `X-API-Key`. Share pages under `/v/` stay public.
+The app registers an anonymous device and keeps that token in the device secure store. It sends `Authorization: Bearer` on API calls. Do not put `API_KEY` in the app. `API_KEY` is an operator key sent as `X-API-Key` and is compared with `hmac.compare_digest`. Share pages under `/v/` stay public until the share token is rotated or the capture is deleted.
 
 Ultra-wide capture needs a physical iPhone. The simulator will not list that lens; the app then keeps the 92° portrait ultra-wide default until a wide-only camera is reported, in which case it uses 53°.
 
@@ -62,7 +62,7 @@ npx tsc --noEmit
 
 ### Installed builds
 
-`mobile/eas.json` is set up for EAS Build. Set `EXPO_PUBLIC_API_URL` and, when the API is locked, `EXPO_PUBLIC_API_KEY` in the EAS environment for the build profile. Do not commit those values.
+`mobile/eas.json` is set up for EAS Build. Set `EXPO_PUBLIC_API_URL` in the EAS environment for the build profile. Do not commit that value, and do not set `API_KEY` in the app environment. If a build already shipped with `EXPO_PUBLIC_API_KEY`, rotate `API_KEY` after deploy.
 
 ```bash
 cd mobile
@@ -89,7 +89,7 @@ Project records use `gemini_mock` / `gemini` and `worldlabs_mock` / `worldlabs`.
 
 Leave `GEMINI_API_KEY` unset and staging applies a local color grade. It does not add furniture. Set the key and the API calls the [Gemini image API](https://ai.google.dev/gemini-api/docs/image-generation): `POST https://generativelanguage.googleapis.com/v1/models/{model}:generateContent` with header `x-goog-api-key`, inline JPEG bytes, and `responseModalities` of `TEXT` and `IMAGE`. The default model is `gemini-nano-banana-2.1` (Nano Banana 2.1). `gemini-3.1-flash-image` (Nano Banana 2) is deprecated and has no published shutdown date; new projects should stay on 2.1. Override with `GEMINI_MODEL` if you need a different id. A key that the API rejects fails the staging job and names Gemini in the error. It does not silently fall back to the mock.
 
-Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the panorama on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean panorama (the original, or the unlabeled staged JPEG for a staged world) and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true`. The draft model `marble-1.0-draft` runs first. Its URL is saved as a preview while `marble-1.1` (`WORLDLABS_MODEL`) continues. A draft failure is logged and the full model still runs. Set `WORLDLABS_DRAFT_MODEL` to `off` to skip the draft. Worlds are public when `WORLDLABS_PUBLIC` is true, so the Marble link can be shared.
+Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the panorama on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean panorama (the original, or the unlabeled staged JPEG for a staged world) and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true`. The draft model `marble-1.0-draft` runs first. Its world id is stored while `marble-1.1` (`WORLDLABS_MODEL`) continues. A draft failure is logged and the full model still runs. Set `WORLDLABS_DRAFT_MODEL` to `off` to skip the draft. Worlds are private unless `WORLDLABS_PUBLIC` is true. The name sent to Marble is the project id. Deleting a capture deletes the draft world, the full world, and the same pair for a staged world. A world that finishes after the capture was deleted is deleted too.
 
 ## Staging label and preservation
 
@@ -124,7 +124,7 @@ railway config apply
 1. Create a Railway project from this repo and confirm the service builds the root Dockerfile.
 2. Add a Postgres plugin and set `DATABASE_URL` to its connection string. `postgres://` URLs are accepted.
 3. Set `PUBLIC_BASE_URL` to the public Railway URL, with no trailing slash. Share links use it.
-4. Set `API_KEY` if the API should require `X-API-Key`. Share pages stay open.
+4. Set `API_KEY` only for operators. The iPhone app uses a per-device token instead. Share pages stay open to anyone with the current share token.
 5. Set `GEMINI_API_KEY` and `WORLDLABS_API_KEY` when those accounts exist. Until then the health check reports `mock` for that step.
 6. Optional: mount a volume at `/data` when you are still on local disk. `STORAGE_DIR` is already `/data` in the image.
 
@@ -150,7 +150,7 @@ Backend (`backend/.env.example`):
 | Variable | Purpose |
 | --- | --- |
 | `PUBLIC_BASE_URL` | Public origin for share links |
-| `API_KEY` | Shared secret for `/api/v1`. Blank leaves the API open |
+| `API_KEY` | Operator key (`X-API-Key`). Not for the app. Blank means device tokens only |
 | `DATABASE_URL` | Postgres URL. Blank uses SQLite |
 | `STORAGE_DIR` | Local files. Docker uses `/data` |
 | `S3_ENDPOINT_URL` | R2 S3 endpoint |
@@ -158,14 +158,14 @@ Backend (`backend/.env.example`):
 | `S3_ACCESS_KEY_ID` | R2 access key |
 | `S3_SECRET_ACCESS_KEY` | R2 secret |
 | `S3_REGION` | `auto` for R2 |
-| `CORS_ORIGINS` | Comma-separated origins, or `*` |
+| `CORS_ORIGINS` | Comma-separated browser origins. Empty allows none |
 | `GEMINI_API_KEY` | Blank uses the staging mock |
 | `GEMINI_MODEL` | Default `gemini-nano-banana-2.1` |
 | `GEMINI_IMAGE_SIZE` | `1K`, `2K`, or `4K` (default `1K`) |
 | `WORLDLABS_API_KEY` | Blank uses the world mock |
 | `WORLDLABS_DRAFT_MODEL` | Default `marble-1.0-draft`. `off` skips the fast preview |
 | `WORLDLABS_MODEL` | Full world. Default `marble-1.1` |
-| `WORLDLABS_PUBLIC` | Default `true` so the Marble link is shareable |
+| `WORLDLABS_PUBLIC` | Default `false`. Worlds are private |
 | `STITCH_CONCURRENCY` | Stitch and generation jobs at once |
 | `JOBS_INLINE` | Await jobs inside the request. Tests only |
 | `MOCK_STAGE_DELAY` | Seconds the mock staging waits |
@@ -179,7 +179,6 @@ Mobile (`mobile/.env.example`):
 | Variable | Purpose |
 | --- | --- |
 | `EXPO_PUBLIC_API_URL` | Backend origin for dev and installed builds |
-| `EXPO_PUBLIC_API_KEY` | Sent as `X-API-Key` when the API is locked |
 
 ## Privacy
 
@@ -187,7 +186,9 @@ The app does not create user accounts, so there is no account to delete. Each ca
 
 Before the first upload, the app shows a consent screen. Agreeing lets the app send room photos to the 360Flow API. The API stitches them and sends the panorama to World Labs to build the 3D walkthrough. Virtual staging is optional; choosing it sends the panorama to Google Gemini. Until the person agrees, the upload does not start.
 
-`DELETE /api/v1/projects/{id}` removes that capture. It deletes the database row, the uploaded photos, the panorama, the staged image, and any files stored for that capture on local disk or R2. When `WORLDLABS_API_KEY` is set, it also asks World Labs to delete the original world, the draft world, and a staged world. The share link then returns 404. The same API key that protects the rest of `/api/v1` protects this route. In the app, Delete on the home screen and on the panorama screen asks for confirmation before calling it.
+`DELETE /api/v1/projects/{id}` removes that capture for the device that owns it. Another device gets 404. It deletes the database row, the uploaded photos, the panorama, the staged image, and any files stored for that capture on local disk or R2. When `WORLDLABS_API_KEY` is set, it also asks World Labs to delete the full world, the draft world, and the staged pair. The share link then returns 404. `POST /api/v1/projects/{id}/share/rotate` issues a new share token and retires the old one. In the app, Delete on the home screen and on the panorama screen asks for confirmation before calling it.
+
+`/docs` and `/openapi.json` stay off unless `ENABLE_DOCS=true`. Share pages send `X-Content-Type-Options`, `Referrer-Policy`, and a Content-Security-Policy that includes `frame-ancestors 'none'`. Share links are built from `PUBLIC_BASE_URL` only.
 
 ## What you need to supply
 

@@ -1,6 +1,9 @@
 import { File as ExpoFile, Paths } from 'expo-file-system';
 import Constants from 'expo-constants';
+import * as SecureStore from 'expo-secure-store';
 import { Project, StageStatus, StatusResponse, WorldStatus } from '../models/types';
+
+const DEVICE_TOKEN_KEY = 'device_token';
 
 function configuredBaseUrl(): string | null {
   const configured = process.env.EXPO_PUBLIC_API_URL?.trim();
@@ -28,17 +31,27 @@ export function getApiOrigin(): string {
   return getBaseUrl().replace(/\/api\/v1\/?$/, '');
 }
 
-function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
-  const headers = { ...extra };
-  const key = process.env.EXPO_PUBLIC_API_KEY?.trim();
-  if (key) headers['X-API-Key'] = key;
-  return headers;
+async function deviceToken(): Promise<string> {
+  const existing = await SecureStore.getItemAsync(DEVICE_TOKEN_KEY);
+  if (existing) return existing;
+  const res = await fetch(`${getBaseUrl()}/devices`, { method: 'POST' });
+  if (!res.ok) throw new Error('Could not register this device');
+  const body = await res.json();
+  const token = typeof body.token === 'string' ? body.token : '';
+  if (!token) throw new Error('Could not register this device');
+  await SecureStore.setItemAsync(DEVICE_TOKEN_KEY, token);
+  return token;
+}
+
+async function authHeaders(extra: Record<string, string> = {}): Promise<Record<string, string>> {
+  const token = await deviceToken();
+  return { ...extra, Authorization: `Bearer ${token}` };
 }
 
 const REQUEST_TIMEOUT = 10000;
 
-function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = REQUEST_TIMEOUT): Promise<Response> {
-  const headers = authHeaders(options.headers as Record<string, string> | undefined);
+async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = REQUEST_TIMEOUT): Promise<Response> {
+  const headers = await authHeaders(options.headers as Record<string, string> | undefined);
   return Promise.race([
     fetch(url, { ...options, headers }),
     new Promise<never>((_, reject) =>
@@ -131,7 +144,7 @@ class APIService {
   async downloadToCache(url: string, filename: string): Promise<string> {
     const dest = new ExpoFile(Paths.cache, filename);
     const output = await ExpoFile.downloadFileAsync(url, dest, {
-      headers: authHeaders(),
+      headers: await authHeaders(),
       idempotent: true,
     });
     return output.uri;

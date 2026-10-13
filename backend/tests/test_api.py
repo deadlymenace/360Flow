@@ -35,7 +35,8 @@ def test_health(client):
     assert body["database"] == "sqlite"
     assert body["staging"] == "mock"
     assert body["world"] == "mock"
-    assert body["auth"] == "open"
+    assert body["auth"] == "device"
+    assert body["admin"] is False
 
 
 def test_project_survives_reopen(client):
@@ -168,19 +169,17 @@ def test_full_pipeline_with_mocks(client):
     assert DISCLOSURE_TEXT in staged_page.text
 
 
-def test_api_key_protects_api_and_not_the_share_page(client, monkeypatch):
+def test_device_token_and_admin_key(client, monkeypatch):
+    assert client.raw.get("/api/v1/projects").status_code == 401
     monkeypatch.setenv("API_KEY", "secret-key")
-    assert client.get("/health").json()["auth"] == "api-key"
-    assert client.get("/api/v1/projects").status_code == 401
-    allowed = client.get("/api/v1/projects", headers={"X-API-Key": "secret-key"})
+    assert client.get("/health").json()["admin"] is True
+    assert client.raw.get("/api/v1/projects", headers={"X-API-Key": "wrong-key"}).status_code == 401
+    allowed = client.raw.get("/api/v1/projects", headers={"X-API-Key": "secret-key"})
     assert allowed.status_code == 200
-    created = client.post(
-        "/api/v1/projects",
-        headers={"X-API-Key": "secret-key"},
-        json={"name": "Locked"},
-    ).json()
-    # The share token page stays public so a listing link does not need the key.
-    assert client.get(f"/v/{created['share_token']}").status_code == 404
+    created = client.post("/api/v1/projects", json={"name": "Locked"}).json()
+    # The share token page stays public so a listing link does not need the device token.
+    assert client.raw.get(f"/v/{created['share_token']}").status_code == 404
+    assert client.raw.get(f"/api/v1/projects/{created['id']}", headers={"X-API-Key": "secret-key"}).status_code == 200
 
 
 def test_delete_project_removes_files_row_and_share_link(client):
@@ -229,8 +228,7 @@ def test_delete_missing_project_is_404(client):
     assert missing.status_code == 404
 
 
-def test_delete_requires_api_key_and_notifies_world_labs(client, monkeypatch):
-    monkeypatch.setenv("API_KEY", "secret-key")
+def test_delete_notifies_world_labs_for_every_stored_world(client, monkeypatch):
     monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
     deleted_urls: list[str] = []
 
@@ -253,30 +251,26 @@ def test_delete_requires_api_key_and_notifies_world_labs(client, monkeypatch):
             return _Response()
 
     monkeypatch.setattr("services.world_gen.httpx.AsyncClient", _Client)
-    created = client.post(
-        "/api/v1/projects",
-        headers={"X-API-Key": "secret-key"},
-        json={"name": "Locked room"},
-    ).json()
+    created = client.post("/api/v1/projects", json={"name": "Locked room"}).json()
     from db import update_project
 
     update_project(
         created["id"],
         world_id="world-full",
-        world_preview_id="world-full",
+        world_preview_id="world-draft",
         staged_world_id="world-staged",
+        staged_world_preview_id="world-staged-draft",
     )
-    assert client.delete(f"/api/v1/projects/{created['id']}").status_code == 401
-    removed = client.delete(
-        f"/api/v1/projects/{created['id']}",
-        headers={"X-API-Key": "secret-key"},
-    )
+    assert client.raw.delete(f"/api/v1/projects/{created['id']}").status_code == 401
+    removed = client.delete(f"/api/v1/projects/{created['id']}")
     assert removed.status_code == 204
-    assert client.get(f"/v/{created['share_token']}").status_code == 404
+    assert client.raw.get(f"/v/{created['share_token']}").status_code == 404
     assert sorted(deleted_urls) == sorted(
         [
             "https://api.worldlabs.ai/marble/v1/worlds/world-full",
+            "https://api.worldlabs.ai/marble/v1/worlds/world-draft",
             "https://api.worldlabs.ai/marble/v1/worlds/world-staged",
+            "https://api.worldlabs.ai/marble/v1/worlds/world-staged-draft",
         ]
     )
 
@@ -319,5 +313,6 @@ def test_gemini_http_error_fails_the_job(client, monkeypatch):
     assert staged.status_code == 200
     body = client.get(f"/api/v1/projects/{project_id}/stage/status").json()
     assert body["status"] == "failed"
-    assert "Gemini" in body["error"]
+    assert body["error"] == "Staging failed. Try again."
     assert "test-key" not in body["error"]
+    assert "API key not valid" not in body["error"]

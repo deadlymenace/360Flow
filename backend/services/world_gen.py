@@ -27,6 +27,12 @@ def generation_models(draft_model: str | None, full_model: str) -> list[str]:
     return [full_model]
 
 
+def world_display_name(project_id: str, *, staged: bool) -> str:
+    """Marble title. Uses the project id so the user's room name is not sent."""
+    name = project_id if not staged else f"{project_id}-staged"
+    return name[:64]
+
+
 def build_world_request(display_name: str, media_asset_id: str, model: str, public: bool) -> dict:
     """Image-to-world body. ``is_pano`` is true because the stitcher emits a 2:1 equirect."""
     name = " ".join(display_name.split())[:64] or "360Flow room"

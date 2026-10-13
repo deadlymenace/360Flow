@@ -38,6 +38,7 @@
 
 ### Deletion and privacy
 - There are no user accounts. Do not add an account-deletion flow unless accounts are added.
+- Do not put `API_KEY` or `EXPO_PUBLIC_API_KEY` in the app. Devices call `POST /api/v1/devices` and store the token in `expo-secure-store`. Project routes are scoped by `owner_device_id` and return 404 for other devices. `API_KEY` is an operator key checked with `hmac.compare_digest`.
 - `DELETE /api/v1/projects/{id}` removes the row, `uploads/{id}/`, `panoramas/{id}.jpg`, `staged/{id}.jpg`, and `worlds/{id}/` on local disk or R2, and asks World Labs to delete stored world ids. The share token then 404s.
 - The app must show the one-time third-party disclosure (Google Gemini and World Labs) before the first upload. Consent is stored in the app document directory.
 

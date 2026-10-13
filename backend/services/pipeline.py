@@ -17,7 +17,7 @@ from config import get_settings
 from db import ProjectRecord, get_project, update_project
 from services.staging import stage_image
 from services.stitcher import stitch_images
-from services.world_gen import generate_world
+from services.world_gen import delete_worlds, generate_world, world_display_name
 from storage import delete_project_assets, get_storage, panorama_key, staged_key
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ async def run_stitch(project_id: str) -> None:
             logger.info("Project %s deleted during stitch", project_id)
             return
         logger.exception("Project %s stitch failed", project_id)
-        update_project(project_id, status="failed", error=_short(exc))
+        update_project(project_id, status="failed", error="Stitching failed. Try again.")
         return
     await run_world(project_id, source="original")
 
@@ -141,7 +141,7 @@ async def run_stage(project_id: str) -> None:
             logger.info("Project %s deleted during staging", project_id)
             return
         logger.exception("Project %s staging failed", project_id)
-        update_project(project_id, status="failed", error=_short(exc))
+        update_project(project_id, status="failed", error="Staging failed. Try again.")
 
 
 async def run_world(project_id: str, source: str = "original") -> None:
@@ -152,6 +152,7 @@ async def run_world(project_id: str, source: str = "original") -> None:
         error=None,
         active_job="staged_world" if staged_source else "world",
     )
+    created_ids: list[str] = []
     try:
         project = _require(project_id)
         storage = get_storage()
@@ -159,30 +160,40 @@ async def run_world(project_id: str, source: str = "original") -> None:
             if not project.staged_key:
                 raise RuntimeError("Stage the panorama before generating a 3D world from it")
             image = storage.get_bytes(project.staged_key)
-            label = f"{project.name} staged"
         else:
             if not project.panorama_key:
                 raise RuntimeError("No panorama available for a 3D world")
             image = storage.get_bytes(project.panorama_key)
-            label = project.name
+        label = world_display_name(project.id, staged=staged_source)
 
         async def on_preview(result: dict) -> None:
+            world_id = result.get("world_id")
+            if world_id:
+                created_ids.append(world_id)
+            if _deleted(project_id):
+                await delete_worlds([world_id])
+                return
             if staged_source:
                 update_project(
                     project_id,
                     staged_world_preview_url=result.get("marble_url"),
+                    staged_world_preview_id=world_id,
                     staged_world_provider=result.get("provider"),
                 )
             else:
                 update_project(
                     project_id,
                     world_preview_url=result.get("marble_url"),
-                    world_preview_id=result.get("world_id"),
+                    world_preview_id=world_id,
                     world_provider=result.get("provider"),
                 )
 
         result = await generate_world(image, label, on_preview=on_preview)
+        final_id = result.get("world_id")
+        if final_id:
+            created_ids.append(final_id)
         if _deleted(project_id):
+            await delete_worlds(created_ids)
             return
         if staged_source:
             saved = update_project(
@@ -213,15 +224,17 @@ async def run_world(project_id: str, source: str = "original") -> None:
                 error=None,
             )
         if saved is None:
+            await delete_worlds(created_ids)
             delete_project_assets(project_id)
             return
         logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
     except Exception as exc:
         if _deleted(project_id):
             logger.info("Project %s deleted during world generation", project_id)
+            await delete_worlds(created_ids)
             return
         logger.exception("Project %s world generation failed", project_id)
-        update_project(project_id, status="failed", error=_short(exc))
+        update_project(project_id, status="failed", error="3D generation failed. Try again.")
 
 
 def _deleted(project_id: str) -> bool:
@@ -234,7 +247,3 @@ def _require(project_id: str) -> ProjectRecord:
         raise RuntimeError("Project not found")
     return project
 
-
-def _short(exc: Exception) -> str:
-    text = str(exc).strip() or exc.__class__.__name__
-    return text[:500]
