@@ -10,12 +10,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, inspect, or_, select, text
+from sqlalchemy import DateTime, Float, Index, Integer, String, Text, create_engine, inspect, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from config import Settings, get_settings
 
 TRANSIENT_STATUSES = ("uploading", "stitching", "staging", "generating_3d", "delayed")
+# Statuses that still have a worker. Delayed is queued, not running, but it
+# still occupies the one open job slot for the project.
+OPEN_JOB_STATUSES = ("pending", "running", "delayed")
+GLOBAL_QUOTA_DEVICE = "__global__"
+_RESUME_LOCK_KEY = 360360160
 
 
 class Base(DeclarativeBase):
@@ -79,6 +85,15 @@ class JobRow(Base):
     """A stitch, stage, or world job that must survive a process restart."""
 
     __tablename__ = "jobs"
+    __table_args__ = (
+        Index(
+            "jobs_one_open_per_project",
+            "project_id",
+            unique=True,
+            sqlite_where=text("status IN ('pending', 'running', 'delayed')"),
+            postgresql_where=text("status IN ('pending', 'running', 'delayed')"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     project_id: Mapped[str] = mapped_column(String(36), index=True)
@@ -87,6 +102,8 @@ class JobRow(Base):
     operation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     operation_phase: Mapped[str | None] = mapped_column(String(16), nullable=True)
     media_asset_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    delayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -131,6 +148,11 @@ _EXTRA_COLUMNS = {
     "staged_world_preview_id": "VARCHAR(64)",
     "share_expires_at": "TIMESTAMP",
     "provider_error": "TEXT",
+}
+
+_JOB_EXTRA_COLUMNS = {
+    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+    "delayed_at": "TIMESTAMP",
 }
 
 
@@ -187,6 +209,8 @@ class JobRecord:
     operation_id: str | None
     operation_phase: str | None
     media_asset_id: str | None
+    attempt_count: int = 0
+    delayed_at: datetime | None = None
 
 
 _engine = None
@@ -194,8 +218,12 @@ _Session: sessionmaker[Session] | None = None
 
 
 def init_db(settings: Settings | None = None) -> None:
-    global _engine, _Session
+    global _engine, _Session, _leader_conn, _leader_flag
     settings = settings or get_settings()
+    if _leader_conn is not None:
+        _leader_conn.close()
+        _leader_conn = None
+        _leader_flag = False
     if _engine is not None:
         _engine.dispose()
     connect_args = {}
@@ -204,6 +232,7 @@ def init_db(settings: Settings | None = None) -> None:
     _engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
     Base.metadata.create_all(_engine)
     _ensure_columns(_engine)
+    _ensure_job_schema(_engine)
     _Session = sessionmaker(bind=_engine, expire_on_commit=False)
 
 
@@ -215,8 +244,30 @@ def _ensure_columns(engine) -> None:
                 conn.execute(text(f"ALTER TABLE projects ADD COLUMN {name} {ddl}"))
 
 
+def _ensure_job_schema(engine) -> None:
+    """Add job columns and the one-open-job index on databases created before them."""
+    tables = set(inspect(engine).get_table_names())
+    if "jobs" not in tables:
+        return
+    existing = {column["name"] for column in inspect(engine).get_columns("jobs")}
+    with engine.begin() as conn:
+        for name, ddl in _JOB_EXTRA_COLUMNS.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}"))
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_open_per_project "
+                "ON jobs (project_id) WHERE status IN ('pending', 'running', 'delayed')"
+            )
+        )
+
+
 def dispose_db() -> None:
-    global _engine, _Session
+    global _engine, _Session, _leader_conn, _leader_flag
+    if _leader_conn is not None:
+        _leader_conn.close()
+    _leader_conn = None
+    _leader_flag = False
     if _engine is not None:
         _engine.dispose()
     _engine = None
@@ -293,6 +344,8 @@ def _job_record(row: JobRow) -> JobRecord:
         operation_id=row.operation_id,
         operation_phase=row.operation_phase,
         media_asset_id=row.media_asset_id,
+        attempt_count=row.attempt_count or 0,
+        delayed_at=row.delayed_at,
     )
 
 
@@ -398,6 +451,7 @@ def create_job(project_id: str, kind: str) -> JobRecord:
         project_id=project_id,
         kind=kind,
         status="pending",
+        attempt_count=0,
         created_at=now,
         updated_at=now,
     )
@@ -435,23 +489,66 @@ def delete_job(job_id: str) -> None:
 _JOB_PRIORITY = {"stitch": 1, "stage": 2, "world": 3, "staged_world": 4}
 
 
-def claim_resumable_jobs() -> list[JobRecord]:
+_leader_conn = None
+_leader_flag = False
+
+
+def try_resume_leadership() -> tuple[bool, bool]:
+    """Return ``(is_leader, just_acquired)``.
+
+    Postgres holds a session advisory lock on a dedicated connection so only
+    one replica resumes crashed jobs. SQLite is always the leader.
+    """
+    global _leader_conn, _leader_flag
+    if _engine is None or _engine.dialect.name != "postgresql":
+        return True, False
+    if _leader_flag and _leader_conn is not None:
+        return True, False
+    if _leader_conn is None:
+        _leader_conn = _engine.connect()
+    got = _leader_conn.execute(text("SELECT pg_try_advisory_lock(:key)"), {"key": _RESUME_LOCK_KEY}).scalar()
+    _leader_conn.commit()
+    if not got:
+        return False, False
+    _leader_flag = True
+    return True, True
+
+
+def claim_resumable_jobs(*, fresh_running: bool = True) -> list[JobRecord]:
     """One unfinished job per project, preferring the furthest-along kind.
 
     A restart can leave both a finished stitch job and the world job it
-    started. Only the later one should run.
+    started. Only the later one should run. On Postgres the resume leader
+    takes ``SELECT ... FOR UPDATE SKIP LOCKED`` so another replica cannot
+    claim the same rows. A maintenance pass leaves fresh rows alone; those
+    belong to the replica that created them.
     """
+    if _engine is not None and _engine.dialect.name == "postgresql":
+        leader, _just = try_resume_leadership()
+        if not leader:
+            return []
     with session_scope() as session:
-        rows = session.scalars(select(JobRow).where(JobRow.status.in_(("pending", "running")))).all()
+        query = select(JobRow).where(JobRow.status.in_(("pending", "running")))
+        dialect = session.get_bind().dialect.name
+        if not fresh_running:
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=get_settings().job_claim_stale_seconds)
+            query = query.where(JobRow.updated_at < cutoff)
+        if dialect == "postgresql":
+            query = query.with_for_update(skip_locked=True)
+        rows = list(session.scalars(query).all())
         best: dict[str, JobRow] = {}
         for row in rows:
             current = best.get(row.project_id)
             if current is None or _JOB_PRIORITY.get(row.kind, 0) > _JOB_PRIORITY.get(current.kind, 0):
                 best[row.project_id] = row
+        now = datetime.now(timezone.utc)
         for row in rows:
             winner = best[row.project_id]
             if row.id != winner.id:
                 session.delete(row)
+                continue
+            row.status = "running"
+            row.updated_at = now
         return [_job_record(row) for row in best.values()]
 
 
@@ -492,20 +589,307 @@ def daily_quota_available(device_id: str | None, kind: str, limit: int) -> bool:
         return row is None or row.count < limit
 
 
+_BUMP_QUOTA = text(
+    """
+    INSERT INTO daily_usage (device_id, day, kind, count)
+    VALUES (:device_id, :day, :kind, 1)
+    ON CONFLICT (device_id, day, kind)
+    DO UPDATE SET count = daily_usage.count + 1
+    WHERE daily_usage.count < :limit
+    RETURNING count
+    """
+)
+
+
+class _EnqueueStop(Exception):
+    def __init__(self, outcome: str) -> None:
+        self.outcome = outcome
+
+
+def bump_quota(session: Session, device_id: str, kind: str, limit: int) -> bool:
+    """Atomically count one use. False when the row is already at ``limit``."""
+    if limit <= 0:
+        return True
+    row = session.execute(
+        _BUMP_QUOTA,
+        {
+            "device_id": device_id,
+            "day": datetime.now(timezone.utc).date().isoformat(),
+            "kind": kind,
+            "limit": limit,
+        },
+    ).first()
+    return row is not None
+
+
 def consume_daily_quota(device_id: str | None, kind: str, limit: int) -> bool:
     """Count one paid job for this device today. False when the limit is already met."""
     if not device_id or limit <= 0:
         return True
-    day = datetime.now(timezone.utc).date().isoformat()
     with session_scope() as session:
-        row = session.get(DailyUsageRow, (device_id, day, kind))
-        if row is None:
-            session.add(DailyUsageRow(device_id=device_id, day=day, kind=kind, count=1))
-            return True
-        if row.count >= limit:
-            return False
-        row.count += 1
+        return bump_quota(session, device_id, kind, limit)
+
+
+def charge_world_quota(session: Session, device_id: str | None) -> bool:
+    """Device cap and the global daily cap, in the caller's transaction."""
+    settings = get_settings()
+    if not settings.worldlabs_api_key:
         return True
+    if device_id and settings.worldlabs_daily_limit > 0:
+        if not bump_quota(session, device_id, "worldlabs", settings.worldlabs_daily_limit):
+            return False
+    if settings.global_daily_worlds_cap > 0:
+        if not bump_quota(session, GLOBAL_QUOTA_DEVICE, "worldlabs", settings.global_daily_worlds_cap):
+            return False
+    return True
+
+
+def charge_staging_quota(session: Session, device_id: str | None) -> bool:
+    settings = get_settings()
+    if not settings.gemini_api_key or settings.gemini_daily_limit <= 0 or not device_id:
+        return True
+    return bump_quota(session, device_id, "gemini", settings.gemini_daily_limit)
+
+
+def _aware(when: datetime) -> datetime:
+    if when.tzinfo is None:
+        return when.replace(tzinfo=timezone.utc)
+    return when
+
+
+def delay_expired(attempt_count: int, delayed_at: datetime | None, now: datetime | None = None) -> bool:
+    """True when a delayed 3D job has been waiting too long or retried too often."""
+    settings = get_settings()
+    if attempt_count > settings.world_delay_max_attempts:
+        return True
+    if delayed_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return current - _aware(delayed_at) >= timedelta(hours=settings.world_delay_max_hours)
+
+
+def _open_jobs(session: Session, project_id: str) -> list[JobRow]:
+    return list(
+        session.scalars(
+            select(JobRow).where(
+                JobRow.project_id == project_id,
+                JobRow.status.in_(OPEN_JOB_STATUSES),
+            )
+        ).all()
+    )
+
+
+def _queue_deletes_in_session(session: Session, world_ids: list[str], error: str) -> None:
+    now = datetime.now(timezone.utc)
+    detail = (error or "delete failed")[:500]
+    for world_id in dict.fromkeys(world_ids):
+        row = session.get(PendingWorldDeleteRow, world_id)
+        if row is None:
+            session.add(
+                PendingWorldDeleteRow(
+                    world_id=world_id,
+                    attempts=0,
+                    last_error=detail,
+                    next_attempt_at=now,
+                    created_at=now,
+                )
+            )
+
+
+_ORIGINAL_WORLD_FIELDS = (
+    "world_provider",
+    "world_id",
+    "world_marble_url",
+    "world_splat_url",
+    "world_mesh_url",
+    "world_thumbnail_url",
+    "world_operation_id",
+    "world_preview_url",
+    "world_preview_id",
+)
+_STAGED_WORLD_FIELDS = (
+    "staged_world_provider",
+    "staged_world_id",
+    "staged_world_marble_url",
+    "staged_world_preview_url",
+    "staged_world_splat_url",
+    "staged_world_mesh_url",
+    "staged_world_thumbnail_url",
+    "staged_world_operation_id",
+    "staged_world_preview_id",
+)
+
+
+def _world_ids(row: ProjectRow, which: str) -> list[str]:
+    from services.world_urls import valid_world_id
+
+    raw = []
+    if which in {"original", "all"}:
+        raw.extend([row.world_id, row.world_preview_id])
+    if which in {"staged", "all"}:
+        raw.extend([row.staged_world_id, row.staged_world_preview_id])
+    return [item for item in (valid_world_id(value) for value in raw) if item]
+
+
+def begin_job(
+    project_id: str,
+    kind: str,
+    *,
+    project_fields: dict | None = None,
+    replace_delayed: bool = False,
+    retire_worlds: str | None = None,
+    charge: bool = True,
+) -> tuple[str, JobRecord | None]:
+    """Mark the project busy and insert its job in one transaction.
+
+    The update matches only when the project has no open job. A unique partial
+    index on ``jobs`` is the backstop. World and staging quota are counted here,
+    before the provider is called. ``replace_delayed`` drops a delayed job so a
+    re-upload can proceed.
+    """
+    try:
+        with session_scope() as session:
+            return _begin_job(
+                session,
+                project_id,
+                kind,
+                project_fields or {},
+                replace_delayed,
+                retire_worlds,
+                charge,
+            )
+    except _EnqueueStop as exc:
+        return exc.outcome, None
+    except IntegrityError:
+        return "busy", None
+
+
+def _begin_job(
+    session: Session,
+    project_id: str,
+    kind: str,
+    project_fields: dict,
+    replace_delayed: bool,
+    retire_worlds: str | None,
+    charge: bool,
+) -> tuple[str, JobRecord]:
+    dialect = session.get_bind().dialect.name
+    query = select(ProjectRow).where(ProjectRow.id == project_id)
+    if dialect == "postgresql":
+        query = query.with_for_update()
+    row = session.scalar(query)
+    if row is None:
+        raise _EnqueueStop("missing")
+    open_jobs = _open_jobs(session, project_id)
+    if open_jobs:
+        if not (replace_delayed and row.status == "delayed"):
+            raise _EnqueueStop("busy")
+        for job in open_jobs:
+            session.delete(job)
+        session.flush()
+    if charge and kind in {"world", "staged_world"} and not charge_world_quota(session, row.owner_device_id):
+        raise _EnqueueStop("quota")
+    if charge and kind == "stage" and not charge_staging_quota(session, row.owner_device_id):
+        raise _EnqueueStop("quota")
+    now = datetime.now(timezone.utc)
+    open_exists = (
+        select(JobRow.id)
+        .where(JobRow.project_id == project_id, JobRow.status.in_(OPEN_JOB_STATUSES))
+        .exists()
+    )
+    marked = session.execute(
+        update(ProjectRow)
+        .where(ProjectRow.id == project_id, ~open_exists)
+        .values(active_job=kind, updated_at=now)
+    )
+    if marked.rowcount != 1:
+        raise _EnqueueStop("busy")
+    session.expire(row)
+    row = session.get(ProjectRow, project_id)
+    if row is None:
+        raise _EnqueueStop("missing")
+    if retire_worlds:
+        _queue_deletes_in_session(session, _world_ids(row, retire_worlds), "replaced by a new capture")
+        clearing = _ORIGINAL_WORLD_FIELDS if retire_worlds == "original" else ()
+        if retire_worlds == "staged":
+            clearing = _STAGED_WORLD_FIELDS
+        if retire_worlds == "all":
+            clearing = _ORIGINAL_WORLD_FIELDS + _STAGED_WORLD_FIELDS
+        for field in clearing:
+            setattr(row, field, None)
+    for key, value in project_fields.items():
+        setattr(row, key, value)
+    row.active_job = kind
+    row.updated_at = now
+    if kind == "stitch":
+        row.status = project_fields.get("status", "stitching")
+    elif kind in {"world", "staged_world"}:
+        row.status = "generating_3d"
+        row.error = None
+        row.provider_error = None
+    elif kind == "stage":
+        row.staging_status = "staging"
+        row.staging_error = None
+    job = JobRow(
+        id=str(uuid4()),
+        project_id=project_id,
+        kind=kind,
+        status="pending",
+        attempt_count=0,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(job)
+    session.flush()
+    return "queued", _job_record(job)
+
+
+def claim_delayed_job(job_id: str) -> JobRecord | None:
+    """Move one delayed job to running. Only the transaction that updates it wins."""
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        dialect = session.get_bind().dialect.name
+        if dialect == "postgresql":
+            locked = session.scalar(
+                select(JobRow.id)
+                .where(JobRow.id == job_id, JobRow.status == "delayed")
+                .with_for_update(skip_locked=True)
+            )
+            if locked is None:
+                return None
+        result = session.execute(
+            update(JobRow)
+            .where(JobRow.id == job_id, JobRow.status == "delayed")
+            .values(status="running", updated_at=now)
+        )
+        if result.rowcount != 1:
+            return None
+        row = session.get(JobRow, job_id)
+        return _job_record(row) if row else None
+
+
+def cancel_delayed_project(project_id: str) -> str | None:
+    """Drop a delayed 3D job and leave the panorama in place. None if it was not delayed."""
+    with session_scope() as session:
+        row = session.get(ProjectRow, project_id)
+        if row is None or row.status != "delayed":
+            return None
+        for job in _open_jobs(session, project_id):
+            session.delete(job)
+        row.status = "stitched" if row.panorama_key else "created"
+        row.active_job = None
+        row.error = None
+        row.provider_error = None
+        row.updated_at = datetime.now(timezone.utc)
+        return row.status
+
+
+def touch_job(job_id: str) -> None:
+    """Refresh ``updated_at`` so another replica does not treat a live job as stale."""
+    with session_scope() as session:
+        session.execute(
+            update(JobRow).where(JobRow.id == job_id).values(updated_at=datetime.now(timezone.utc))
+        )
 
 
 def queue_world_deletes(world_ids: list[str], error: str) -> None:

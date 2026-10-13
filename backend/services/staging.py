@@ -151,6 +151,7 @@ async def _edit_view(
         return image
 
     edited = await produce(prompt)
+    # The structure score is the gate. A prompt cannot waive it.
     if structure_score(original, edited) >= STRUCTURE_MIN:
         return edited, None
     logger.info("Structure check failed at yaw %.0f°, retrying", view.yaw_deg)

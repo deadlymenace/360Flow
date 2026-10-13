@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 from db import get_by_share_token
+from services.world_urls import valid_marble_url
 from routers.responses import jpeg_response, labeled_jpeg
 from storage import get_storage
 from viewer import render_pano_page, render_world_page
@@ -60,12 +61,12 @@ async def view_world(token: str, source: str = Query(default="original")):
     if staged_source and not project.staged_key:
         raise HTTPException(status_code=404, detail="Staged panorama not ready yet")
     if staged_source:
-        marble = project.staged_world_marble_url or project.staged_world_preview_url
+        marble = valid_marble_url(project.staged_world_marble_url) or valid_marble_url(project.staged_world_preview_url)
         preview = bool(marble and project.staged_world_preview_url and not project.staged_world_marble_url)
         generating = project.active_job == "staged_world"
     else:
-        marble = project.world_marble_url or project.world_preview_url
-        preview = bool(marble and project.world_preview_url and not project.world_marble_url)
+        marble = valid_marble_url(project.world_marble_url) or valid_marble_url(project.world_preview_url)
+        preview = bool(marble and valid_marble_url(project.world_preview_url) and not project.world_marble_url)
         generating = project.active_job == "world" or (
             project.status == "generating_3d" and project.active_job != "staged_world"
         )

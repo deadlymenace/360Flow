@@ -74,7 +74,7 @@ def test_resume_repolls_world_operation_without_generating(client, monkeypatch):
     update_job(job.id, status="running", operation_id="op-full", operation_phase="full")
     calls = {"generate": 0, "poll": []}
 
-    async def poll(operation_id: str, timeout_s: int) -> dict:
+    async def poll(operation_id: str, timeout_s: int, on_tick=None) -> dict:
         calls["poll"].append(operation_id)
         assert timeout_s > 0
         return _world(operation_id, "world-resumed")
@@ -107,11 +107,11 @@ def test_resumed_draft_continues_to_the_full_model(client, monkeypatch):
     update_job(job.id, status="running", operation_id="op-draft", operation_phase="draft", media_asset_id="media-1")
     calls = {"generate": 0, "full": 0}
 
-    async def poll(operation_id: str, timeout_s: int) -> dict:
+    async def poll(operation_id: str, timeout_s: int, on_tick=None) -> dict:
         assert operation_id == "op-draft"
         return _world(operation_id, "world-draft")
 
-    async def full(image, label, media_asset_id, on_operation=None, on_submitting=None):
+    async def full(image, label, media_asset_id, on_operation=None, on_submitting=None, on_tick=None):
         calls["full"] += 1
         assert media_asset_id == "media-1"
         assert image == b"panorama"
@@ -235,6 +235,61 @@ def test_out_of_credits_delays_the_tour_until_credits_return(client, monkeypatch
     assert finished["world_marble_url"].endswith("/world-later")
     assert finished["error"] is None
     assert calls["n"] == 2
+
+
+def test_delayed_tour_can_be_retried_or_cancelled(client, monkeypatch):
+    created = client.post("/api/v1/projects", json={"name": "Wait"}).json()
+    project_id = created["id"]
+    key = panorama_key(project_id)
+    get_storage().put_bytes(key, b"panorama", "image/jpeg")
+    update_project(project_id, status="delayed", panorama_key=key, active_job="world", error=WORLD_DELAYED_MESSAGE)
+    job = create_job(project_id, "world")
+    update_job(job.id, status="delayed")
+
+    async def generate(*args, **kwargs):
+        return {
+            "provider": "worldlabs",
+            "world_id": "world-after-retry",
+            "marble_url": "https://marble.worldlabs.ai/world/world-after-retry",
+            "splat_url": None,
+            "mesh_url": None,
+            "thumbnail_url": None,
+            "operation_id": "op-after",
+        }
+
+    monkeypatch.setattr(pipeline, "generate_world", generate)
+    retried = client.post(f"/api/v1/projects/{project_id}/retry")
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["status"] == "complete"
+
+    update_project(project_id, status="delayed", active_job="world", error=WORLD_DELAYED_MESSAGE, panorama_key=key)
+    again = create_job(project_id, "world")
+    update_job(again.id, status="delayed")
+    cancelled = client.post(f"/api/v1/projects/{project_id}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "stitched"
+    body = client.get(f"/api/v1/projects/{project_id}").json()
+    assert body["status"] == "stitched"
+    assert body["has_original"] is True
+    removed = client.delete(f"/api/v1/projects/{project_id}")
+    assert removed.status_code == 204
+
+
+def test_delayed_world_fails_after_the_wait_cap(client):
+    from datetime import datetime, timedelta, timezone
+
+    from services.world_gen import WORLD_DELAY_EXPIRED_MESSAGE
+
+    created = client.post("/api/v1/projects", json={"name": "Too long"}).json()
+    project_id = created["id"]
+    update_project(project_id, status="delayed", active_job="world", error=WORLD_DELAYED_MESSAGE)
+    job = create_job(project_id, "world")
+    update_job(job.id, status="delayed", attempt_count=1, delayed_at=datetime.now(timezone.utc) - timedelta(hours=25))
+    assert asyncio.run(pipeline.retry_delayed_worlds()) == 0
+    body = client.get(f"/api/v1/projects/{project_id}").json()
+    assert body["status"] == "failed"
+    assert body["error"] == WORLD_DELAY_EXPIRED_MESSAGE
+    assert "402" not in body["error"]
 
 
 def test_orphan_transient_project_still_fails_on_startup(client):

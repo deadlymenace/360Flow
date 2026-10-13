@@ -81,6 +81,10 @@ class Settings:
     trusted_proxy_count: int
     gemini_daily_limit: int
     worldlabs_daily_limit: int
+    global_daily_worlds_cap: int
+    world_delay_max_hours: int
+    world_delay_max_attempts: int
+    job_claim_stale_seconds: int
     share_link_ttl_days: int
     embed_frame_ancestors: list[str]
     max_image_pixels: int
@@ -175,6 +179,10 @@ def get_settings() -> Settings:
         trusted_proxy_count=max(0, _int("TRUSTED_PROXY_COUNT", 1)),
         gemini_daily_limit=max(0, _int("GEMINI_JOBS_PER_DEVICE_PER_DAY", 20)),
         worldlabs_daily_limit=max(0, _int("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", 10)),
+        global_daily_worlds_cap=max(0, _int("GLOBAL_DAILY_WORLDS_CAP", 100)),
+        world_delay_max_hours=max(1, _int("WORLD_DELAY_MAX_HOURS", 24)),
+        world_delay_max_attempts=max(1, _int("WORLD_DELAY_MAX_ATTEMPTS", 48)),
+        job_claim_stale_seconds=max(30, _int("JOB_CLAIM_STALE_SECONDS", 120)),
         share_link_ttl_days=max(0, _int("SHARE_LINK_TTL_DAYS", 30)),
         embed_frame_ancestors=ancestors,
         max_image_pixels=max(1, _int("MAX_IMAGE_PIXELS", 24_000_000)),

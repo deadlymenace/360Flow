@@ -10,6 +10,7 @@ import httpx
 
 from config import get_settings
 from db import forget_world_delete, pending_world_delete_ids, queue_world_deletes
+from services.world_urls import valid_marble_url, valid_world_id
 from services.world_gen_mock import mock_generate_3d
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ FULL_WORLD_TIMEOUT_S = 20 * 60
 WORLD_FAILED_MESSAGE = "3D generation failed. Try again."
 WORLD_CREDITS_MESSAGE = "3D generation is unavailable right now (provider credits)."
 WORLD_DELAYED_MESSAGE = "Your 3D tour is delayed, we'll finish it shortly"
+WORLD_DELAY_EXPIRED_MESSAGE = "Your 3D tour could not be finished in time. Try again from the app."
 WORLD_PROVIDER_QUOTA_MESSAGE = "3D generation is unavailable right now (provider quota)."
 
 # Pano world generation. Draft is 150; marble-1.0 / marble-1.1 are 1,500.
@@ -196,8 +198,8 @@ def build_world_request(display_name: str, media_asset_id: str, model: str, publ
 def parse_world(operation: dict) -> dict:
     world = operation.get("response") or {}
     metadata = operation.get("metadata") or {}
-    world_id = world.get("world_id") or world.get("id") or metadata.get("world_id")
-    marble = world.get("world_marble_url")
+    world_id = valid_world_id(world.get("world_id") or world.get("id") or metadata.get("world_id"))
+    marble = valid_marble_url(world.get("world_marble_url"))
     if not marble and world_id:
         marble = f"https://marble.worldlabs.ai/world/{world_id}"
     assets = world.get("assets") or {}
@@ -224,6 +226,7 @@ async def generate_world(
     on_media=None,
     on_operation=None,
     on_submitting=None,
+    on_tick=None,
 ) -> dict:
     """Generate a draft world first, then the full world from the same panorama.
 
@@ -234,7 +237,13 @@ async def generate_world(
     settings = get_settings()
     models = generation_models(settings.worldlabs_draft_model, settings.worldlabs_model)
     if not settings.worldlabs_api_key:
-        return await _mock_world(models, on_preview=on_preview, on_operation=on_operation, on_submitting=on_submitting)
+        return await _mock_world(
+            models,
+            on_preview=on_preview,
+            on_operation=on_operation,
+            on_submitting=on_submitting,
+            on_tick=on_tick,
+        )
 
     headers = {"WLT-Api-Key": settings.worldlabs_api_key}
     timeout = httpx.Timeout(60.0, read=180.0)
@@ -253,20 +262,23 @@ async def generate_world(
             on_preview=on_preview,
             on_operation=on_operation,
             on_submitting=on_submitting,
+            on_tick=on_tick,
         )
 
 
-async def poll_world_operation(operation_id: str, timeout_s: int) -> dict:
+async def poll_world_operation(operation_id: str, timeout_s: int, on_tick=None) -> dict:
     """Poll an operation World Labs already accepted. Does not call worlds:generate."""
     settings = get_settings()
     if not settings.worldlabs_api_key:
+        if on_tick is not None:
+            on_tick()
         result = await mock_generate_3d("memory")
         result["operation_id"] = operation_id
         return result
     headers = {"WLT-Api-Key": settings.worldlabs_api_key}
     timeout = httpx.Timeout(60.0, read=180.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        operation = await _poll_until_done(client, headers, operation_id, timeout_s)
+        operation = await _poll_until_done(client, headers, operation_id, timeout_s, on_tick=on_tick)
     _raise_operation_error(operation)
     return parse_world(operation)
 
@@ -277,12 +289,13 @@ async def continue_full_world(
     media_asset_id: str | None,
     on_operation=None,
     on_submitting=None,
+    on_tick=None,
 ) -> dict:
     """Start the full model after a resumed draft. Does not regenerate the draft."""
     settings = get_settings()
     model = settings.worldlabs_model
     if not settings.worldlabs_api_key:
-        return await _mock_world([model], on_operation=on_operation, on_submitting=on_submitting)
+        return await _mock_world([model], on_operation=on_operation, on_submitting=on_submitting, on_tick=on_tick)
     headers = {"WLT-Api-Key": settings.worldlabs_api_key}
     timeout = httpx.Timeout(60.0, read=180.0)
     await _require_credits(model)
@@ -299,10 +312,13 @@ async def continue_full_world(
             phase="full",
             on_operation=on_operation,
             on_submitting=on_submitting,
+            on_tick=on_tick,
         )
 
 
-async def _mock_world(models: list[str], on_preview=None, on_operation=None, on_submitting=None) -> dict:
+async def _mock_world(models: list[str], on_preview=None, on_operation=None, on_submitting=None, on_tick=None) -> dict:
+    if on_tick is not None:
+        on_tick()
     if on_submitting is not None:
         await on_submitting("draft" if len(models) > 1 else "full")
     if on_operation is not None:
@@ -328,6 +344,7 @@ async def _generate_models(
     on_preview=None,
     on_operation=None,
     on_submitting=None,
+    on_tick=None,
 ) -> dict:
     final = None
     for index, model in enumerate(models):
@@ -345,6 +362,7 @@ async def _generate_models(
                 phase=phase,
                 on_operation=on_operation,
                 on_submitting=on_submitting,
+                on_tick=on_tick,
             )
         except ProviderFailure as exc:
             if phase == "draft" and not _is_out_of_credits(exc):
@@ -374,7 +392,7 @@ async def delete_worlds(world_ids: list[str | None]) -> None:
     the world is already gone.
     """
     settings = get_settings()
-    ids = list(dict.fromkeys(item for item in world_ids if item))
+    ids = list(dict.fromkeys(valid_world_id(item) for item in world_ids if valid_world_id(item)))
     if not ids or not settings.worldlabs_api_key:
         return
     headers = {"WLT-Api-Key": settings.worldlabs_api_key}
@@ -411,6 +429,8 @@ async def retry_pending_world_deletes(*, force: bool = False) -> int:
 
 
 async def _delete_one(client: httpx.AsyncClient, headers: dict, world_id: str) -> tuple[bool, str | None]:
+    if valid_world_id(world_id) is None:
+        return False, "invalid world id"
     url = f"{WORLDLABS_BASE}/marble/v1/worlds/{world_id}"
     try:
         response = await client.delete(url, headers=headers)
@@ -452,6 +472,7 @@ async def _generate_model(
     phase: str = "full",
     on_operation=None,
     on_submitting=None,
+    on_tick=None,
 ) -> dict:
     body = build_world_request(display_name, media_id, model, public)
     await _require_credits(model)
@@ -470,7 +491,7 @@ async def _generate_model(
     if on_operation is not None:
         await on_operation(operation_id, phase)
     clear_world_credits_cache()
-    operation = await _poll_until_done(client, headers, operation_id, timeout_s, operation)
+    operation = await _poll_until_done(client, headers, operation_id, timeout_s, operation, on_tick=on_tick)
     _raise_operation_error(operation)
     parsed = parse_world(operation)
     parsed["model"] = model
@@ -483,10 +504,13 @@ async def _poll_until_done(
     operation_id: str,
     timeout_s: int,
     operation: dict | None = None,
+    on_tick=None,
 ) -> dict:
     operation = operation or {"operation_id": operation_id, "done": False}
     deadline = time.monotonic() + timeout_s
     while not operation.get("done"):
+        if on_tick is not None:
+            on_tick()
         if time.monotonic() > deadline:
             raise ProviderFailure(WORLD_FAILED_MESSAGE, f"HTTP timeout: operation {operation_id} exceeded {timeout_s}s")
         polled = await client.get(f"{WORLDLABS_BASE}/marble/v1/operations/{operation_id}", headers=headers)

@@ -70,9 +70,8 @@ def share_security_headers(query_string: bytes, ancestors: list[str]) -> list[tu
     allowlist so the in-app WebView and listing embeds are not blocked.
     """
     embed = _embed_requested(query_string)
-    if embed:
-        sources = " ".join(ancestors) if ancestors else "*"
-        frame = f"frame-ancestors {sources}"
+    if embed and ancestors:
+        frame = "frame-ancestors " + " ".join(ancestors)
     else:
         frame = "frame-ancestors 'none'"
     policy = (
@@ -163,6 +162,10 @@ class GuardMiddleware:
         if path.startswith("/api/") and not self._within_limit(path, method, headers, ip, settings):
             await _send_json(send, 429, {"detail": "Too many requests"})
             return
+        if path == "/health" and headers.get("x-api-key"):
+            if not limiter.allow(_bucket(headers, ip), settings.rate_limit_per_minute, 60):
+                await _send_json(send, 429, {"detail": "Too many requests"})
+                return
 
         if method == "OPTIONS" and origin:
             if not allowed:

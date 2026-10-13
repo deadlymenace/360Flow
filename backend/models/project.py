@@ -56,7 +56,7 @@ class CreateProjectRequest(BaseModel):
 
 
 class StageRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=2000)
+    prompt: str = Field(min_length=1, max_length=400)
 
 
 class UploadMetadata(BaseModel):

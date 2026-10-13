@@ -126,6 +126,9 @@ def test_share_pages_send_security_headers(client, monkeypatch):
     policy = response.headers["content-security-policy"]
     assert "frame-ancestors 'none'" in policy
     assert "default-src 'none'" in policy
+    embedded_without_allowlist = client.raw.get("/v/missing-token?embed=1")
+    assert "frame-ancestors 'none'" in embedded_without_allowlist.headers["content-security-policy"]
+    assert "frame-ancestors *" not in embedded_without_allowlist.headers["content-security-policy"]
     monkeypatch.setenv("EMBED_FRAME_ANCESTORS", "https://listings.example")
     embedded = client.raw.get("/v/missing-token?embed=1")
     embedded_policy = embedded.headers["content-security-policy"]
@@ -314,3 +317,214 @@ def test_failed_world_deletes_are_retried(client, monkeypatch):
     assert cleared == 1
     assert pending_world_delete_ids(force=True) == []
     assert calls["n"] == 2
+
+
+def test_marble_urls_and_world_ids_are_constrained():
+    from services.world_gen import parse_world
+    from services.world_urls import valid_marble_url, valid_world_id
+
+    assert valid_marble_url("https://marble.worldlabs.ai/world/world-1")
+    assert valid_marble_url("http://marble.worldlabs.ai/world/world-1") is None
+    assert valid_marble_url("https://evil.example/world/world-1") is None
+    assert valid_marble_url("javascript:alert(1)") is None
+    assert valid_world_id("world-1") == "world-1"
+    assert valid_world_id("../secret") is None
+    assert valid_world_id("world/1") is None
+    parsed = parse_world(
+        {
+            "response": {
+                "world_id": "../secret",
+                "world_marble_url": "https://evil.example/world",
+            }
+        }
+    )
+    assert parsed["world_id"] is None
+    assert parsed["marble_url"] is None
+
+
+def test_daily_quota_increment_is_atomic():
+    import threading
+
+    from db import consume_daily_quota
+
+    results: list[bool] = []
+    barrier = threading.Barrier(8)
+
+    def hit() -> None:
+        barrier.wait()
+        results.append(consume_daily_quota("quota-race-device", "worldlabs", 1))
+
+    threads = [threading.Thread(target=hit) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert results.count(True) == 1
+
+
+def test_global_daily_world_cap_is_shared(monkeypatch):
+    from sqlalchemy import delete
+
+    from db import DailyUsageRow, GLOBAL_QUOTA_DEVICE, session_scope
+    from services.quota import consume_world_quota
+
+    with session_scope() as session:
+        session.execute(delete(DailyUsageRow).where(DailyUsageRow.device_id == GLOBAL_QUOTA_DEVICE))
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setenv("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", "10")
+    monkeypatch.setenv("GLOBAL_DAILY_WORLDS_CAP", "2")
+    assert consume_world_quota("global-cap-a") is True
+    assert consume_world_quota("global-cap-b") is True
+    assert consume_world_quota("global-cap-c") is False
+    assert consume_world_quota("global-cap-a") is False
+
+
+def test_one_active_job_per_project(client):
+    import threading
+
+    from db import begin_job, update_project
+    from storage import get_storage, panorama_key
+
+    created = client.post("/api/v1/projects", json={"name": "One job"}).json()
+    project_id = created["id"]
+    key = panorama_key(project_id)
+    get_storage_bytes = b"panorama"
+    get_storage().put_bytes(key, get_storage_bytes, "image/jpeg")
+    update_project(project_id, status="stitched", panorama_key=key, active_job=None)
+    results: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def go() -> None:
+        barrier.wait()
+        results.append(begin_job(project_id, "world")[0])
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sorted(results) == ["busy", "queued"]
+
+
+def test_concurrent_generate_3d_starts_one_world(client, monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from db import update_project
+    from main import app
+    from storage import get_storage, panorama_key
+
+    created = client.post("/api/v1/projects", json={"name": "Double world"}).json()
+    project_id = created["id"]
+    key = panorama_key(project_id)
+    get_storage().put_bytes(key, b"panorama", "image/jpeg")
+    update_project(project_id, status="stitched", panorama_key=key, active_job=None)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = {"n": 0}
+
+    async def fake_generate(*args, **kwargs):
+        calls["n"] += 1
+        started.set()
+        await release.wait()
+        return {
+            "provider": "worldlabs",
+            "world_id": "world-once",
+            "marble_url": "https://marble.worldlabs.ai/world/world-once",
+            "splat_url": None,
+            "mesh_url": None,
+            "thumbnail_url": None,
+            "operation_id": "op-once",
+        }
+
+    monkeypatch.setattr("services.pipeline.generate_world", fake_generate)
+
+    async def race():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+            headers = {"Authorization": f"Bearer {client.token}"}
+            url = f"/api/v1/projects/{project_id}/generate-3d"
+            first_task = asyncio.create_task(http.post(url, headers=headers))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            second = await http.post(url, headers=headers)
+            release.set()
+            first = await first_task
+            return first, second
+
+    first, second = asyncio.run(race())
+    assert calls["n"] == 1
+    assert sorted([first.status_code, second.status_code]) == [200, 409]
+
+
+def test_reupload_queues_old_world_deletes_before_clearing_ids(client):
+    from db import pending_world_delete_ids, update_project
+
+    created = client.post("/api/v1/projects", json={"name": "Replace"}).json()
+    project_id = created["id"]
+    update_project(
+        project_id,
+        status="delayed",
+        active_job="world",
+        world_id="world-old",
+        world_preview_id="draft-old",
+        panorama_key=f"panoramas/{project_id}.jpg",
+    )
+    from db import create_job, update_job
+
+    job = create_job(project_id, "world")
+    update_job(job.id, status="delayed")
+    files = [
+        ("images", (f"{index}.jpg", _real_jpeg(), "image/jpeg"))
+        for index in range(2)
+    ]
+    uploaded = client.post(f"/api/v1/projects/{project_id}/upload", files=files)
+    assert uploaded.status_code == 200, uploaded.text
+    queued = pending_world_delete_ids(force=True)
+    assert "world-old" in queued
+    assert "draft-old" in queued
+    body = client.get(f"/api/v1/projects/{project_id}").json()
+    assert body["world_marble_url"] is None
+
+
+def test_staging_failure_without_a_provider_message_is_failed(client, monkeypatch):
+    from db import update_project
+    from services.staging import StagingProviderError
+    from storage import get_storage, panorama_key
+
+    async def boom(*args, **kwargs):
+        raise StagingProviderError("", None)
+
+    monkeypatch.setattr("services.pipeline.stage_image", boom)
+    created = client.post("/api/v1/projects", json={"name": "Stage blank"}).json()
+    project_id = created["id"]
+    key = panorama_key(project_id)
+    get_storage().put_bytes(key, _real_jpeg(), "image/jpeg")
+    update_project(project_id, status="stitched", panorama_key=key, active_job=None)
+    staged = client.post(f"/api/v1/projects/{project_id}/stage", json={"prompt": "a sofa"})
+    assert staged.status_code == 200, staged.text
+    body = client.get(f"/api/v1/projects/{project_id}/stage/status").json()
+    assert body["status"] == "failed"
+    assert body["error"]
+
+
+def test_health_admin_key_attempts_are_rate_limited(client, monkeypatch):
+    from ratelimit import limiter
+
+    limiter.reset()
+    monkeypatch.setenv("API_KEY", "secret-key")
+    monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "2")
+    assert client.raw.get("/health", headers={"X-API-Key": "nope"}).status_code == 200
+    assert client.raw.get("/health", headers={"X-API-Key": "nope"}).status_code == 200
+    blocked = client.raw.get("/health", headers={"X-API-Key": "nope"})
+    assert blocked.status_code == 429
+    public = client.raw.get("/health")
+    assert public.status_code == 200
+    limiter.reset()
+
+
+def _real_jpeg() -> bytes:
+    image = Image.new("RGB", (64, 48), (30, 60, 90))
+    raw = io.BytesIO()
+    image.save(raw, format="JPEG")
+    return raw.getvalue()

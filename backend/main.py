@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from auth import _admin_key_matches
 from config import get_settings
 from db import fail_interrupted_jobs, init_db
+from db import try_resume_leadership
 from services.pipeline import resume_durable_jobs, retry_delayed_worlds
 from httpguard import GuardMiddleware
 from routers.devices import router as devices_router
@@ -41,6 +42,12 @@ async def lifespan(app: FastAPI):
                 await retry_pending_world_deletes()
             except Exception:
                 logging.getLogger(__name__).exception("World delete retry failed")
+            try:
+                leader, just_acquired = try_resume_leadership()
+                if leader:
+                    await resume_durable_jobs(fresh_running=just_acquired)
+            except Exception:
+                logging.getLogger(__name__).exception("Job resume failed")
             try:
                 await retry_delayed_worlds()
             except Exception:
