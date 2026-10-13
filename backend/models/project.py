@@ -42,6 +42,8 @@ class Project(BaseModel):
     staged_world_preview_url: Optional[str] = None
     staged_world_viewer_url: Optional[str] = None
     staging_notes: Optional[str] = None
+    staging_status: Optional[str] = None
+    staging_error: Optional[str] = None
     active_job: Optional[str] = None
     disclosure: Optional[str] = None
 

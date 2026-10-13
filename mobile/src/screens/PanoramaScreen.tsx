@@ -29,6 +29,7 @@ export default function PanoramaScreen({ navigation, route }: Props) {
   const [prompt, setPrompt] = useState(STAGING_PRESETS[0].prompt);
   const [submitting, setSubmitting] = useState(false);
   const previousStatus = useRef<string | null>(null);
+  const previousStaging = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -38,13 +39,17 @@ export default function PanoramaScreen({ navigation, route }: Props) {
         if (cancelled) return;
         setProject(latest);
         setError(null);
-        if (previousStatus.current === 'staging' && latest.status === 'staged') {
+        if (previousStaging.current === 'staging' && latest.staging_status === 'staged') {
           setMode('compare');
+        }
+        if (previousStaging.current === 'staging' && latest.staging_status === 'failed') {
+          Alert.alert('Staging failed', latest.staging_error || 'Try again');
         }
         if (latest.status === 'failed' && previousStatus.current && previousStatus.current !== 'failed') {
           Alert.alert('Something went wrong', latest.error || 'Try again from this screen.');
         }
         previousStatus.current = latest.status;
+        previousStaging.current = latest.staging_status;
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load the project');
       }
@@ -64,12 +69,19 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     project?.active_job === 'world' ||
     project?.active_job === 'staged_world' ||
     project?.status === 'generating_3d';
+  const originalDraftReady = Boolean(project?.world_preview_url) && !project?.world_marble_url && buildingWorld;
+  const stagedDraftReady =
+    Boolean(project?.staged_world_preview_url) &&
+    !project?.staged_world_marble_url &&
+    project?.active_job === 'staged_world';
   const activity =
-    project?.active_job === 'stage' || project?.status === 'staging'
+    project?.staging_status === 'staging'
       ? 'Staging the room…'
-      : buildingWorld
-        ? 'Creating the 3D walkthrough…'
-        : null;
+      : originalDraftReady || stagedDraftReady
+        ? 'Draft 3D is ready. The full walkthrough is still generating.'
+        : buildingWorld
+          ? 'Creating the 3D walkthrough…'
+          : null;
 
   const handleStage = async () => {
     const text = prompt.trim();
@@ -78,8 +90,12 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     try {
       await api.startStaging(projectId, text);
       setShowStage(false);
-      previousStatus.current = 'staging';
-      setProject((current) => (current ? { ...current, status: 'staging', staging_prompt: text } : current));
+      previousStaging.current = 'staging';
+      setProject((current) =>
+        current
+          ? { ...current, staging_status: 'staging', staging_error: null, staging_prompt: text }
+          : current,
+      );
     } catch (err) {
       Alert.alert('Staging failed', err instanceof Error ? err.message : 'Try again');
     } finally {
@@ -215,16 +231,21 @@ export default function PanoramaScreen({ navigation, route }: Props) {
         {project?.status === 'failed' && project.error ? (
           <Text style={styles.errorDetail}>{project.error}</Text>
         ) : null}
+        {project?.staging_status === 'failed' && project.staging_error ? (
+          <Text style={styles.errorDetail}>{project.staging_error}</Text>
+        ) : null}
         <TouchableOpacity
           style={[styles.primary, !project?.has_original && styles.disabled]}
           disabled={!project?.has_original}
           onPress={() => openWorld('original')}
         >
-          <Text style={styles.primaryText}>View 3D walkthrough</Text>
+          <Text style={styles.primaryText}>
+            {project?.world_preview_url && !project?.world_marble_url ? 'View draft 3D' : 'View 3D walkthrough'}
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.secondary, (!project?.has_original || buildingWorld || project?.status === 'staging') && styles.disabled]}
-          disabled={!project?.has_original || submitting || buildingWorld || project?.status === 'staging'}
+          style={[styles.secondary, (!project?.has_original || buildingWorld || project?.staging_status === 'staging') && styles.disabled]}
+          disabled={!project?.has_original || submitting || buildingWorld || project?.staging_status === 'staging'}
           onPress={() => setShowStage(true)}
         >
           <Text style={styles.secondaryText}>{project?.has_staged ? 'Stage again' : 'Optionally stage furniture'}</Text>
@@ -236,7 +257,11 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             onPress={handleStagedWorld}
           >
             <Text style={styles.secondaryText}>
-              {project.status === 'complete' && project.staged_world_viewer_url ? 'View staged 3D' : 'Create staged 3D'}
+              {project.staged_world_preview_url && !project.staged_world_marble_url
+                ? 'View draft staged 3D'
+                : project.staged_world_marble_url || project.staged_world_viewer_url
+                  ? 'View staged 3D'
+                  : 'Create staged 3D'}
             </Text>
           </TouchableOpacity>
         )}

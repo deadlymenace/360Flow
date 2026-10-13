@@ -63,6 +63,8 @@ def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
         staged_world_preview_url=row.staged_world_preview_url,
         staged_world_viewer_url=f"{share}/world?source=staged" if staged else None,
         staging_notes=row.staging_notes,
+        staging_status=row.staging_status,
+        staging_error=row.staging_error,
         active_job=row.active_job,
         disclosure=DISCLOSURE_TEXT if staged else None,
     )
@@ -77,6 +79,8 @@ def status_body(row: ProjectRecord, request: Request | None = None) -> dict:
         "has_original": bool(row.panorama_key),
         "has_staged": bool(row.staged_key),
         "staging_provider": row.staging_provider,
+        "staging_status": row.staging_status,
+        "staging_error": row.staging_error,
         "world_provider": row.world_provider,
         "world_preview_url": row.world_preview_url,
         "active_job": row.active_job,

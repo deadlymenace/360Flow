@@ -316,3 +316,81 @@ def test_gemini_http_error_fails_the_job(client, monkeypatch):
     assert body["error"] == "Staging failed. Try again."
     assert "test-key" not in body["error"]
     assert "API key not valid" not in body["error"]
+    project = client.get(f"/api/v1/projects/{project_id}").json()
+    assert project["status"] == "complete"
+    assert project["has_original"] is True
+    assert project["world_provider"] == "worldlabs_mock"
+    assert project["error"] is None
+    assert project["staging_status"] == "failed"
+
+
+def test_gemini_quota_does_not_fail_the_project(client, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+
+    class _Response:
+        status_code = 429
+
+        def json(self):
+            return {
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": "You exceeded your current quota, please check your plan and billing details.",
+                }
+            }
+
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return _Response()
+
+    monkeypatch.setattr("services.staging.httpx.AsyncClient", _Client)
+    created = client.post("/api/v1/projects", json={"name": "Quota"}).json()
+    project_id = created["id"]
+    files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+    uploaded = client.post(
+        f"/api/v1/projects/{project_id}/upload",
+        files=files,
+        data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    staged = client.post(f"/api/v1/projects/{project_id}/stage", json={"prompt": "a sofa"})
+    assert staged.status_code == 200
+    body = client.get(f"/api/v1/projects/{project_id}/stage/status").json()
+    assert body["status"] == "failed"
+    assert body["error"] == "AI staging is unavailable right now (provider quota)"
+    assert "exceeded" not in body["error"]
+    project = client.get(f"/api/v1/projects/{project_id}").json()
+    assert project["status"] == "complete"
+    assert project["has_original"] is True
+    assert project["has_staged"] is False
+    world = client.get(f"/api/v1/projects/{project_id}/generate-3d/status").json()
+    assert world["status"] == "complete"
+    assert world["assets"]["viewer_url"].endswith("/world")
+
+
+def test_share_page_shows_draft_world_while_full_world_generates(client):
+    from db import update_project
+
+    created = client.post("/api/v1/projects", json={"name": "Draft room"}).json()
+    update_project(
+        created["id"],
+        status="generating_3d",
+        active_job="world",
+        panorama_key=f"panoramas/{created['id']}.jpg",
+        world_preview_url="https://marble.worldlabs.ai/world/draft-1",
+        world_preview_id="draft-1",
+    )
+    page = client.get(f"/v/{created['share_token']}/world")
+    assert page.status_code == 200
+    assert "https://marble.worldlabs.ai/world/draft-1" in page.text
+    assert "Fast 3D preview" in page.text
+    assert "still generating" in page.text

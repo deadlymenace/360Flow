@@ -205,6 +205,8 @@ async def upload_images(
         staged_world_operation_id=None,
         staged_world_preview_id=None,
         staging_notes=None,
+        staging_status=None,
+        staging_error=None,
         active_job="stitch",
     )
     logger.info("Project %s: stored %d images", project_id, count)
@@ -265,10 +267,12 @@ async def stage_project(project_id: str, req: StageRequest, request: Request):
     if not project.panorama_key:
         raise HTTPException(status_code=400, detail="No panorama available to stage")
     _reject_if_busy(project.status)
-    update_project(project_id, staging_prompt=req.prompt, status="staging", error=None)
+    if project.staging_status == "staging" and not get_settings().jobs_inline:
+        raise HTTPException(status_code=409, detail="This project is already processing")
+    update_project(project_id, staging_prompt=req.prompt, staging_status="staging", staging_error=None)
     await enqueue(run_stage(project_id))
     latest = get_project(project_id)
-    return {"status": latest.status if latest else "staging", "prompt": req.prompt}
+    return {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
 
 
 @router.get("/projects/{project_id}/stage/status")
@@ -277,14 +281,20 @@ async def get_stage_status(project_id: str, request: Request):
     provider = project.staging_provider
     if provider is None:
         provider = "gemini" if get_settings().gemini_api_key else "gemini_mock"
+    if project.staging_status:
+        stage_state = project.staging_status
+    elif project.staged_key:
+        stage_state = "staged"
+    else:
+        stage_state = "idle"
     return {
-        "status": project.status,
+        "status": stage_state,
         "prompt": project.staging_prompt,
         "provider": provider,
         "has_staged": bool(project.staged_key),
         "disclosure": DISCLOSURE_TEXT if project.staged_key else None,
         "notes": project.staging_notes,
-        "error": project.error,
+        "error": project.staging_error,
     }
 
 

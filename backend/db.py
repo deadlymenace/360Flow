@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, inspect, select, text
+from sqlalchemy import DateTime, Float, Integer, String, Text, create_engine, inspect, or_, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from config import Settings, get_settings
@@ -68,6 +68,8 @@ class ProjectRow(Base):
     staged_world_operation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     staged_world_preview_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     staging_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staging_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    staging_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     active_job: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
@@ -83,6 +85,8 @@ _EXTRA_COLUMNS = {
     "staged_world_thumbnail_url": "TEXT",
     "staged_world_operation_id": "VARCHAR(64)",
     "staging_notes": "TEXT",
+    "staging_status": "VARCHAR(32)",
+    "staging_error": "TEXT",
     "active_job": "VARCHAR(32)",
     "owner_device_id": "VARCHAR(36)",
     "staged_world_preview_id": "VARCHAR(64)",
@@ -126,6 +130,8 @@ class ProjectRecord:
     staged_world_operation_id: str | None
     staged_world_preview_id: str | None
     staging_notes: str | None
+    staging_status: str | None
+    staging_error: str | None
     active_job: str | None
 
 
@@ -216,6 +222,8 @@ def _record(row: ProjectRow) -> ProjectRecord:
         staged_world_operation_id=row.staged_world_operation_id,
         staged_world_preview_id=row.staged_world_preview_id,
         staging_notes=row.staging_notes,
+        staging_status=row.staging_status,
+        staging_error=row.staging_error,
         active_job=row.active_job,
     )
 
@@ -309,19 +317,34 @@ def update_project(project_id: str, **fields: object) -> ProjectRecord | None:
 
 
 def fail_interrupted_jobs() -> int:
-    """In-process jobs do not survive a restart. Mark them so the app can retry."""
+    """In-process jobs do not survive a restart. Mark them so the app can retry.
+
+    A staging job that was in progress fails on its own status. A finished
+    panorama and 3D world stay available.
+    """
     with session_scope() as session:
-        rows = session.scalars(select(ProjectRow).where(ProjectRow.status.in_(TRANSIENT_STATUSES))).all()
+        rows = session.scalars(
+            select(ProjectRow).where(
+                or_(
+                    ProjectRow.status.in_(TRANSIENT_STATUSES),
+                    ProjectRow.staging_status == "staging",
+                )
+            )
+        ).all()
         now = datetime.now(timezone.utc)
         for row in rows:
-            previous = row.status
-            row.status = "failed"
-            if not row.active_job:
-                row.active_job = {
-                    "stitching": "stitch",
-                    "staging": "stage",
-                    "generating_3d": "world",
-                }.get(previous, "stitch")
-            row.error = "Processing was interrupted by a server restart. Retry from the app."
+            if row.status in TRANSIENT_STATUSES:
+                previous = row.status
+                row.status = "failed"
+                if not row.active_job:
+                    row.active_job = {
+                        "stitching": "stitch",
+                        "staging": "stage",
+                        "generating_3d": "world",
+                    }.get(previous, "stitch")
+                row.error = "Processing was interrupted by a server restart. Retry from the app."
+            if row.staging_status == "staging":
+                row.staging_status = "failed"
+                row.staging_error = "Staging was interrupted by a server restart. Try staging again."
             row.updated_at = now
         return len(rows)

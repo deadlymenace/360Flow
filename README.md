@@ -9,7 +9,7 @@ The working app is the Expo project in `mobile/`. The API is the FastAPI service
 1. On an iPhone 11 or newer, the app captures 16 portrait ultra-wide photos at 22.5° steps and records each shot's yaw and horizontal field of view.
 2. The API stitches those photos into an exact 2:1 equirectangular JPEG. The left and right edges are sealed so they match. A 16-shot ring covers about ±54° of latitude, so the zenith and nadir are inpainted caps, not photographed ceiling and floor. Optional upward and downward shots can be added later if the ceiling and floor need real geometry.
 3. The app and the public share page show the panorama immediately.
-4. World Labs Marble builds a 3D walkthrough from that original panorama (`is_pano`). A fast draft (`marble-1.0-draft`, about 20 seconds) is stored first, then the full world (`marble-1.1`, about 5 minutes).
+4. World Labs Marble builds a 3D walkthrough from that original panorama (`is_pano`). A fast draft (`marble-1.0-draft`, about 20 seconds) is shown while the full world (`marble-1.1`) generates. Full worlds have taken about 10 minutes, and the client keeps polling for at least 15.
 5. Staging is optional. A prompt or furniture preset asks Gemini to add furniture and decor on five overlapping views, keeping the original ceiling and floor. The unstaged panorama stays stored. Every staged view, every staged 3D world, and every exported staged JPEG carries the label **Virtually staged (AI)** and can be compared with the original. A staged panorama can get its own 3D world.
 
 ## Run it locally
@@ -87,9 +87,9 @@ An iOS build that you can install through TestFlight needs an Apple Developer ac
 
 Project records use `gemini_mock` / `gemini` and `worldlabs_mock` / `worldlabs`.
 
-Leave `GEMINI_API_KEY` unset and staging applies a local color grade. It does not add furniture. Set the key and the API calls the [Gemini image API](https://ai.google.dev/gemini-api/docs/image-generation): `POST https://generativelanguage.googleapis.com/v1/models/{model}:generateContent` with header `x-goog-api-key`, inline JPEG bytes, and `responseModalities` of `TEXT` and `IMAGE`. The default model is `gemini-nano-banana-2.1` (Nano Banana 2.1). `gemini-3.1-flash-image` (Nano Banana 2) is deprecated and has no published shutdown date; new projects should stay on 2.1. Override with `GEMINI_MODEL` if you need a different id. A key that the API rejects fails the staging job and names Gemini in the error. It does not silently fall back to the mock.
+Leave `GEMINI_API_KEY` unset and staging applies a local color grade. It does not add furniture. Set the key and the API calls the [Gemini image API](https://ai.google.dev/gemini-api/docs/image-generation): `POST https://generativelanguage.googleapis.com/v1/models/{model}:generateContent` with header `x-goog-api-key`, inline JPEG bytes, and `responseModalities` of `TEXT` and `IMAGE`. The default model is `gemini-3.1-flash-image`. Override with `GEMINI_MODEL` if you need a different id. A provider quota or `429 RESOURCE_EXHAUSTED` response tells the client `AI staging is unavailable right now (provider quota)`. Any other Gemini failure says `Staging failed. Try again.` and leaves the panorama and 3D world in place. Staging status is stored separately from the project status. It does not silently fall back to the mock.
 
-Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the panorama on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean panorama (the original, or the unlabeled staged JPEG for a staged world) and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true`. The draft model `marble-1.0-draft` runs first. Its world id is stored while `marble-1.1` (`WORLDLABS_MODEL`) continues. A draft failure is logged and the full model still runs. Set `WORLDLABS_DRAFT_MODEL` to `off` to skip the draft. Worlds are private unless `WORLDLABS_PUBLIC` is true. The name sent to Marble is the project id. Deleting a capture deletes the draft world, the full world, and the same pair for a staged world. A world that finishes after the capture was deleted is deleted too.
+Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the panorama on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean panorama (the original, or the unlabeled staged JPEG for a staged world) and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true`. The draft model `marble-1.0-draft` runs first. Its world id and Marble URL are stored while `marble-1.1` (`WORLDLABS_MODEL`) continues, and the app shows that draft. A draft failure is logged and the full model still runs. The full-world poll waits 20 minutes. Set `WORLDLABS_DRAFT_MODEL` to `off` to skip the draft. Worlds are private unless `WORLDLABS_PUBLIC` is true. The name sent to Marble is the project id. Deleting a capture deletes the draft world, the full world, and the same pair for a staged world. A world that finishes after the capture was deleted is deleted too.
 
 ## Staging label and preservation
 
@@ -160,7 +160,7 @@ Backend (`backend/.env.example`):
 | `S3_REGION` | `auto` for R2 |
 | `CORS_ORIGINS` | Comma-separated browser origins. Empty allows none |
 | `GEMINI_API_KEY` | Blank uses the staging mock |
-| `GEMINI_MODEL` | Default `gemini-nano-banana-2.1` |
+| `GEMINI_MODEL` | Default `gemini-3.1-flash-image` |
 | `GEMINI_IMAGE_SIZE` | `1K`, `2K`, or `4K` (default `1K`) |
 | `WORLDLABS_API_KEY` | Blank uses the world mock |
 | `WORLDLABS_DRAFT_MODEL` | Default `marble-1.0-draft`. `off` skips the fast preview |

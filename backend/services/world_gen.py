@@ -14,6 +14,10 @@ from services.world_gen_mock import mock_generate_3d
 logger = logging.getLogger(__name__)
 
 WORLDLABS_BASE = "https://api.worldlabs.ai"
+# Draft worlds finish in seconds. Full worlds have taken about 9 minutes,
+# so the poll loop waits at least 15 and keeps a few minutes of headroom.
+DRAFT_WORLD_TIMEOUT_S = 4 * 60
+FULL_WORLD_TIMEOUT_S = 20 * 60
 
 
 def generation_models(draft_model: str | None, full_model: str) -> list[str]:
@@ -91,7 +95,7 @@ async def generate_world(image_bytes: bytes, display_name: str, on_preview=None)
         media_id = await _upload_panorama(client, headers, image_bytes)
         final = None
         for index, model in enumerate(models):
-            timeout_s = 4 * 60 if index < len(models) - 1 else 20 * 60
+            timeout_s = DRAFT_WORLD_TIMEOUT_S if index < len(models) - 1 else FULL_WORLD_TIMEOUT_S
             try:
                 parsed = await _generate_model(
                     client, headers, display_name, media_id, model, settings.worldlabs_public, timeout_s

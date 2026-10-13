@@ -162,7 +162,7 @@ def get_settings() -> Settings:
         device_registrations_per_hour=max(1, _int("DEVICE_REGISTRATIONS_PER_HOUR", 30)),
         max_image_pixels=max(1, _int("MAX_IMAGE_PIXELS", 24_000_000)),
         gemini_api_key=_blank("GEMINI_API_KEY"),
-        gemini_model=_blank("GEMINI_MODEL") or "gemini-nano-banana-2.1",
+        gemini_model=_blank("GEMINI_MODEL") or "gemini-3.1-flash-image",
         gemini_image_size=image_size,
         worldlabs_api_key=_blank("WORLDLABS_API_KEY"),
         worldlabs_model=_blank("WORLDLABS_MODEL") or "marble-1.1",

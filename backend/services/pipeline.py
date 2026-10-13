@@ -15,7 +15,7 @@ from pathlib import Path
 
 from config import get_settings
 from db import ProjectRecord, get_project, update_project
-from services.staging import stage_image
+from services.staging import StagingProviderError, stage_image
 from services.stitcher import stitch_images
 from services.world_gen import delete_worlds, generate_world, world_display_name
 from storage import delete_project_assets, get_storage, panorama_key, staged_key
@@ -111,7 +111,12 @@ async def run_stitch(project_id: str) -> None:
 
 
 async def run_stage(project_id: str) -> None:
-    update_project(project_id, status="staging", error=None, active_job="stage")
+    """Stage without changing the capture status.
+
+    The panorama and 3D world stay available when staging fails. Progress and
+    errors live on staging_status and staging_error.
+    """
+    update_project(project_id, staging_status="staging", staging_error=None)
     try:
         project = _require(project_id)
         if not project.panorama_key or not project.staging_prompt:
@@ -125,23 +130,28 @@ async def run_stage(project_id: str) -> None:
         storage.put_bytes(key, staged_bytes, "image/jpeg")
         saved = update_project(
             project_id,
-            status="staged",
+            staging_status="staged",
             staged_key=key,
             staging_provider=provider,
             staging_notes=notes,
-            active_job=None,
-            error=None,
+            staging_error=None,
         )
         if saved is None:
             delete_project_assets(project_id)
             return
         logger.info("Project %s staged via %s", project_id, provider)
-    except Exception as exc:
-        if _deleted(project_id):
-            logger.info("Project %s deleted during staging", project_id)
-            return
-        logger.exception("Project %s staging failed", project_id)
-        update_project(project_id, status="failed", error="Staging failed. Try again.")
+    except StagingProviderError as exc:
+        _fail_stage(project_id, exc.client_message)
+    except Exception:
+        _fail_stage(project_id, "Staging failed. Try again.")
+
+
+def _fail_stage(project_id: str, message: str) -> None:
+    if _deleted(project_id):
+        logger.info("Project %s deleted during staging", project_id)
+        return
+    logger.exception("Project %s staging failed", project_id)
+    update_project(project_id, staging_status="failed", staging_error=message)
 
 
 async def run_world(project_id: str, source: str = "original") -> None:

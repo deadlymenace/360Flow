@@ -25,6 +25,8 @@ export interface Project {
   staged_world_preview_url: string | null;
   staged_world_viewer_url: string | null;
   staging_notes: string | null;
+  staging_status: 'staging' | 'staged' | 'failed' | null;
+  staging_error: string | null;
   active_job: string | null;
   disclosure: string | null;
 }
@@ -48,6 +50,8 @@ export interface StatusResponse {
   has_original?: boolean;
   has_staged?: boolean;
   staging_provider?: string | null;
+  staging_status?: 'staging' | 'staged' | 'failed' | null;
+  staging_error?: string | null;
   world_provider?: string | null;
   world_preview_url?: string | null;
   active_job?: string | null;
@@ -89,6 +93,9 @@ export interface CaptureSegment {
   actualYaw: number | null;
   capturedAt: Date | null;
 }
+
+/** Full Marble worlds have taken about 9 minutes. Keep polling at least this long. */
+export const WORLD_GENERATION_WAIT_MS = 15 * 60 * 1000;
 
 export const SEGMENT_COUNT = 16;
 export const SEGMENT_ANGLE = 360 / SEGMENT_COUNT; // 22.5°
