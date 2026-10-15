@@ -13,11 +13,12 @@
       "backgroundColor": "#1a1a2e"
     },
     "ios": {
-      "supportsTablet": true,
+      "supportsTablet": false,
       "bundleIdentifier": "com.threesixtyflow.app",
       "infoPlist": {
-        "NSCameraUsageDescription": "360Flow needs camera access to capture panoramic photos of rooms.",
-        "NSMotionUsageDescription": "360Flow uses motion sensors to guide you through a 360° rotation.",
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "360Flow uses the camera to take 16 guided photos that are stitched into a 360° panorama of the room.",
+        "NSMotionUsageDescription": "360Flow uses motion sensors to guide capture, showing when to turn and when the phone is level for each of the 16 photos.",
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
         }
@@ -40,13 +41,13 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "360Flow needs camera access to capture panoramic photos of rooms."
+          "cameraPermission": "360Flow uses the camera to take 16 guided photos that are stitched into a 360° panorama of the room."
         }
       ],
       [
         "expo-sensors",
         {
-          "motionPermission": "360Flow uses motion sensors to guide you through a 360° rotation."
+          "motionPermission": "360Flow uses motion sensors to guide capture, showing when to turn and when the phone is level for each of the 16 photos."
         }
       ],
       "expo-secure-store"

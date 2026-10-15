@@ -62,7 +62,7 @@ npx tsc --noEmit
 
 ### Installed builds
 
-`mobile/eas.json` is set up for EAS Build. Set `EXPO_PUBLIC_API_URL` in the EAS environment for the build profile. Do not commit that value, and do not set `API_KEY` in the app environment. If a build already shipped with `EXPO_PUBLIC_API_KEY`, rotate `API_KEY` after deploy.
+`mobile/eas.json` is set up for EAS Build. The preview and production profiles set `EXPO_PUBLIC_API_URL` to `https://backend-production-adb6.up.railway.app`. That host is the staging API, the only backend for now, and both profiles should move to a production URL when one exists. Do not set `API_KEY` in the app environment. If a build already shipped with `EXPO_PUBLIC_API_KEY`, rotate `API_KEY` after deploy.
 
 ```bash
 cd mobile
@@ -192,7 +192,7 @@ Mobile (`mobile/.env.example`):
 
 | Variable | Purpose |
 | --- | --- |
-| `EXPO_PUBLIC_API_URL` | Backend origin for dev and installed builds |
+| `EXPO_PUBLIC_API_URL` | Backend origin for dev and installed builds. Preview and production EAS profiles currently use the staging Railway URL |
 
 ## Privacy
 
