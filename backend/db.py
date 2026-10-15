@@ -190,9 +190,9 @@ _JOB_EXTRA_COLUMNS = {
     "attempt_count": "INTEGER NOT NULL DEFAULT 0",
     "delayed_at": "TIMESTAMP",
     "lease_owner": "VARCHAR(64)",
-    "lease_expires_at": "TIMESTAMP",
+    "lease_expires_at": "TIMESTAMP WITH TIME ZONE",
     "rate_limit_attempts": "INTEGER NOT NULL DEFAULT 0",
-    "rate_limit_started_at": "TIMESTAMP",
+    "rate_limit_started_at": "TIMESTAMP WITH TIME ZONE",
 }
 
 
@@ -273,9 +273,7 @@ def init_db(settings: Settings | None = None) -> None:
         _leader_flag = False
     if _engine is not None:
         _engine.dispose()
-    connect_args = {}
-    if settings.database_url.startswith("sqlite"):
-        connect_args["check_same_thread"] = False
+    connect_args = _database_connect_args(settings.database_url)
     _engine = create_engine(settings.database_url, connect_args=connect_args, pool_pre_ping=True)
     Base.metadata.create_all(_engine)
     _ensure_columns(_engine)
@@ -309,6 +307,20 @@ def _ensure_columns(engine) -> None:
         )
 
 
+def _database_connect_args(database_url: str) -> dict:
+    """SQLite stays single-threaded. Postgres sessions pin UTC.
+
+    Lease and rate-limit instants are ``timestamptz``. Older ``timestamp``
+    columns are still read as UTC, which matches how they were written.
+    """
+    if database_url.startswith("sqlite"):
+        return {"check_same_thread": False}
+    return {"options": "-c timezone=UTC"}
+
+
+_LEASE_TZ_COLUMNS = ("lease_expires_at", "rate_limit_started_at")
+
+
 def _ensure_job_schema(engine) -> None:
     """Add job columns and the one-open-job index on databases created before them."""
     tables = set(inspect(engine).get_table_names())
@@ -319,10 +331,40 @@ def _ensure_job_schema(engine) -> None:
         for name, ddl in _JOB_EXTRA_COLUMNS.items():
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}"))
+        if engine.dialect.name == "postgresql":
+            _promote_lease_timestamps(conn, existing)
         conn.execute(
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_open_per_project "
                 "ON jobs (project_id) WHERE status IN ('pending', 'running', 'delayed')"
+            )
+        )
+
+
+def _promote_lease_timestamps(conn, existing: set[str]) -> None:
+    """Turn pre-existing naive lease timestamps into ``timestamptz``.
+
+    Those values were written as UTC. ``AT TIME ZONE 'UTC'`` keeps that instant
+    when the column gains a time zone.
+    """
+    for name in _LEASE_TZ_COLUMNS:
+        if name not in existing:
+            continue
+        data_type = conn.execute(
+            text(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'jobs' AND column_name = :name"
+            ),
+            {"name": name},
+        ).scalar()
+        if str(data_type or "").lower() != "timestamp without time zone":
+            continue
+        conn.execute(
+            text(
+                f"ALTER TABLE jobs ALTER COLUMN {name} "
+                f"TYPE TIMESTAMP WITH TIME ZONE "
+                f"USING {name} AT TIME ZONE 'UTC'"
             )
         )
 
@@ -610,7 +652,7 @@ def _lease_is_available(row: JobRow, owner: str, now: datetime) -> bool:
     """True when ``owner`` may take the row: nobody holds it, or it expired."""
     if row.lease_expires_at is None:
         return True
-    if _as_utc(row.lease_expires_at) < now:
+    if _as_utc(row.lease_expires_at) <= now:
         return True
     return row.lease_owner == owner
 

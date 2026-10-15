@@ -122,7 +122,11 @@ def extract_gemini_image(body: dict) -> bytes:
     raise GeminiTextOnly(detail or "Gemini did not return an image")
 
 
-async def stage_image(image_bytes: bytes, user_prompt: str) -> tuple[bytes, str, str | None]:
+async def stage_image(
+    image_bytes: bytes,
+    user_prompt: str,
+    before_generate=None,
+) -> tuple[bytes, str, str | None]:
     """Return a clean staged JPEG, the provider id, and any structure notes.
 
     The disclosure banner is applied later, when the image is served.
@@ -139,7 +143,9 @@ async def stage_image(image_bytes: bytes, user_prompt: str) -> tuple[bytes, str,
     style_part = style_content_part(user_prompt)
     for view in views:
         instructions = build_staging_prompt(perspective=True, yaw_deg=view.yaw_deg)
-        image, note = await _edit_view(view, instructions, style_part, settings)
+        image, note = await _edit_view(
+            view, instructions, style_part, settings, before_generate=before_generate
+        )
         edited.append(PerspectiveView(view.yaw_deg, view.hfov_deg, image))
         if note:
             notes.append(note)
@@ -153,10 +159,13 @@ async def _edit_view(
     instructions: str,
     style_part: str,
     settings,
+    before_generate=None,
 ) -> tuple[np.ndarray, str | None]:
     original = view.image
 
     async def produce(text: str) -> np.ndarray:
+        if before_generate is not None:
+            before_generate()
         if not settings.gemini_api_key:
             return apply_mock_grade(original)
         raw = await _gemini_edit(

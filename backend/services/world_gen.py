@@ -135,18 +135,27 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
 # Set by the job runner. Counts every HTTP 429 for one job, across polls and
 # generate calls, and raises RateLimitExceeded when the job's budget is spent.
 _rate_limit_hook: ContextVar = ContextVar("worldlabs_rate_limit_hook", default=None)
+_rate_limit_success_hook: ContextVar = ContextVar("worldlabs_rate_limit_success_hook", default=None)
 
 
-def bind_rate_limit_hook(hook):
-    return _rate_limit_hook.set(hook)
+def bind_rate_limit_hook(hook, on_success=None):
+    return (_rate_limit_hook.set(hook), _rate_limit_success_hook.set(on_success))
 
 
 def reset_rate_limit_hook(token) -> None:
-    _rate_limit_hook.reset(token)
+    limit_token, success_token = token
+    _rate_limit_hook.reset(limit_token)
+    _rate_limit_success_hook.reset(success_token)
 
 
 def _note_rate_limit() -> None:
     hook = _rate_limit_hook.get()
+    if hook is not None:
+        hook()
+
+
+def _note_rate_limit_success() -> None:
+    hook = _rate_limit_success_hook.get()
     if hook is not None:
         hook()
 
@@ -163,6 +172,8 @@ async def _send_retrying_rate_limit(send):
     for attempt in range(1, attempts + 1):
         response = await send()
         if response.status_code != 429:
+            if 200 <= response.status_code < 300:
+                _note_rate_limit_success()
             return response
         _note_rate_limit()
         if attempt == attempts:

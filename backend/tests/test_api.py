@@ -514,7 +514,9 @@ def test_paid_staging_respects_the_daily_quota(client, monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-test")
     monkeypatch.setenv("GEMINI_JOBS_PER_DEVICE_PER_DAY", "1")
 
-    async def fake_stage(image_bytes, prompt):
+    async def fake_stage(image_bytes, prompt, before_generate=None):
+        if before_generate is not None:
+            before_generate()
         return image_bytes, "gemini", None
 
     monkeypatch.setattr("services.pipeline.stage_image", fake_stage)

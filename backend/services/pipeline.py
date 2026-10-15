@@ -274,8 +274,21 @@ def _require_lease(job_id: str | None) -> None:
     if not job_id:
         return
     job = get_job(job_id)
-    if job is None or job.lease_owner != WORKER_ID:
+    now = datetime.now(timezone.utc)
+    if (
+        job is None
+        or job.lease_owner != WORKER_ID
+        or job.lease_expires_at is None
+        or _as_utc(job.lease_expires_at) <= now
+    ):
         raise LeaseLost()
+
+
+def _lease_still_held(job_id: str) -> bool:
+    job = get_job(job_id)
+    if job is None or job.lease_owner != WORKER_ID or job.lease_expires_at is None:
+        return False
+    return _as_utc(job.lease_expires_at) > datetime.now(timezone.utc)
 
 
 def _rate_limit_already_exceeded(job: JobRecord) -> bool:
@@ -305,19 +318,59 @@ def note_world_rate_limit(job_id: str) -> None:
         )
 
 
-async def _lease_heartbeat(job_id: str, stop: asyncio.Event) -> None:
-    """Renew the lease for the whole run, including waits and provider sleeps."""
+def clear_world_rate_limit(job_id: str) -> None:
+    """A successful poll or generate ends the current 429 window."""
+    job = get_job(job_id)
+    if job is None or (job.rate_limit_attempts == 0 and job.rate_limit_started_at is None):
+        return
+    update_job(job_id, rate_limit_attempts=0, rate_limit_started_at=None)
+
+
+# How long to wait before retrying a lease renewal that raised.
+_LEASE_RENEW_BACKOFF_SECONDS = 1.0
+
+
+async def _lease_heartbeat(job_id: str, stop: asyncio.Event, on_lost) -> None:
+    """Renew the lease for the whole run, including waits and provider sleeps.
+
+    A transient database error is retried while this process still holds an
+    unexpired lease. A real loss cancels the job so it cannot call a paid API.
+    """
     interval = get_settings().job_lease_heartbeat_seconds
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
             return
         except asyncio.TimeoutError:
-            if not renew_job_lease(job_id, WORKER_ID):
-                logger.warning("Lost the lease for job %s", job_id)
-                return
+            pass
         except asyncio.CancelledError:
+            raise
+        held = await _renew_lease(job_id, stop)
+        if held is None:
             return
+        if not held:
+            logger.warning("Lost the lease for job %s", job_id)
+            on_lost()
+            return
+
+
+async def _renew_lease(job_id: str, stop: asyncio.Event) -> bool | None:
+    """True when the lease was renewed. None when the heartbeat was stopped."""
+    while not stop.is_set():
+        try:
+            return renew_job_lease(job_id, WORKER_ID)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Lease renewal for job %s failed", job_id)
+            if not _lease_still_held(job_id):
+                return False
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=_LEASE_RENEW_BACKOFF_SECONDS)
+                return None
+            except asyncio.TimeoutError:
+                continue
+    return None
 
 
 async def run_job(job_id: str) -> None:
@@ -331,19 +384,28 @@ async def run_job(job_id: str) -> None:
     keep = False
     owned = False
     abandoned = False
+    lost = False
+    job_task = asyncio.current_task()
+
+    def _on_lease_lost() -> None:
+        nonlocal lost
+        lost = True
+        if job_task is not None and not job_task.done():
+            job_task.cancel()
+
     try:
         job = claim_job_lease(job_id, WORKER_ID)
         if job is None:
             return
         owned = True
-        heart = asyncio.create_task(_lease_heartbeat(job_id, stop))
+        heart = asyncio.create_task(_lease_heartbeat(job_id, stop, _on_lease_lost))
         async with runner._limit():
             try:
                 _require_lease(job_id)
                 if job.kind == "stitch":
                     follow = await run_stitch(job.project_id)
                 elif job.kind == "stage":
-                    await run_stage(job.project_id, resume=False)
+                    await run_stage(job.project_id, resume=False, job_id=job_id)
                 elif job.kind in {"world", "staged_world"}:
                     async with world_limit():
                         _require_lease(job_id)
@@ -355,6 +417,12 @@ async def run_job(job_id: str) -> None:
             except LeaseLost:
                 abandoned = True
                 logger.warning("Job %s lost its lease before a paid call; leaving it for the new owner", job_id)
+            except asyncio.CancelledError:
+                if lost:
+                    abandoned = True
+                    logger.warning("Job %s lost its lease; leaving it for the new owner", job_id)
+                else:
+                    raise
     finally:
         stop.set()
         if heart is not None:
@@ -425,7 +493,7 @@ async def run_stitch(project_id: str) -> str | None:
     return "world"
 
 
-async def run_stage(project_id: str, *, resume: bool = False) -> None:
+async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None = None) -> None:
     """Stage without changing the capture status.
 
     The panorama and 3D world stay available when staging fails. Progress and
@@ -442,7 +510,13 @@ async def run_stage(project_id: str, *, resume: bool = False) -> None:
             raise RuntimeError("No panorama available to stage")
         storage = get_storage()
         original = storage.get_bytes(project.panorama_key)
-        staged_bytes, provider, notes = await stage_image(original, project.staging_prompt)
+
+        def before_generate() -> None:
+            _require_lease(job_id)
+
+        staged_bytes, provider, notes = await stage_image(
+            original, project.staging_prompt, before_generate=before_generate
+        )
         if _deleted(project_id):
             return
         key = staged_key(project_id)
@@ -494,7 +568,10 @@ async def run_world(
 ) -> str | None:
     token = None
     if job_id:
-        token = bind_rate_limit_hook(lambda: note_world_rate_limit(job_id))
+        token = bind_rate_limit_hook(
+            lambda: note_world_rate_limit(job_id),
+            lambda: clear_world_rate_limit(job_id),
+        )
     try:
         return await _run_world(project_id, source, job_id, resume=resume)
     finally:
@@ -549,6 +626,7 @@ async def _run_world(
                 update_job(job_id, media_asset_id=media_id)
 
         async def on_submitting(phase: str) -> None:
+            _require_lease(job_id)
             if job_id:
                 update_job(job_id, operation_phase="submitting", status="running")
 
@@ -632,6 +710,7 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
             _require_lease(job.id)
 
             async def on_submitting(_phase: str) -> None:
+                _require_lease(job.id)
                 update_job(job.id, operation_phase="submitting", status="running")
 
             async def on_operation(operation_id: str, next_phase: str) -> None:

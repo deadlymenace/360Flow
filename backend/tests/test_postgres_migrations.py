@@ -103,7 +103,9 @@ def test_postgres_migration_adds_every_column():
     job_columns = {column["name"] for column in inspect(engine).get_columns("jobs")}
     assert {"lease_owner", "lease_expires_at", "rate_limit_attempts", "rate_limit_started_at"} <= job_columns
     lease_type = _postgres_data_type(engine, "lease_expires_at", table="jobs")
-    assert lease_type.startswith("timestamp"), lease_type
+    assert lease_type == "timestamp with time zone", lease_type
+    started_type = _postgres_data_type(engine, "rate_limit_started_at", table="jobs")
+    assert started_type == "timestamp with time zone", started_type
     project_indexes = {index["name"] for index in inspect(engine).get_indexes("projects")}
     assert "projects_preview_token" in project_indexes
     with engine.begin() as conn:
@@ -214,4 +216,54 @@ def test_sqlite_migration_adds_job_lease_columns():
     with engine.connect() as conn:
         attempts = conn.execute(text("SELECT rate_limit_attempts FROM jobs WHERE id = 'job-1'")).scalar()
     assert attempts == 0
+    engine.dispose()
+
+
+def test_postgres_promotes_naive_lease_timestamps():
+    """A pre-existing TIMESTAMP lease column becomes timestamptz and keeps the UTC instant."""
+    url = os.environ.get("TEST_POSTGRES_URL", "").strip()
+    if not url:
+        if os.environ.get("CI"):
+            pytest.fail("TEST_POSTGRES_URL is required in CI")
+        pytest.skip("Set TEST_POSTGRES_URL to run migrations against Postgres")
+    engine = create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS jobs"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE jobs (
+                    id VARCHAR(36) PRIMARY KEY,
+                    project_id VARCHAR(36) NOT NULL,
+                    kind VARCHAR(32) NOT NULL,
+                    status VARCHAR(32) NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    lease_expires_at TIMESTAMP,
+                    rate_limit_started_at TIMESTAMP
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO jobs "
+                "(id, project_id, kind, status, created_at, updated_at, lease_expires_at, rate_limit_started_at) "
+                "VALUES ('job-tz', 'project-tz', 'world', 'running', "
+                "'2026-10-15 12:00:00', '2026-10-15 12:00:00', "
+                "'2026-10-15 12:00:00', '2026-10-15 11:00:00')"
+            )
+        )
+    _ensure_job_schema(engine)
+    assert _postgres_data_type(engine, "lease_expires_at", table="jobs") == "timestamp with time zone"
+    assert _postgres_data_type(engine, "rate_limit_started_at", table="jobs") == "timestamp with time zone"
+    with engine.connect() as conn:
+        conn.execute(text("SET TIME ZONE 'America/New_York'"))
+        lease, started = conn.execute(
+            text("SELECT lease_expires_at, rate_limit_started_at FROM jobs WHERE id = 'job-tz'")
+        ).one()
+        conn.commit()
+    assert lease.tzinfo is not None and started.tzinfo is not None
+    assert lease.astimezone(timezone.utc) == datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    assert started.astimezone(timezone.utc) == datetime(2026, 10, 15, 11, 0, tzinfo=timezone.utc)
     engine.dispose()
