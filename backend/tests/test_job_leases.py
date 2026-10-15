@@ -282,7 +282,11 @@ def test_waiting_world_job_is_charged_once(client, monkeypatch):
             assert db.get_job(waiting_job).lease_owner == db.WORKER_ID
 
             db.update_job(waiting_job, lease_expires_at=_utcnow() - timedelta(seconds=5))
-            assert await pipeline.resume_durable_jobs(fresh_running=False) == 0
+            resumed = await pipeline.resume_durable_jobs(fresh_running=False)
+            # The original worker still holds this job in memory. Give it a live
+            # lease again so it can finish the one paid call the test expects.
+            db.update_job(waiting_job, lease_expires_at=_utcnow() + timedelta(seconds=30))
+            assert resumed == 0
         finally:
             release.set()
             await _drain_runner()
@@ -306,7 +310,9 @@ def test_waiting_stage_job_calls_gemini_once(client, monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def fake_stage(image, prompt):
+    async def fake_stage(image, prompt, before_generate=None):
+        if before_generate is not None:
+            before_generate()
         calls["n"] += 1
         assert prompt == "boho"
         started.set()
@@ -499,3 +505,172 @@ def test_each_429_counts_toward_the_job_cap(monkeypatch):
 
 async def _async_none() -> None:
     return None
+
+
+def test_lease_heartbeat_retries_a_transient_error(client, monkeypatch):
+    project_id = _ready_project("heartbeat-blip")
+    job = db.create_job(project_id, "world")
+    assert db.claim_job_lease(job.id, db.WORKER_ID) is not None
+    calls = {"n": 0}
+    real_renew = db.renew_job_lease
+
+    def renew(job_id: str, owner: str) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("connection dropped")
+        return real_renew(job_id, owner)
+
+    monkeypatch.setattr(pipeline, "renew_job_lease", renew)
+    monkeypatch.setattr(
+        pipeline,
+        "get_settings",
+        lambda: replace(config.get_settings(), job_lease_heartbeat_seconds=0.01),
+    )
+    monkeypatch.setattr(pipeline, "_LEASE_RENEW_BACKOFF_SECONDS", 0.01)
+    lost = {"n": 0}
+
+    async def run() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            pipeline._lease_heartbeat(job.id, stop, lambda: lost.__setitem__("n", lost["n"] + 1))
+        )
+        await asyncio.sleep(0.08)
+        stop.set()
+        await task
+
+    try:
+        asyncio.run(run())
+        assert calls["n"] >= 2
+        assert lost["n"] == 0
+        assert db.get_job(job.id).lease_owner == db.WORKER_ID
+    finally:
+        db.delete_job(job.id)
+
+
+def test_lost_lease_cancels_the_running_job(client, monkeypatch):
+    project_id = _ready_project("heartbeat-lost")
+    job = db.create_job(project_id, "world")
+    monkeypatch.setattr(
+        pipeline,
+        "get_settings",
+        lambda: replace(config.get_settings(), job_lease_heartbeat_seconds=0.01),
+    )
+    phases: list[str] = []
+
+    async def generate(*args, **kwargs):
+        on_submitting = kwargs["on_submitting"]
+        await on_submitting("draft")
+        phases.append("draft")
+        db.update_job(
+            job.id,
+            lease_owner="other-replica",
+            lease_expires_at=_utcnow() + timedelta(seconds=30),
+        )
+        try:
+            await asyncio.sleep(5)
+        finally:
+            phases.append("released")
+
+    monkeypatch.setattr(pipeline, "generate_world", generate)
+    try:
+        asyncio.run(pipeline.run_job(job.id))
+        saved = db.get_job(job.id)
+        assert phases[0] == "draft"
+        assert "released" in phases
+        assert saved is not None
+        assert saved.lease_owner == "other-replica"
+    finally:
+        db.delete_job(job.id)
+
+
+def test_expired_lease_blocks_the_next_generate(client, monkeypatch):
+    project_id = _ready_project("lease-expired")
+    job = db.create_job(project_id, "world")
+    phases: list[str] = []
+
+    async def generate(*args, **kwargs):
+        on_submitting = kwargs["on_submitting"]
+        await on_submitting("draft")
+        phases.append("draft")
+        db.update_job(job.id, lease_expires_at=_utcnow() - timedelta(seconds=1))
+        await on_submitting("full")
+        phases.append("full")
+
+    monkeypatch.setattr(pipeline, "generate_world", generate)
+    try:
+        asyncio.run(pipeline.run_job(job.id))
+        assert phases == ["draft"]
+        saved = db.get_job(job.id)
+        assert saved is not None
+        assert saved.lease_owner == db.WORKER_ID
+    finally:
+        db.delete_job(job.id)
+
+
+def test_staging_checks_the_lease_before_each_view(client, monkeypatch):
+    project_id = _ready_project("stage-lease")
+    db.update_project(project_id, staging_prompt="a sofa")
+    job = db.create_job(project_id, "stage")
+    calls = {"n": 0}
+
+    async def fake_stage(image_bytes, user_prompt, before_generate=None):
+        assert before_generate is not None
+        before_generate()
+        calls["n"] += 1
+        db.update_job(job.id, lease_owner="other-replica", lease_expires_at=_utcnow() + timedelta(seconds=30))
+        before_generate()
+        calls["n"] += 1
+        return b"jpeg", "gemini_mock", None
+
+    monkeypatch.setattr(pipeline, "stage_image", fake_stage)
+    try:
+        asyncio.run(pipeline.run_job(job.id))
+        assert calls["n"] == 1
+        saved = db.get_job(job.id)
+        assert saved is not None
+        assert saved.lease_owner == "other-replica"
+    finally:
+        db.delete_job(job.id)
+
+
+def test_successful_poll_or_generate_resets_the_429_window(client, monkeypatch):
+    monkeypatch.setenv("WORLDLABS_RATE_LIMIT_MAX_SECONDS", "30")
+    project_id = _ready_project("reset-window")
+    job = db.create_job(project_id, "world")
+    db.update_job(
+        job.id,
+        rate_limit_attempts=2,
+        rate_limit_started_at=_utcnow() - timedelta(seconds=120),
+    )
+
+    async def send_error():
+        return SimpleNamespace(status_code=500, headers={})
+
+    async def send_ok():
+        return SimpleNamespace(status_code=200, headers={})
+
+    token = bind_rate_limit_hook(
+        lambda: pipeline.note_world_rate_limit(job.id),
+        lambda: pipeline.clear_world_rate_limit(job.id),
+    )
+    try:
+        failed = asyncio.run(_send_retrying_rate_limit(send_error))
+        assert failed.status_code == 500
+        still = db.get_job(job.id)
+        assert still is not None
+        assert still.rate_limit_attempts == 2
+        assert still.rate_limit_started_at is not None
+        ok = asyncio.run(_send_retrying_rate_limit(send_ok))
+        assert ok.status_code == 200
+        cleared = db.get_job(job.id)
+        assert cleared is not None
+        assert cleared.rate_limit_attempts == 0
+        assert cleared.rate_limit_started_at is None
+        pipeline.note_world_rate_limit(job.id)
+        refreshed = db.get_job(job.id)
+        assert refreshed is not None
+        assert refreshed.rate_limit_attempts == 1
+        assert (_utcnow() - db._as_utc(refreshed.rate_limit_started_at)).total_seconds() < 5
+    finally:
+        reset_rate_limit_hook(token)
+        db.delete_job(job.id)
