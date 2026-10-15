@@ -100,6 +100,10 @@ class Settings:
     worldlabs_retry_attempts: int
     worldlabs_retry_base_seconds: float
     worldlabs_retry_max_seconds: float
+    worldlabs_rate_limit_max_attempts: int
+    worldlabs_rate_limit_max_seconds: int
+    job_lease_seconds: int
+    job_lease_heartbeat_seconds: int
     worker_concurrency: int
     stitch_concurrency: int
     jobs_inline: bool
@@ -166,6 +170,12 @@ def get_settings() -> Settings:
         if item in {"*", "'self'"} or item.startswith("https://") or item.startswith("http://"):
             ancestors.append(item)
 
+    job_lease_seconds = min(600, max(30, _int("JOB_LEASE_SECONDS", 90)))
+    job_lease_heartbeat_seconds = min(
+        max(5, job_lease_seconds // 3),
+        max(5, _int("JOB_LEASE_HEARTBEAT_SECONDS", 30)),
+    )
+
     return Settings(
         database_url=database_url,
         storage_dir=storage_dir,
@@ -199,9 +209,13 @@ def get_settings() -> Settings:
         worldlabs_public=_bool("WORLDLABS_PUBLIC", False),
         worldlabs_low_credit_threshold=max(0, _int("WORLDLABS_LOW_CREDIT_THRESHOLD", 6000)),
         worldlabs_concurrency=max(1, _int("WORLDLABS_CONCURRENCY", 2)),
-        worldlabs_retry_attempts=max(1, _int("WORLDLABS_RETRY_ATTEMPTS", 5)),
-        worldlabs_retry_base_seconds=max(0.0, _float("WORLDLABS_RETRY_BASE_SECONDS", 0.5)),
-        worldlabs_retry_max_seconds=max(0.0, _float("WORLDLABS_RETRY_MAX_SECONDS", 32)),
+        worldlabs_retry_attempts=min(8, max(1, _int("WORLDLABS_RETRY_ATTEMPTS", 5))),
+        worldlabs_retry_base_seconds=min(60.0, max(0.0, _float("WORLDLABS_RETRY_BASE_SECONDS", 0.5))),
+        worldlabs_retry_max_seconds=min(60.0, max(0.0, _float("WORLDLABS_RETRY_MAX_SECONDS", 32))),
+        worldlabs_rate_limit_max_attempts=min(40, max(1, _int("WORLDLABS_RATE_LIMIT_MAX_ATTEMPTS", 20))),
+        worldlabs_rate_limit_max_seconds=min(3600, max(30, _int("WORLDLABS_RATE_LIMIT_MAX_SECONDS", 900))),
+        job_lease_seconds=job_lease_seconds,
+        job_lease_heartbeat_seconds=job_lease_heartbeat_seconds,
         worker_concurrency=max(1, _int("WORKER_CONCURRENCY", 3)),
         stitch_concurrency=max(1, _int("STITCH_CONCURRENCY", 1)),
         jobs_inline=_bool("JOBS_INLINE", False),

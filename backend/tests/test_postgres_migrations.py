@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
-from db import Base, ProjectRow, _EXTRA_COLUMNS, _ensure_columns, _ensure_job_schema
+from db import Base, ProjectRow, _EXTRA_COLUMNS, _JOB_EXTRA_COLUMNS, _ensure_columns, _ensure_job_schema
 
 # Shared by SQLite and Postgres. DATETIME is rejected by Postgres.
 _SAFE_TYPE = re.compile(r"^(TEXT|INTEGER|BIGINT|REAL|DOUBLE PRECISION|TIMESTAMP|VARCHAR\(\d+\))$")
@@ -52,6 +52,15 @@ def test_added_column_types_are_valid_on_postgres_and_sqlite():
     for name, ddl in _EXTRA_COLUMNS.items():
         assert _SAFE_TYPE.fullmatch(ddl), f"{name} uses {ddl}, which is not valid on both SQLite and Postgres"
         assert "DATETIME" not in ddl.upper()
+
+
+def test_job_lease_column_types_are_valid_on_postgres_and_sqlite():
+    for name, ddl in _JOB_EXTRA_COLUMNS.items():
+        assert "DATETIME" not in ddl.upper(), name
+        prefix = ddl.split()[0]
+        assert prefix in {"INTEGER", "BIGINT", "REAL", "TEXT", "TIMESTAMP"} or prefix.startswith("VARCHAR("), ddl
+        if prefix.startswith("VARCHAR"):
+            assert re.fullmatch(r"VARCHAR\(\d+\)", prefix), ddl
 
 
 def test_sqlite_migration_adds_share_expiry_as_timestamp():
@@ -91,6 +100,10 @@ def test_postgres_migration_adds_every_column():
     assert {"devices", "daily_usage", "pending_world_deletes", "jobs", "rate_windows"} <= table_names
     index_names = {index["name"] for index in inspect(engine).get_indexes("jobs")}
     assert "jobs_one_open_per_project" in index_names
+    job_columns = {column["name"] for column in inspect(engine).get_columns("jobs")}
+    assert {"lease_owner", "lease_expires_at", "rate_limit_attempts", "rate_limit_started_at"} <= job_columns
+    lease_type = _postgres_data_type(engine, "lease_expires_at", table="jobs")
+    assert lease_type.startswith("timestamp"), lease_type
     project_indexes = {index["name"] for index in inspect(engine).get_indexes("projects")}
     assert "projects_preview_token" in project_indexes
     with engine.begin() as conn:
@@ -150,14 +163,55 @@ def _assert_share_expiry_roundtrip(engine) -> None:
         assert abs((stored - expires).total_seconds()) < 1
 
 
-def _postgres_data_type(engine, column: str) -> str:
+def _postgres_data_type(engine, column: str, table: str = "projects") -> str:
     with engine.connect() as conn:
         found = conn.execute(
             text(
                 "SELECT data_type FROM information_schema.columns "
-                "WHERE table_name = 'projects' AND column_name = :column"
+                "WHERE table_name = :table AND column_name = :column"
             ),
-            {"column": column},
+            {"table": table, "column": column},
         ).scalar()
     assert found, column
     return str(found)
+
+
+_OLD_JOBS = """
+CREATE TABLE jobs (
+    id VARCHAR(36) PRIMARY KEY,
+    project_id VARCHAR(36) NOT NULL,
+    kind VARCHAR(32) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    operation_id TEXT,
+    operation_phase VARCHAR(16),
+    media_asset_id TEXT,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL
+)
+"""
+
+
+def test_sqlite_migration_adds_job_lease_columns():
+    engine = create_engine("sqlite://")
+    with engine.begin() as conn:
+        conn.execute(text(_OLD_JOBS))
+        conn.execute(
+            text(
+                "INSERT INTO jobs (id, project_id, kind, status, created_at, updated_at) "
+                "VALUES ('job-1', 'project-1', 'world', 'running', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+    _ensure_job_schema(engine)
+    columns = {column["name"] for column in inspect(engine).get_columns("jobs")}
+    assert {
+        "attempt_count",
+        "delayed_at",
+        "lease_owner",
+        "lease_expires_at",
+        "rate_limit_attempts",
+        "rate_limit_started_at",
+    } <= columns
+    with engine.connect() as conn:
+        attempts = conn.execute(text("SELECT rate_limit_attempts FROM jobs WHERE id = 'job-1'")).scalar()
+    assert attempts == 0
+    engine.dispose()

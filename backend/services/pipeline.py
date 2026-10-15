@@ -15,24 +15,31 @@ import json
 import logging
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 from config import get_settings
 from db import (
+    WORKER_ID,
     JobRecord,
     ProjectRecord,
     begin_job,
     claim_delayed_job,
+    claim_job_lease,
     claim_resumable_jobs,
     delay_expired,
     delete_job,
+    delete_owned_job,
     get_job,
     get_project,
     list_delayed_world_jobs,
+    release_job_lease,
+    renew_job_lease,
     touch_job,
     update_job,
     update_project,
 )
+from db import _as_utc as _as_utc
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE
 from services.staging import StagingProviderError, stage_image
 from services.stitcher import stitch_images
@@ -43,9 +50,13 @@ from services.world_gen import (
     WORLD_DELAYED_MESSAGE,
     WORLD_DELAY_EXPIRED_MESSAGE,
     WORLD_FAILED_MESSAGE,
+    WORLD_RATE_LIMIT_EXHAUSTED,
     OperationInFlight,
     ProviderFailure,
+    RateLimitExceeded,
     _is_out_of_credits,
+    bind_rate_limit_hook,
+    reset_rate_limit_hook,
     continue_full_world,
     credits_required,
     delete_worlds,
@@ -61,6 +72,7 @@ logger = logging.getLogger(__name__)
 
 _stitch_pool: ThreadPoolExecutor | None = None
 _world_semaphore: asyncio.Semaphore | None = None
+_in_flight: set[str] = set()
 _INTERRUPTED_WORLD = "3D generation was interrupted. Retry from the app."
 _INTERRUPTED_WORLD_DETAIL = (
     "Interrupted before a World Labs operation id was saved; not started again, to avoid a second charge."
@@ -95,11 +107,9 @@ class JobRunner:
         return self._semaphore
 
     def submit(self, coro) -> asyncio.Task:
-        async def wrapped() -> None:
-            async with self._limit():
-                await coro
-
-        task = asyncio.create_task(wrapped())
+        # The worker slot is taken inside ``run_job``, after the lease and
+        # heartbeat start, so a job waiting on the semaphore still renews it.
+        task = asyncio.create_task(coro)
         self._tasks.add(task)
         task.add_done_callback(self._finished)
         return task
@@ -156,13 +166,13 @@ async def start_job(job_id: str) -> None:
 
 
 async def resume_durable_jobs(*, fresh_running: bool = True) -> int:
-    """Re-queue jobs that were pending or running when the process stopped.
+    """Re-queue jobs whose lease is missing or expired.
 
     Delayed world jobs stay queued until ``retry_delayed_worlds`` sees credits.
-    ``fresh_running`` is false on the maintenance pass so a live replica keeps
-    the jobs it just created.
+    Jobs this process is already running are left alone, even when their
+    ``updated_at`` is old. ``fresh_running`` is accepted so callers stay the same.
     """
-    jobs = claim_resumable_jobs(fresh_running=fresh_running)
+    jobs = claim_resumable_jobs(fresh_running=fresh_running, skip_ids=set(_in_flight))
     for job in jobs:
         logger.warning(
             "Resuming %s job %s for project %s (operation %s, phase %s)",
@@ -247,36 +257,121 @@ async def retry_delayed_project(project_id: str) -> str:
 
 
 async def _schedule(job_id: str) -> None:
+    if job_id in _in_flight:
+        logger.info("Job %s is already running in this process", job_id)
+        return
     if get_settings().jobs_inline:
         await run_job(job_id)
         return
     runner.submit(run_job(job_id))
 
 
-async def run_job(job_id: str) -> None:
+class LeaseLost(Exception):
+    """This process no longer owns the job, so it must not call a paid provider."""
+
+
+def _require_lease(job_id: str | None) -> None:
+    if not job_id:
+        return
+    job = get_job(job_id)
+    if job is None or job.lease_owner != WORKER_ID:
+        raise LeaseLost()
+
+
+def _rate_limit_already_exceeded(job: JobRecord) -> bool:
+    settings = get_settings()
+    if job.rate_limit_attempts >= settings.worldlabs_rate_limit_max_attempts:
+        return True
+    if job.rate_limit_started_at is None:
+        return False
+    elapsed = (datetime.now(timezone.utc) - _as_utc(job.rate_limit_started_at)).total_seconds()
+    return elapsed >= settings.worldlabs_rate_limit_max_seconds
+
+
+def note_world_rate_limit(job_id: str) -> None:
+    """Count one World Labs HTTP 429. Raise when the job's budget is spent."""
     job = get_job(job_id)
     if job is None:
+        raise RateLimitExceeded("World Labs rate limit cap reached")
+    now = datetime.now(timezone.utc)
+    started = job.rate_limit_started_at or now
+    attempts = job.rate_limit_attempts + 1
+    update_job(job_id, rate_limit_attempts=attempts, rate_limit_started_at=started)
+    settings = get_settings()
+    elapsed = (now - _as_utc(started)).total_seconds()
+    if attempts >= settings.worldlabs_rate_limit_max_attempts or elapsed >= settings.worldlabs_rate_limit_max_seconds:
+        raise RateLimitExceeded(
+            f"World Labs rate limit exceeded after {attempts} attempts and {int(elapsed)}s"
+        )
+
+
+async def _lease_heartbeat(job_id: str, stop: asyncio.Event) -> None:
+    """Renew the lease for the whole run, including waits and provider sleeps."""
+    interval = get_settings().job_lease_heartbeat_seconds
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            if not renew_job_lease(job_id, WORKER_ID):
+                logger.warning("Lost the lease for job %s", job_id)
+                return
+        except asyncio.CancelledError:
+            return
+
+
+async def run_job(job_id: str) -> None:
+    if job_id in _in_flight:
+        logger.info("Job %s is already running in this process", job_id)
         return
-    resume = job.status in {"running", "delayed"}
-    update_job(job_id, status="running")
+    _in_flight.add(job_id)
+    stop = asyncio.Event()
+    heart: asyncio.Task | None = None
     follow: str | None = None
     keep = False
+    owned = False
+    abandoned = False
     try:
-        if job.kind == "stitch":
-            follow = await run_stitch(job.project_id)
-        elif job.kind == "stage":
-            await run_stage(job.project_id, resume=resume)
-        elif job.kind in {"world", "staged_world"}:
-            async with world_limit():
-                source = "staged" if job.kind == "staged_world" else "original"
-                outcome = await run_world(job.project_id, source=source, job_id=job_id, resume=resume)
-                keep = outcome in {"delayed", "poll"}
-        else:
-            logger.error("Unknown job kind %s", job.kind)
+        job = claim_job_lease(job_id, WORKER_ID)
+        if job is None:
+            return
+        owned = True
+        heart = asyncio.create_task(_lease_heartbeat(job_id, stop))
+        async with runner._limit():
+            try:
+                _require_lease(job_id)
+                if job.kind == "stitch":
+                    follow = await run_stitch(job.project_id)
+                elif job.kind == "stage":
+                    await run_stage(job.project_id, resume=False)
+                elif job.kind in {"world", "staged_world"}:
+                    async with world_limit():
+                        _require_lease(job_id)
+                        source = "staged" if job.kind == "staged_world" else "original"
+                        outcome = await run_world(job.project_id, source=source, job_id=job_id)
+                        keep = outcome in {"delayed", "poll"}
+                else:
+                    logger.error("Unknown job kind %s", job.kind)
+            except LeaseLost:
+                abandoned = True
+                logger.warning("Job %s lost its lease before a paid call; leaving it for the new owner", job_id)
     finally:
-        if not keep:
-            delete_job(job_id)
-    if follow and not keep:
+        stop.set()
+        if heart is not None:
+            heart.cancel()
+            try:
+                await heart
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Lease heartbeat for job %s failed", job_id)
+        _in_flight.discard(job_id)
+        if owned and not abandoned:
+            if keep:
+                release_job_lease(job_id, WORKER_ID)
+            else:
+                delete_owned_job(job_id, WORKER_ID)
+    if follow and owned and not abandoned and not keep:
         await enqueue_job(job.project_id, follow)
 
 
@@ -364,6 +459,8 @@ async def run_stage(project_id: str, *, resume: bool = False) -> None:
             delete_project_assets(project_id)
             return
         logger.info("Project %s staged via %s", project_id, provider)
+    except LeaseLost:
+        raise
     except StagingProviderError as exc:
         _fail_stage(project_id, exc.client_message, exc.detail)
     except Exception as exc:
@@ -395,11 +492,36 @@ async def run_world(
     *,
     resume: bool = False,
 ) -> str | None:
+    token = None
+    if job_id:
+        token = bind_rate_limit_hook(lambda: note_world_rate_limit(job_id))
+    try:
+        return await _run_world(project_id, source, job_id, resume=resume)
+    finally:
+        if token is not None:
+            reset_rate_limit_hook(token)
+
+
+async def _run_world(
+    project_id: str,
+    source: str,
+    job_id: str | None,
+    *,
+    resume: bool,
+) -> str | None:
     staged_source = source == "staged"
     job = get_job(job_id) if job_id else None
     existing = get_project(project_id)
     if existing is None:
         return
+    if job and _rate_limit_already_exceeded(job):
+        _fail_world(
+            project_id,
+            WORLD_RATE_LIMIT_EXHAUSTED,
+            "World Labs rate limit cap reached before another provider call",
+            staged_source,
+        )
+        return None
     if job and job.operation_phase == "submitting":
         _fail_world(project_id, _INTERRUPTED_WORLD, _INTERRUPTED_WORLD_DETAIL, staged_source)
         return None
@@ -447,12 +569,29 @@ async def run_world(
             on_tick=on_tick,
         )
         await _store_world(project_id, result, staged_source, created_ids)
+    except LeaseLost:
+        raise
+    except RateLimitExceeded as exc:
+        await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
+        return None
     except OperationInFlight:
+        if job_id and (current := get_job(job_id)) and _rate_limit_already_exceeded(current):
+            await _fail_world_clean(
+                project_id,
+                created_ids,
+                WORLD_RATE_LIMIT_EXHAUSTED,
+                "World Labs rate limit cap reached",
+                staged_source,
+            )
+            return None
         held = _hold_charged_operation(project_id, job_id, staged_source)
         if held:
             return held
         await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
     except ProviderFailure as exc:
+        if isinstance(exc, RateLimitExceeded):
+            await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
+            return None
         if exc.status_code == 429:
             held = _hold_charged_operation(project_id, job_id, staged_source)
             if held:
@@ -490,6 +629,7 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
                 await delete_worlds(created_ids)
                 return None
             image, label = _world_inputs(project, staged_source)
+            _require_lease(job.id)
 
             async def on_submitting(_phase: str) -> None:
                 update_job(job.id, operation_phase="submitting", status="running")
@@ -506,12 +646,29 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
                 on_tick=on_tick,
             )
         await _store_world(project_id, parsed, staged_source, created_ids)
+    except LeaseLost:
+        raise
+    except RateLimitExceeded as exc:
+        await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
+        return None
     except OperationInFlight:
+        if _rate_limit_already_exceeded(get_job(job.id) or job):
+            await _fail_world_clean(
+                project_id,
+                created_ids,
+                WORLD_RATE_LIMIT_EXHAUSTED,
+                "World Labs rate limit cap reached",
+                staged_source,
+            )
+            return None
         held = _hold_charged_operation(project_id, job.id, staged_source)
         if held:
             return held
         await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
     except ProviderFailure as exc:
+        if isinstance(exc, RateLimitExceeded):
+            await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
+            return None
         if exc.status_code == 429:
             held = _hold_charged_operation(project_id, job.id, staged_source)
             if held:
@@ -619,6 +776,8 @@ def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: 
         return None
     job = get_job(job_id)
     if job is None or not job.operation_id:
+        return None
+    if _rate_limit_already_exceeded(job):
         return None
     phase = job.operation_phase
     if phase == "submitting":

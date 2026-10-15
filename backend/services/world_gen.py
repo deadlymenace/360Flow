@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -29,6 +30,9 @@ WORLD_CREDITS_MESSAGE = "3D generation is unavailable right now (provider credit
 WORLD_DELAYED_MESSAGE = "Your 3D tour is delayed, we'll finish it shortly"
 WORLD_DELAY_EXPIRED_MESSAGE = "Your 3D tour could not be finished in time. Try again from the app."
 WORLD_PROVIDER_QUOTA_MESSAGE = "3D generation is unavailable right now (provider quota)."
+WORLD_RATE_LIMIT_EXHAUSTED = (
+    "3D generation is unavailable right now (provider quota). Try again from the app."
+)
 
 # Pano world generation. Draft is 150; marble-1.0 / marble-1.1 are 1,500.
 # A plus model can cost more, so 1,500 is only the minimum that must be on hand.
@@ -47,6 +51,13 @@ class ProviderFailure(Exception):
         self.client_message = client_message
         self.detail = " ".join(detail.split())[:500]
         self.status_code = status_code
+
+
+class RateLimitExceeded(ProviderFailure):
+    """The job used its whole World Labs 429 budget. Callers fail it."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(WORLD_RATE_LIMIT_EXHAUSTED, detail, 429)
 
 
 class OperationInFlight(ProviderFailure):
@@ -113,17 +124,40 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
+# Set by the job runner. Counts every HTTP 429 for one job, across polls and
+# generate calls, and raises RateLimitExceeded when the job's budget is spent.
+_rate_limit_hook: ContextVar = ContextVar("worldlabs_rate_limit_hook", default=None)
+
+
+def bind_rate_limit_hook(hook):
+    return _rate_limit_hook.set(hook)
+
+
+def reset_rate_limit_hook(token) -> None:
+    _rate_limit_hook.reset(token)
+
+
+def _note_rate_limit() -> None:
+    hook = _rate_limit_hook.get()
+    if hook is not None:
+        hook()
+
+
 async def _send_retrying_rate_limit(send):
     """Call ``send`` again after HTTP 429, up to the configured attempt cap.
 
     ``send`` must perform one HTTP request. A non-429 response is returned
     immediately so a charged call is not repeated for any other status.
+    Every 429 also counts against the job's total attempt and time budget.
     """
     attempts = get_settings().worldlabs_retry_attempts
     response = None
     for attempt in range(1, attempts + 1):
         response = await send()
-        if response.status_code != 429 or attempt == attempts:
+        if response.status_code != 429:
+            return response
+        _note_rate_limit()
+        if attempt == attempts:
             return response
         delay = retry_wait_seconds(attempt, _retry_after_seconds(response))
         logger.warning(

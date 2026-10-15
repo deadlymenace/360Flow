@@ -22,6 +22,9 @@ TRANSIENT_STATUSES = ("uploading", "stitching", "staging", "generating_3d", "del
 OPEN_JOB_STATUSES = ("pending", "running", "delayed")
 GLOBAL_QUOTA_DEVICE = "__global__"
 _RESUME_LOCK_KEY = 360360160
+# One id per process. A lease names this owner so another worker can tell a
+# live job from one whose process died.
+WORKER_ID = str(uuid4())
 
 
 class Base(DeclarativeBase):
@@ -107,6 +110,10 @@ class JobRow(Base):
     media_asset_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
     delayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rate_limit_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    rate_limit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -168,6 +175,10 @@ _EXTRA_COLUMNS = {
 _JOB_EXTRA_COLUMNS = {
     "attempt_count": "INTEGER NOT NULL DEFAULT 0",
     "delayed_at": "TIMESTAMP",
+    "lease_owner": "VARCHAR(64)",
+    "lease_expires_at": "TIMESTAMP",
+    "rate_limit_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "rate_limit_started_at": "TIMESTAMP",
 }
 
 
@@ -228,6 +239,10 @@ class JobRecord:
     media_asset_id: str | None
     attempt_count: int = 0
     delayed_at: datetime | None = None
+    lease_owner: str | None = None
+    lease_expires_at: datetime | None = None
+    rate_limit_attempts: int = 0
+    rate_limit_started_at: datetime | None = None
 
 
 _engine = None
@@ -377,6 +392,10 @@ def _job_record(row: JobRow) -> JobRecord:
         media_asset_id=row.media_asset_id,
         attempt_count=row.attempt_count or 0,
         delayed_at=row.delayed_at,
+        lease_owner=row.lease_owner,
+        lease_expires_at=row.lease_expires_at,
+        rate_limit_attempts=row.rate_limit_attempts or 0,
+        rate_limit_started_at=row.rate_limit_started_at,
     )
 
 
@@ -547,42 +566,127 @@ def try_resume_leadership() -> tuple[bool, bool]:
     return True, True
 
 
-def claim_resumable_jobs(*, fresh_running: bool = True) -> list[JobRecord]:
-    """One unfinished job per project, preferring the furthest-along kind.
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
-    A restart can leave both a finished stitch job and the world job it
-    started. Only the later one should run. On Postgres the resume leader
-    takes ``SELECT ... FOR UPDATE SKIP LOCKED`` so another replica cannot
-    claim the same rows. A maintenance pass leaves fresh rows alone; those
-    belong to the replica that created them.
+
+def _lease_is_available(row: JobRow, owner: str, now: datetime) -> bool:
+    """True when ``owner`` may take the row: nobody holds it, or it expired."""
+    if row.lease_expires_at is None:
+        return True
+    if _as_utc(row.lease_expires_at) < now:
+        return True
+    return row.lease_owner == owner
+
+
+def claim_job_lease(job_id: str, owner: str) -> JobRecord | None:
+    """Mark one pending or running job as owned by ``owner``.
+
+    The update matches only when the lease is missing, expired, or already
+    held by the same owner. Postgres locks the row with ``SKIP LOCKED`` so
+    two workers cannot take it.
     """
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(seconds=get_settings().job_lease_seconds)
+    with session_scope() as session:
+        dialect = session.get_bind().dialect.name
+        if dialect == "postgresql":
+            locked = session.scalar(
+                select(JobRow.id).where(JobRow.id == job_id).with_for_update(skip_locked=True)
+            )
+            if locked is None:
+                return None
+        row = session.get(JobRow, job_id)
+        if row is None or row.status not in {"pending", "running"}:
+            return None
+        if not _lease_is_available(row, owner, now):
+            return None
+        row.status = "running"
+        row.lease_owner = owner
+        row.lease_expires_at = until
+        row.updated_at = now
+        session.flush()
+        return _job_record(row)
+
+
+def renew_job_lease(job_id: str, owner: str) -> bool:
+    """Extend a lease this owner still holds. False when the job was reclaimed."""
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(seconds=get_settings().job_lease_seconds)
+    with session_scope() as session:
+        row = session.get(JobRow, job_id)
+        if row is None or row.lease_owner != owner or row.status != "running":
+            return False
+        row.lease_expires_at = until
+        row.updated_at = now
+        return True
+
+
+def release_job_lease(job_id: str, owner: str) -> None:
+    """Drop the lease without deleting the job, so a later pass can claim it."""
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        row = session.get(JobRow, job_id)
+        if row is None or row.lease_owner != owner:
+            return
+        row.lease_owner = None
+        row.lease_expires_at = None
+        row.updated_at = now
+
+
+def delete_owned_job(job_id: str, owner: str) -> bool:
+    """Delete the job only when this owner still holds the lease."""
+    with session_scope() as session:
+        row = session.get(JobRow, job_id)
+        if row is None or row.lease_owner != owner:
+            return False
+        session.delete(row)
+        return True
+
+
+def claim_resumable_jobs(*, fresh_running: bool = True, skip_ids: set[str] | None = None) -> list[JobRecord]:
+    """Claim unfinished jobs whose lease is missing or expired.
+
+    One job per project wins, preferring the furthest-along kind. On Postgres
+    the resume leader takes ``SELECT ... FOR UPDATE SKIP LOCKED`` so another
+    replica cannot claim the same rows. ``skip_ids`` are jobs this process is
+    already running; their lease is left untouched. ``fresh_running`` is kept
+    so callers do not change. The lease, not ``updated_at``, decides staleness.
+    """
+    del fresh_running
     if _engine is not None and _engine.dialect.name == "postgresql":
         leader, _just = try_resume_leadership()
         if not leader:
             return []
+    skip = skip_ids or set()
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(seconds=get_settings().job_lease_seconds)
     with session_scope() as session:
         query = select(JobRow).where(JobRow.status.in_(("pending", "running")))
         dialect = session.get_bind().dialect.name
-        if not fresh_running:
-            cutoff = datetime.now(timezone.utc) - timedelta(seconds=get_settings().job_claim_stale_seconds)
-            query = query.where(JobRow.updated_at < cutoff)
         if dialect == "postgresql":
             query = query.with_for_update(skip_locked=True)
         rows = list(session.scalars(query).all())
+        free = [row for row in rows if row.id not in skip and _lease_is_available(row, "", now)]
         best: dict[str, JobRow] = {}
-        for row in rows:
+        for row in free:
             current = best.get(row.project_id)
             if current is None or _JOB_PRIORITY.get(row.kind, 0) > _JOB_PRIORITY.get(current.kind, 0):
                 best[row.project_id] = row
-        now = datetime.now(timezone.utc)
-        for row in rows:
+        claimed: list[JobRow] = []
+        for row in free:
             winner = best[row.project_id]
             if row.id != winner.id:
                 session.delete(row)
                 continue
             row.status = "running"
+            row.lease_owner = WORKER_ID
+            row.lease_expires_at = until
             row.updated_at = now
-        return [_job_record(row) for row in best.values()]
+            claimed.append(row)
+        return [_job_record(row) for row in claimed]
 
 
 def resumable_project_ids() -> set[str]:
@@ -1023,7 +1127,11 @@ def cancel_delayed_project(project_id: str) -> str | None:
 
 
 def touch_job(job_id: str) -> None:
-    """Refresh ``updated_at`` so another replica does not treat a live job as stale."""
+    """Refresh ``updated_at`` while a World Labs poll is making progress.
+
+    Ownership is the lease, not this timestamp. A stale ``updated_at`` does not
+    let another worker claim the job.
+    """
     with session_scope() as session:
         session.execute(
             update(JobRow).where(JobRow.id == job_id).values(updated_at=datetime.now(timezone.utc))
