@@ -13,10 +13,19 @@ function configuredBaseUrl(): string | null {
 }
 
 // EXPO_PUBLIC_API_URL wins so an installed build can reach Railway.
-// The Expo dev host is only a fallback for Expo Go on the same Wi-Fi.
+// A dev build may fall back to the Expo debugger host. Release builds have
+// no HTTP fallback: the URL must be set and must be https.
 export function getBaseUrl(): string {
   const configured = configuredBaseUrl();
-  if (configured) return configured;
+  if (configured) {
+    if (!__DEV__ && !configured.toLowerCase().startsWith('https://')) {
+      throw new Error('EXPO_PUBLIC_API_URL must use https in a release build');
+    }
+    return configured;
+  }
+  if (!__DEV__) {
+    throw new Error('EXPO_PUBLIC_API_URL must be set for a release build');
+  }
 
   const extra = Constants.manifest2?.extra as { expoGo?: { debuggerHost?: string } } | undefined;
   const debuggerHost = Constants.expoConfig?.hostUri ?? extra?.expoGo?.debuggerHost;

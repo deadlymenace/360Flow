@@ -95,12 +95,16 @@ def test_share_token_can_be_rotated(client):
     created = client.post("/api/v1/projects", json={"name": "Rotate me"}).json()
     rotated = client.post(f"/api/v1/projects/{created['id']}/share/rotate").json()
     assert rotated["share_token"] != created["share_token"]
-    assert rotated["preview_url"] == created["preview_url"]
+    assert rotated["preview_url"] != created["preview_url"]
     assert created["preview_url"]
-    from db import get_by_share_token
+    from db import get_by_preview_token, get_by_share_token
 
+    old_preview = created["preview_url"].rstrip("/").rsplit("/", 1)[-1]
+    new_preview = rotated["preview_url"].rstrip("/").rsplit("/", 1)[-1]
     assert get_by_share_token(created["share_token"]) is None
     assert get_by_share_token(rotated["share_token"]).id == created["id"]
+    assert get_by_preview_token(old_preview) is None
+    assert get_by_preview_token(new_preview).id == created["id"]
 
 
 def test_cors_is_closed_unless_an_origin_is_configured(client, monkeypatch):

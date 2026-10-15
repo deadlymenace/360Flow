@@ -3,7 +3,8 @@
 The share token is the public access control. Staged images stay off that page
 until the owner publishes them. The preview token is a separate unguessable
 link used by the owner app so compare and export work before publish. It is
-not printed on the public page and does not expire with the share link.
+not printed on the public page. It expires on the same clock as the share
+link, and rotating the share link rotates the preview token too.
 """
 
 from __future__ import annotations

@@ -42,7 +42,6 @@
         "backgroundColor": "#1a1a2e"
       },
       "edgeToEdgeEnabled": true,
-      "usesCleartextTraffic": true,
       "package": "com.threesixtyflow.app",
       "permissions": [
         "CAMERA",
@@ -54,7 +53,8 @@
         "expo-camera",
         {
           "cameraPermission": "360Flow uses the camera to take 16 guided photos that are stitched into a 360° panorama of the room.",
-          "microphonePermission": false
+          "microphonePermission": false,
+          "recordAudioAndroid": false
         }
       ],
       [
