@@ -73,6 +73,23 @@ eas build --platform ios
 
 An iOS build that you can install through TestFlight needs an Apple Developer account.
 
+### Over-the-air updates
+
+`expo-updates` publishes a JavaScript bundle to a channel on an existing build. `runtimeVersion` uses the app version policy, so the runtime version is `expo.version` (currently `1.0.0`). Bump that version when native code changes, then ship a new build before publishing an update for it.
+
+`mobile/eas.json` sets a channel on each build profile: `development`, `preview`, and `production`.
+
+Update manifests are signed. The public certificate is `mobile/certs/certificate.pem` (`keyid` `main`, algorithm `rsa-v1_5-sha256`). The private key stays outside the repo. Do not commit `*.key`, `private-key.pem`, or a `keys/` directory.
+
+The EAS project is `deadlymenace`, id `cc2c18fc-3a1a-4554-82bb-be2545db1b0c`. `updates.url` is `https://u.expo.dev/cc2c18fc-3a1a-4554-82bb-be2545db1b0c`.
+
+Publish a signed update. Pass the private key from outside the repo, and use the channel name that matches the build:
+
+```bash
+cd mobile
+eas update --channel <name> --private-key-path <path outside repo>
+```
+
 ## Mock providers and real APIs
 
 `GET /health` returns `{"status": "ok"}`. The same request with the operator `X-API-Key` reports which path is active:
