@@ -3,6 +3,16 @@
     "name": "360Flow",
     "slug": "threesixtyflow",
     "version": "1.0.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "codeSigningCertificate": "./certs/certificate.pem",
+      "codeSigningMetadata": {
+        "keyid": "main",
+        "alg": "rsa-v1_5-sha256"
+      }
+    },
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -51,7 +61,8 @@
           "motionPermission": "360Flow uses motion sensors to guide capture, showing when to turn and when the phone is level for each of the 16 photos."
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-updates"
     ]
   }
 }

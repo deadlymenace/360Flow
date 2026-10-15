@@ -30,6 +30,13 @@ yarn-error.*
 .DS_Store
 *.pem
 
+# Update code signing. Commit only the public certificate.
+# The private key stays outside the repo and must not be generated here.
+*.key
+private-key.pem
+keys/
+!certs/certificate.pem
+
 # local env files
 .env*.local
 
