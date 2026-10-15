@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -85,6 +86,7 @@ class ProjectRow(Base):
     # Null and 0 both mean the staged view is private. 1 means the owner published it.
     staged_published: Mapped[int | None] = mapped_column(Integer, nullable=True)
     preview_token: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    preview_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class JobRow(Base):
@@ -147,6 +149,17 @@ class PendingWorldDeleteRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class PendingDraftCleanupRow(Base):
+    """A draft operation World Labs accepted, then the full model continued without it."""
+
+    __tablename__ = "pending_draft_cleanups"
+
+    operation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 # Types in this map are sent as raw DDL to both SQLite and Postgres.
 # TIMESTAMP is valid in both. DATETIME is not a Postgres type and crashes startup.
 _EXTRA_COLUMNS = {
@@ -170,6 +183,7 @@ _EXTRA_COLUMNS = {
     "provider_error": "TEXT",
     "staged_published": "INTEGER",
     "preview_token": "VARCHAR(64)",
+    "preview_expires_at": "TIMESTAMP",
 }
 
 _JOB_EXTRA_COLUMNS = {
@@ -226,6 +240,7 @@ class ProjectRecord:
     provider_error: str | None
     staged_published: bool
     preview_token: str | None
+    preview_expires_at: datetime | None
 
 
 @dataclass
@@ -284,6 +299,12 @@ def _ensure_columns(engine) -> None:
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS projects_preview_token "
                 "ON projects (preview_token)"
+            )
+        )
+        conn.execute(
+            text(
+                "UPDATE projects SET preview_expires_at = share_expires_at "
+                "WHERE preview_expires_at IS NULL"
             )
         )
 
@@ -378,6 +399,7 @@ def _record(row: ProjectRow) -> ProjectRecord:
         provider_error=row.provider_error,
         staged_published=bool(row.staged_published),
         preview_token=row.preview_token,
+        preview_expires_at=row.preview_expires_at,
     )
 
 
@@ -453,6 +475,7 @@ def create_project(name: str, owner_device_id: str | None = None) -> ProjectReco
         share_expires_at=share_deadline(now),
         owner_device_id=owner_device_id,
         preview_token=secrets.token_urlsafe(16),
+        preview_expires_at=share_deadline(now),
         staged_published=0,
     )
     with session_scope() as session:
@@ -471,14 +494,25 @@ def list_projects(owner_device_id: str | None = None, *, admin: bool = False) ->
 
 
 def rotate_share_token(project_id: str) -> ProjectRecord | None:
+    deadline = share_deadline()
     return update_project(
         project_id,
         share_token=secrets.token_urlsafe(16),
-        share_expires_at=share_deadline(),
+        share_expires_at=deadline,
+        preview_token=secrets.token_urlsafe(16),
+        preview_expires_at=deadline,
     )
 
 
+_PROJECT_ID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+_PUBLIC_TOKEN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
 def get_project(project_id: str) -> ProjectRecord | None:
+    if not _PROJECT_ID.fullmatch(project_id or ""):
+        return None
     with session_scope() as session:
         row = session.get(ProjectRow, project_id)
         return _record(row) if row else None
@@ -710,6 +744,8 @@ def list_delayed_world_jobs() -> list[JobRecord]:
 
 
 def get_by_share_token(token: str) -> ProjectRecord | None:
+    if not _PUBLIC_TOKEN.fullmatch(token or ""):
+        return None
     with session_scope() as session:
         row = session.scalar(select(ProjectRow).where(ProjectRow.share_token == token))
         if row is None or _share_expired(row.share_expires_at):
@@ -718,30 +754,37 @@ def get_by_share_token(token: str) -> ProjectRecord | None:
 
 
 def get_by_preview_token(token: str) -> ProjectRecord | None:
-    """Owner preview. This token does not expire with the public share link."""
-    if not token:
+    """Owner preview. It expires on its own deadline, which rotates with the share link."""
+    if not _PUBLIC_TOKEN.fullmatch(token or ""):
         return None
     with session_scope() as session:
         row = session.scalar(select(ProjectRow).where(ProjectRow.preview_token == token))
-        return _record(row) if row else None
+        if row is None:
+            return None
+        deadline = row.preview_expires_at if row.preview_expires_at is not None else row.share_expires_at
+        if _share_expired(deadline):
+            return None
+        return _record(row)
 
 
-def daily_quota_available(device_id: str | None, kind: str, limit: int) -> bool:
+def daily_quota_available(device_id: str | None, kind: str, limit: int, needed: int = 1) -> bool:
     if not device_id or limit <= 0:
         return True
     day = datetime.now(timezone.utc).date().isoformat()
     with session_scope() as session:
         row = session.get(DailyUsageRow, (device_id, day, kind))
-        return row is None or row.count < limit
+        used = 0 if row is None else row.count
+        return used + max(1, needed) <= limit
 
 
 _BUMP_QUOTA = text(
     """
     INSERT INTO daily_usage (device_id, day, kind, count)
-    VALUES (:device_id, :day, :kind, 1)
+    SELECT :device_id, :day, :kind, :amount
+    WHERE :amount <= :limit
     ON CONFLICT (device_id, day, kind)
-    DO UPDATE SET count = daily_usage.count + 1
-    WHERE daily_usage.count < :limit
+    DO UPDATE SET count = daily_usage.count + :amount
+    WHERE daily_usage.count + :amount <= :limit
     RETURNING count
     """
 )
@@ -796,10 +839,11 @@ def allow_shared_rate(bucket: str, limit: int, window_seconds: int) -> bool:
         return bump_rate_window(session, bucket, limit, window_seconds)
 
 
-def bump_quota(session: Session, device_id: str, kind: str, limit: int) -> bool:
-    """Atomically count one use. False when the row is already at ``limit``."""
+def bump_quota(session: Session, device_id: str, kind: str, limit: int, amount: int = 1) -> bool:
+    """Atomically add ``amount``. False when that would pass ``limit``."""
     if limit <= 0:
         return True
+    amount = max(1, int(amount))
     row = session.execute(
         _BUMP_QUOTA,
         {
@@ -807,6 +851,7 @@ def bump_quota(session: Session, device_id: str, kind: str, limit: int) -> bool:
             "day": datetime.now(timezone.utc).date().isoformat(),
             "kind": kind,
             "limit": limit,
+            "amount": amount,
         },
     ).first()
     return row is not None
@@ -823,7 +868,7 @@ def consume_daily_quota(device_id: str | None, kind: str, limit: int) -> bool:
 _RELEASE_QUOTA = text(
     """
     UPDATE daily_usage
-    SET count = count - 1
+    SET count = CASE WHEN count > :amount THEN count - :amount ELSE 0 END
     WHERE device_id = :device_id AND day = :day AND kind = :kind AND count > 0
     RETURNING count
     """
@@ -831,18 +876,35 @@ _RELEASE_QUOTA = text(
 
 
 def release_world_quota(session: Session, device_id: str | None, day: str) -> None:
-    """Give back one world charge from ``day``. No row means nothing was charged."""
+    """Give back one world charge, and the reserved credits, from ``day``."""
     settings = get_settings()
     if not settings.worldlabs_api_key:
         return
     if device_id and settings.worldlabs_daily_limit > 0:
-        session.execute(_RELEASE_QUOTA, {"device_id": device_id, "day": day, "kind": "worldlabs"})
+        session.execute(
+            _RELEASE_QUOTA, {"device_id": device_id, "day": day, "kind": "worldlabs", "amount": 1}
+        )
     if settings.global_daily_worlds_cap > 0:
-        session.execute(_RELEASE_QUOTA, {"device_id": GLOBAL_QUOTA_DEVICE, "day": day, "kind": "worldlabs"})
+        session.execute(
+            _RELEASE_QUOTA,
+            {"device_id": GLOBAL_QUOTA_DEVICE, "day": day, "kind": "worldlabs", "amount": 1},
+        )
+    if settings.global_daily_credits_cap > 0:
+        from services.quota import reserved_world_credits
+
+        session.execute(
+            _RELEASE_QUOTA,
+            {
+                "device_id": GLOBAL_QUOTA_DEVICE,
+                "day": day,
+                "kind": "wl_credits",
+                "amount": reserved_world_credits(),
+            },
+        )
 
 
 def charge_world_quota(session: Session, device_id: str | None) -> bool:
-    """Device cap and the global daily cap, in the caller's transaction."""
+    """Device cap, the global world cap, and the global credit cap, in one transaction."""
     settings = get_settings()
     if not settings.worldlabs_api_key:
         return True
@@ -851,6 +913,17 @@ def charge_world_quota(session: Session, device_id: str | None) -> bool:
             return False
     if settings.global_daily_worlds_cap > 0:
         if not bump_quota(session, GLOBAL_QUOTA_DEVICE, "worldlabs", settings.global_daily_worlds_cap):
+            return False
+    if settings.global_daily_credits_cap > 0:
+        from services.quota import reserved_world_credits
+
+        if not bump_quota(
+            session,
+            GLOBAL_QUOTA_DEVICE,
+            "wl_credits",
+            settings.global_daily_credits_cap,
+            amount=reserved_world_credits(),
+        ):
             return False
     return True
 
@@ -1175,6 +1248,61 @@ def pending_world_delete_ids(*, force: bool = False) -> list[str]:
 def forget_world_delete(world_id: str) -> None:
     with session_scope() as session:
         row = session.get(PendingWorldDeleteRow, world_id)
+        if row is not None:
+            session.delete(row)
+
+
+def remember_draft_cleanup(operation_id: str) -> None:
+    """Keep a draft operation id so a later free poll can delete the world it creates."""
+    from services.world_urls import valid_world_id
+
+    checked = valid_world_id(operation_id)
+    if checked is None:
+        return
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        row = session.get(PendingDraftCleanupRow, checked)
+        if row is None:
+            session.add(
+                PendingDraftCleanupRow(
+                    operation_id=checked,
+                    attempts=0,
+                    next_attempt_at=now,
+                    created_at=now,
+                )
+            )
+
+
+def due_draft_cleanups(*, force: bool = False) -> list[tuple[str, int]]:
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        query = select(PendingDraftCleanupRow)
+        if not force:
+            query = query.where(PendingDraftCleanupRow.next_attempt_at <= now)
+        rows = session.scalars(query).all()
+        return [(row.operation_id, row.attempts) for row in rows]
+
+
+def pending_draft_cleanup_ids() -> list[str]:
+    with session_scope() as session:
+        rows = session.scalars(select(PendingDraftCleanupRow)).all()
+        return [row.operation_id for row in rows]
+
+
+def note_draft_cleanup_attempt(operation_id: str) -> None:
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        row = session.get(PendingDraftCleanupRow, operation_id)
+        if row is None:
+            return
+        row.attempts += 1
+        delay = min(30 * (2 ** min(row.attempts, 8)), 6 * 3600)
+        row.next_attempt_at = now + timedelta(seconds=delay)
+
+
+def forget_draft_cleanup(operation_id: str) -> None:
+    with session_scope() as session:
+        row = session.get(PendingDraftCleanupRow, operation_id)
         if row is not None:
             session.delete(row)
 

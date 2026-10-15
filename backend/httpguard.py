@@ -63,6 +63,19 @@ def capping_receive(receive, limit: int):
     return inner
 
 
+def api_security_headers() -> list[tuple[bytes, bytes]]:
+    """Headers for JSON API responses, including /health.
+
+    Share HTML keeps its own policy. X-Frame-Options DENY would block embed=1.
+    """
+    return [
+        (b"x-content-type-options", b"nosniff"),
+        (b"x-frame-options", b"DENY"),
+        (b"referrer-policy", b"no-referrer"),
+        (b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+    ]
+
+
 def share_security_headers(query_string: bytes, ancestors: list[str]) -> list[tuple[bytes, bytes]]:
     """Headers for public share pages.
 
@@ -150,6 +163,11 @@ class GuardMiddleware:
         settings = get_settings()
         allowed = origin is not None and origin in settings.cors_origins
         ip = client_ip(_socket_host(scope), headers.get("x-forwarded-for"), settings.trusted_proxy_count)
+        raw_path = scope.get("raw_path") or b""
+        query = scope.get("query_string") or b""
+        if _has_nul(path, raw_path, query):
+            await _send_json(send, 404, {"detail": "Not found"})
+            return
 
         if method == "POST" and path.endswith("/upload"):
             cap = upload_byte_cap(settings.max_images, settings.max_image_bytes)
@@ -167,6 +185,11 @@ class GuardMiddleware:
             if not allow_shared_rate(_bucket(headers, ip), settings.rate_limit_per_minute, 60):
                 await _send_json(send, 429, {"detail": "Too many requests"})
                 return
+        if (path.startswith("/v/") or path.startswith("/p/")) and not limiter.allow(
+            f"share:{ip}", settings.share_rate_per_minute, 60
+        ):
+            await _send_json(send, 429, {"detail": "Too many requests"})
+            return
 
         if method == "OPTIONS" and origin:
             if not allowed:
@@ -194,6 +217,8 @@ class GuardMiddleware:
                     extra.extend(
                         share_security_headers(scope.get("query_string") or b"", settings.embed_frame_ancestors)
                     )
+                elif path.startswith("/api/") or path == "/health":
+                    extra.extend(api_security_headers())
                 if extra:
                     merged = list(message.get("headers") or [])
                     merged.extend(extra)
@@ -209,6 +234,12 @@ class GuardMiddleware:
         return limiter.allow(_bucket(headers, ip), settings.rate_limit_per_minute, 60)
 
 
+def _has_nul(path: str, raw_path: bytes, query: bytes) -> bool:
+    if "\x00" in path or b"\x00" in raw_path or b"\x00" in query:
+        return True
+    return b"%00" in raw_path.lower() or b"%00" in query.lower()
+
+
 async def _send_json(send, status: int, body: dict) -> None:
     raw = json.dumps(body).encode()
     await send(
@@ -218,6 +249,7 @@ async def _send_json(send, status: int, body: dict) -> None:
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(raw)).encode()),
+                *api_security_headers(),
             ],
         }
     )

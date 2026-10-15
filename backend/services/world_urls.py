@@ -18,6 +18,29 @@ def valid_world_id(value: object) -> str | None:
     return value
 
 
+def valid_upload_url(value: object) -> str | None:
+    """HTTPS upload target on World Labs or the Google storage host they return.
+
+    A prepare_upload response is provider data, not a user URL, but it is still
+    requested with the panorama bytes. Anything else is refused before the call.
+    """
+    if not isinstance(value, str) or any(char in value for char in ("\n", "\r", "\\")):
+        return None
+    parsed = urlparse(value.strip())
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    allowed = (
+        host == "worldlabs.ai"
+        or host.endswith(".worldlabs.ai")
+        or host == "storage.googleapis.com"
+        or host.endswith(".storage.googleapis.com")
+    )
+    if not allowed or not parsed.path or parsed.path == "/":
+        return None
+    return value.strip()
+
+
 def valid_marble_url(value: object) -> str | None:
     """HTTPS URL on worldlabs.ai or a subdomain, with no embedded credentials."""
     if not isinstance(value, str) or any(char in value for char in ("\n", "\r", "\\")):

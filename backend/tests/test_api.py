@@ -262,14 +262,21 @@ def test_staged_view_stays_private_until_the_owner_publishes(client):
 
     rotated = client.post(f"/api/v1/projects/{project_id}/share/rotate").json()
     assert rotated["share_token"] != token
-    assert rotated["preview_url"] == preview_url
+    assert rotated["preview_url"] != preview_url
+    new_preview = rotated["preview_url"].rstrip("/").rsplit("/", 1)[-1]
+    assert client.get(f"/p/{preview_token}?view=compare").status_code == 404
     update_project(
         project_id,
         share_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
     assert client.get(f"/v/{rotated['share_token']}").status_code == 404
-    assert client.get(f"/p/{preview_token}?view=compare").status_code == 200
-    assert 'data-mode="compare"' in client.get(f"/p/{preview_token}?view=compare").text
+    assert client.get(f"/p/{new_preview}?view=compare").status_code == 200
+    assert 'data-mode="compare"' in client.get(f"/p/{new_preview}?view=compare").text
+    update_project(
+        project_id,
+        preview_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    assert client.get(f"/p/{new_preview}?view=compare").status_code == 404
 
     published_again = client.post(f"/api/v1/projects/{project_id}/staged/publish").json()
     assert published_again["staged_published"] is True
@@ -282,7 +289,7 @@ def test_staged_view_stays_private_until_the_owner_publishes(client):
     cleared = client.get(f"/api/v1/projects/{project_id}").json()
     assert cleared["staged_published"] is False
     assert cleared["has_staged"] is False
-    assert cleared["preview_url"] == preview_url
+    assert cleared["preview_url"] == rotated["preview_url"]
 
 
 def test_device_token_and_admin_key(client, monkeypatch):

@@ -23,6 +23,17 @@ def consume_staging_quota(device_id: str | None) -> bool:
     return consume_daily_quota(device_id, "gemini", settings.gemini_daily_limit)
 
 
+def reserved_world_credits() -> int:
+    """Credits held when a world is queued: the full model, plus the draft when it is on."""
+    from services.world_gen import credits_required
+
+    settings = get_settings()
+    total = credits_required(settings.worldlabs_model)
+    if settings.worldlabs_draft_model:
+        total += credits_required(settings.worldlabs_draft_model)
+    return total
+
+
 def world_quota_blocks(device_id: str | None) -> bool:
     settings = get_settings()
     if not settings.worldlabs_api_key:
@@ -35,6 +46,14 @@ def world_quota_blocks(device_id: str | None) -> bool:
         return True
     if settings.global_daily_worlds_cap > 0 and not daily_quota_available(
         GLOBAL_QUOTA_DEVICE, "worldlabs", settings.global_daily_worlds_cap
+    ):
+        return True
+    credits = reserved_world_credits()
+    if settings.global_daily_credits_cap > 0 and not daily_quota_available(
+        GLOBAL_QUOTA_DEVICE,
+        "wl_credits",
+        settings.global_daily_credits_cap,
+        needed=credits,
     ):
         return True
     return False

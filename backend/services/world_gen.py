@@ -13,8 +13,16 @@ from email.utils import parsedate_to_datetime
 import httpx
 
 from config import get_settings
-from db import forget_world_delete, pending_world_delete_ids, queue_world_deletes
-from services.world_urls import valid_marble_url, valid_world_id
+from db import (
+    due_draft_cleanups,
+    forget_draft_cleanup,
+    forget_world_delete,
+    note_draft_cleanup_attempt,
+    pending_world_delete_ids,
+    queue_world_deletes,
+    remember_draft_cleanup,
+)
+from services.world_urls import valid_marble_url, valid_upload_url, valid_world_id
 from services.world_gen_mock import mock_generate_3d
 
 logger = logging.getLogger(__name__)
@@ -458,6 +466,15 @@ async def _generate_models(
     on_tick=None,
 ) -> dict:
     final = None
+    draft_operation_id: str | None = None
+
+    async def _remember_operation(operation_id: str, remembered_phase: str) -> None:
+        nonlocal draft_operation_id
+        if remembered_phase == "draft":
+            draft_operation_id = operation_id
+        if on_operation is not None:
+            await on_operation(operation_id, remembered_phase)
+
     for index, model in enumerate(models):
         phase = "full" if index == len(models) - 1 else "draft"
         timeout_s = DRAFT_WORLD_TIMEOUT_S if phase == "draft" else FULL_WORLD_TIMEOUT_S
@@ -471,7 +488,7 @@ async def _generate_models(
                 public,
                 timeout_s,
                 phase=phase,
-                on_operation=on_operation,
+                on_operation=_remember_operation,
                 on_submitting=on_submitting,
                 on_tick=on_tick,
             )
@@ -480,11 +497,13 @@ async def _generate_models(
                 raise
             if phase == "draft" and not _is_out_of_credits(exc):
                 logger.error("Draft world failed (%s); continuing with the full model", exc.detail)
+                await _abandon_draft_operation(client, headers, draft_operation_id)
                 continue
             raise
         except Exception:
             if phase == "draft":
                 logger.exception("Draft world failed; continuing with the full model")
+                await _abandon_draft_operation(client, headers, draft_operation_id)
                 continue
             raise
         if phase == "draft":
@@ -520,11 +539,21 @@ async def delete_worlds(world_ids: list[str | None]) -> None:
             queue_world_deletes([world_id], error or "delete failed")
 
 
+# A draft finishes in seconds. Stop polling an operation that never settles.
+_DRAFT_CLEANUP_ATTEMPTS = 24
+
+
 async def retry_pending_world_deletes(*, force: bool = False) -> int:
-    """Retry Marble deletes that failed earlier. Returns how many are now gone."""
+    """Retry Marble deletes, and poll draft operations that were left behind.
+
+    The draft poll is a GET. It does not call worlds:generate.
+    """
     settings = get_settings()
+    if not settings.worldlabs_api_key:
+        return 0
     ids = pending_world_delete_ids(force=force)
-    if not ids or not settings.worldlabs_api_key:
+    cleanups = due_draft_cleanups(force=force)
+    if not ids and not cleanups:
         return 0
     headers = {"WLT-Api-Key": settings.worldlabs_api_key}
     cleared = 0
@@ -538,6 +567,7 @@ async def retry_pending_world_deletes(*, force: bool = False) -> int:
                 continue
             logger.error("Marble delete retry for %s failed: %s", world_id, error)
             queue_world_deletes([world_id], error or "delete failed")
+        await _settle_draft_cleanups(client, headers, cleanups)
     return cleared
 
 
@@ -568,12 +598,13 @@ async def _upload_panorama(client: httpx.AsyncClient, headers: dict, image_bytes
     payload = prepared.json()
     media_id = (payload.get("media_asset") or {}).get("media_asset_id")
     upload = payload.get("upload_info") or {}
-    if not media_id or not upload.get("upload_url"):
-        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs did not return an upload URL")
+    upload_url = valid_upload_url(upload.get("upload_url"))
+    method = str(upload.get("upload_method") or "PUT").upper()
+    if not media_id or upload_url is None or method not in {"PUT", "POST"}:
+        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs returned an upload URL that was not accepted")
     put_headers = dict(upload.get("required_headers") or {})
-    method = (upload.get("upload_method") or "PUT").upper()
     uploaded = await _send_retrying_rate_limit(
-        lambda: client.request(method, upload["upload_url"], content=image_bytes, headers=put_headers)
+        lambda: client.request(method, upload_url, content=image_bytes, headers=put_headers)
     )
     _raise_for_status(uploaded, "World Labs upload failed")
     return media_id
@@ -605,9 +636,9 @@ async def _generate_model(
     )
     _raise_for_status(started, "World Labs rejected world generation")
     operation = started.json()
-    operation_id = operation.get("operation_id")
-    if not operation_id:
-        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs did not return an operation id")
+    operation_id = valid_world_id(operation.get("operation_id"))
+    if operation_id is None:
+        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs returned an operation id that was not accepted")
     if on_operation is not None:
         await on_operation(operation_id, phase)
     clear_world_credits_cache()
@@ -629,6 +660,9 @@ async def _poll_until_done(
     on_tick=None,
     phase: str = "full",
 ) -> dict:
+    operation_id = valid_world_id(operation_id) or ""
+    if not operation_id:
+        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs returned an operation id that was not accepted")
     operation = operation or {"operation_id": operation_id, "done": False}
     deadline = time.monotonic() + timeout_s
     while not operation.get("done"):
@@ -647,6 +681,83 @@ async def _poll_until_done(
         if not operation.get("done"):
             await asyncio.sleep(5)
     return operation
+
+
+async def _abandon_draft_operation(
+    client: httpx.AsyncClient, headers: dict, operation_id: str | None
+) -> None:
+    """One free GET. A finished world is queued for delete; a live one is remembered.
+
+    This never calls worlds:generate and never raises into the full-model attempt.
+    """
+    try:
+        checked = valid_world_id(operation_id)
+        if checked is None:
+            return
+        response = await client.get(f"{WORLDLABS_BASE}/marble/v1/operations/{checked}", headers=headers)
+        if response.status_code >= 400:
+            remember_draft_cleanup(checked)
+            return
+        body = response.json()
+        operation = body if isinstance(body, dict) else {}
+        world_id = parse_world(operation).get("world_id")
+        if world_id:
+            queue_world_deletes([world_id], "orphaned draft")
+            forget_draft_cleanup(checked)
+            return
+        if operation.get("done"):
+            forget_draft_cleanup(checked)
+            return
+        remember_draft_cleanup(checked)
+    except Exception:
+        logger.exception("Could not check orphaned draft operation %s", operation_id)
+        try:
+            if valid_world_id(operation_id):
+                remember_draft_cleanup(str(operation_id))
+        except Exception:
+            logger.exception("Could not queue orphaned draft operation %s", operation_id)
+
+
+async def _settle_draft_cleanups(
+    client: httpx.AsyncClient,
+    headers: dict,
+    rows: list[tuple[str, int]],
+) -> None:
+    for operation_id, attempts in rows:
+        if attempts >= _DRAFT_CLEANUP_ATTEMPTS:
+            logger.error("Giving up on orphaned draft operation %s", operation_id)
+            forget_draft_cleanup(operation_id)
+            continue
+        checked = valid_world_id(operation_id)
+        if checked is None:
+            forget_draft_cleanup(operation_id)
+            continue
+        try:
+            response = await client.get(
+                f"{WORLDLABS_BASE}/marble/v1/operations/{checked}", headers=headers
+            )
+        except Exception:
+            logger.exception("Could not poll orphaned draft operation %s", checked)
+            note_draft_cleanup_attempt(checked)
+            continue
+        if response.status_code >= 400:
+            note_draft_cleanup_attempt(checked)
+            continue
+        try:
+            body = response.json()
+        except Exception:
+            note_draft_cleanup_attempt(checked)
+            continue
+        operation = body if isinstance(body, dict) else {}
+        world_id = parse_world(operation).get("world_id")
+        if world_id:
+            queue_world_deletes([world_id], "orphaned draft")
+            forget_draft_cleanup(checked)
+            continue
+        if operation.get("done"):
+            forget_draft_cleanup(checked)
+            continue
+        note_draft_cleanup_attempt(checked)
 
 
 def _raise_for_status(response: httpx.Response, fallback: str) -> None:
