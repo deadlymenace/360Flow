@@ -11,8 +11,10 @@ export interface Project {
   staging_prompt: string | null;
   share_token: string;
   share_url: string | null;
+  preview_url: string | null;
   has_original: boolean;
   has_staged: boolean;
+  staged_published: boolean;
   staging_provider: string | null;
   world_provider: string | null;
   world_viewer_url: string | null;
@@ -39,6 +41,7 @@ export type ProjectStatus =
   | 'staging'
   | 'staged'
   | 'generating_3d'
+  | 'delayed'
   | 'complete'
   | 'failed';
 
@@ -164,6 +167,7 @@ export function getStatusLabel(status: ProjectStatus): string {
     case 'staging': return 'Staging...';
     case 'staged': return 'Staged';
     case 'generating_3d': return 'Generating 3D...';
+    case 'delayed': return '3D delayed';
     case 'complete': return '3D Ready';
     case 'failed': return 'Failed';
   }

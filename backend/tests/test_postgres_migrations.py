@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
-from db import Base, ProjectRow, _EXTRA_COLUMNS, _ensure_columns
+from db import Base, ProjectRow, _EXTRA_COLUMNS, _ensure_columns, _ensure_job_schema
 
 # Shared by SQLite and Postgres. DATETIME is rejected by Postgres.
 _SAFE_TYPE = re.compile(r"^(TEXT|INTEGER|BIGINT|REAL|DOUBLE PRECISION|TIMESTAMP|VARCHAR\(\d+\))$")
@@ -60,6 +60,9 @@ def test_sqlite_migration_adds_share_expiry_as_timestamp():
         conn.execute(text(_OLD_PROJECTS))
     _migrate_like_startup(engine)
     _assert_share_expiry_roundtrip(engine)
+    indexes = {index["name"] for index in inspect(engine).get_indexes("projects")}
+    assert "projects_preview_token" in indexes
+    _assert_rate_window_is_shared(engine)
     engine.dispose()
 
 
@@ -73,7 +76,9 @@ def test_postgres_migration_adds_every_column():
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS pending_world_deletes"))
         conn.execute(text("DROP TABLE IF EXISTS daily_usage"))
+        conn.execute(text("DROP TABLE IF EXISTS rate_windows"))
         conn.execute(text("DROP TABLE IF EXISTS devices"))
+        conn.execute(text("DROP TABLE IF EXISTS jobs"))
         conn.execute(text("DROP TABLE IF EXISTS projects"))
         conn.execute(text(_OLD_PROJECTS))
     _migrate_like_startup(engine)
@@ -83,14 +88,41 @@ def test_postgres_migration_adds_every_column():
     assert data_type.startswith("timestamp"), data_type
     _assert_share_expiry_roundtrip(engine)
     table_names = set(inspect(engine).get_table_names())
-    assert {"devices", "daily_usage", "pending_world_deletes"} <= table_names
+    assert {"devices", "daily_usage", "pending_world_deletes", "jobs", "rate_windows"} <= table_names
+    index_names = {index["name"] for index in inspect(engine).get_indexes("jobs")}
+    assert "jobs_one_open_per_project" in index_names
+    project_indexes = {index["name"] for index in inspect(engine).get_indexes("projects")}
+    assert "projects_preview_token" in project_indexes
+    with engine.begin() as conn:
+        locked = conn.execute(text("SELECT pg_try_advisory_lock(360360160)")).scalar()
+        assert locked is True
+        conn.execute(text("SELECT pg_advisory_unlock(360360160)"))
+        conn.execute(
+            text(
+                "SELECT id FROM jobs WHERE status IN ('pending', 'running') FOR UPDATE SKIP LOCKED"
+            )
+        )
+    _assert_rate_window_is_shared(engine)
     engine.dispose()
+
+
+def _assert_rate_window_is_shared(engine) -> None:
+    """Two sessions see one counter. A process-local limiter would not."""
+    from db import bump_rate_window
+
+    with Session(engine) as session:
+        assert bump_rate_window(session, "health-share", 1, 60) is True
+        session.commit()
+    with Session(engine) as session:
+        assert bump_rate_window(session, "health-share", 1, 60) is False
+        session.commit()
 
 
 def _migrate_like_startup(engine) -> None:
     """Same order as ``init_db``: create missing tables, then alter projects."""
     Base.metadata.create_all(engine)
     _ensure_columns(engine)
+    _ensure_job_schema(engine)
 
 
 def _assert_share_expiry_roundtrip(engine) -> None:

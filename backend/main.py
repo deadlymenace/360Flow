@@ -2,17 +2,20 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from auth import _admin_key_matches
 from config import get_settings
 from db import fail_interrupted_jobs, init_db
+from db import try_resume_leadership
+from services.pipeline import resume_durable_jobs, retry_delayed_worlds
 from httpguard import GuardMiddleware
 from routers.devices import router as devices_router
 from routers.projects import router as projects_router
 from routers.share import router as share_router
-from services.world_gen import retry_pending_world_deletes
+from services.world_gen import retry_pending_world_deletes, world_credits_balance
 from storage import init_storage
 
 
@@ -22,6 +25,12 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
     init_db(settings)
     init_storage(settings)
+    resumed = await resume_durable_jobs()
+    if resumed:
+        logging.getLogger(__name__).warning("Resumed %d durable jobs", resumed)
+    released = await retry_delayed_worlds()
+    if released:
+        logging.getLogger(__name__).info("Released %d delayed 3D jobs", released)
     interrupted = fail_interrupted_jobs()
     if interrupted:
         logging.getLogger(__name__).warning("Marked %d interrupted jobs as failed", interrupted)
@@ -33,6 +42,16 @@ async def lifespan(app: FastAPI):
                 await retry_pending_world_deletes()
             except Exception:
                 logging.getLogger(__name__).exception("World delete retry failed")
+            try:
+                leader, just_acquired = try_resume_leadership()
+                if leader:
+                    await resume_durable_jobs(fresh_running=just_acquired)
+            except Exception:
+                logging.getLogger(__name__).exception("Job resume failed")
+            try:
+                await retry_delayed_worlds()
+            except Exception:
+                logging.getLogger(__name__).exception("Delayed world retry failed")
             try:
                 await asyncio.wait_for(stop.wait(), timeout=60)
             except asyncio.TimeoutError:
@@ -76,8 +95,12 @@ def create_app() -> FastAPI:
     app.include_router(share_router)
 
     @app.get("/health")
-    async def health():
+    async def health(x_api_key: str | None = Header(default=None)):
+        if not _admin_key_matches(x_api_key):
+            return {"status": "ok"}
         current = get_settings()
+        remaining = await world_credits_balance()
+        threshold = current.worldlabs_low_credit_threshold
         return {
             "status": "ok",
             "storage": current.storage_backend_name,
@@ -85,7 +108,9 @@ def create_app() -> FastAPI:
             "staging": current.staging_mode,
             "world": current.world_mode,
             "auth": current.auth_mode,
-            "admin": bool(current.api_key),
+            "admin": True,
+            "worldlabs_credits": remaining,
+            "worldlabs_low_balance": remaining is not None and remaining < threshold,
         }
 
     return app

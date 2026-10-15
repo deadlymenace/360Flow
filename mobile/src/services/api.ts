@@ -150,6 +150,22 @@ class APIService {
     return output.uri;
   }
 
+  async publishStaged(projectId: string): Promise<Project> {
+    const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/staged/publish`, {
+      method: 'POST',
+    });
+    if (!res.ok) throw new Error(`Publish staged view failed: ${res.status}`);
+    return res.json();
+  }
+
+  async unpublishStaged(projectId: string): Promise<Project> {
+    const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/staged/unpublish`, {
+      method: 'POST',
+    });
+    if (!res.ok) throw new Error(`Unpublish staged view failed: ${res.status}`);
+    return res.json();
+  }
+
   async startStaging(projectId: string, prompt: string): Promise<void> {
     const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}/stage`, {
       method: 'POST',

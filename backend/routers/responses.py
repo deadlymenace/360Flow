@@ -18,6 +18,7 @@ _PROGRESS = {
     "staging": 55,
     "staged": 100,
     "generating_3d": 70,
+    "delayed": 70,
     "complete": 100,
     "failed": 100,
 }
@@ -30,13 +31,24 @@ def share_url(token: str, request: Request | None = None) -> str | None:
     """
     del request
     base = get_settings().public_base_url
-    if not base:
+    if not base or not token:
         return None
     return f"{base.rstrip('/')}/v/{token}"
 
 
-def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
+def preview_url(token: str | None) -> str | None:
+    """Owner-only viewer. It is not the public share link."""
+    if not token:
+        return None
+    base = get_settings().public_base_url
+    if not base:
+        return None
+    return f"{base.rstrip('/')}/p/{token}"
+
+
+def to_project(row: ProjectRecord, request: Request | None = None, *, admin: bool = False) -> Project:
     share = share_url(row.share_token, request)
+    private = preview_url(row.preview_token)
     staged = bool(row.staged_key)
     return Project(
         id=row.id,
@@ -50,8 +62,10 @@ def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
         share_token=row.share_token,
         share_url=share,
         share_expires_at=row.share_expires_at,
+        preview_url=private,
         has_original=bool(row.panorama_key),
         has_staged=staged,
+        staged_published=bool(row.staged_published),
         staging_provider=row.staging_provider,
         world_provider=row.world_provider,
         world_viewer_url=f"{share}/world" if row.panorama_key else None,
@@ -62,12 +76,13 @@ def to_project(row: ProjectRecord, request: Request | None = None) -> Project:
         world_preview_url=row.world_preview_url,
         staged_world_marble_url=row.staged_world_marble_url,
         staged_world_preview_url=row.staged_world_preview_url,
-        staged_world_viewer_url=f"{share}/world?source=staged" if staged else None,
+        staged_world_viewer_url=f"{private}/world?source=staged" if staged and private else None,
         staging_notes=row.staging_notes,
         staging_status=row.staging_status,
         staging_error=row.staging_error,
         active_job=row.active_job,
         disclosure=DISCLOSURE_TEXT if staged else None,
+        provider_error=row.provider_error if admin else None,
     )
 
 
@@ -79,6 +94,7 @@ def status_body(row: ProjectRecord, request: Request | None = None) -> dict:
         "share_url": share_url(row.share_token),
         "has_original": bool(row.panorama_key),
         "has_staged": bool(row.staged_key),
+        "staged_published": bool(row.staged_published),
         "staging_provider": row.staging_provider,
         "staging_status": row.staging_status,
         "staging_error": row.staging_error,

@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from auth import _admin_key_matches
 from config import get_settings
-from db import device_id_for_token
+from db import allow_shared_rate, device_id_for_token
 from ratelimit import limiter
 
 _UPLOAD_OVERHEAD = 256 * 1024
@@ -70,9 +70,8 @@ def share_security_headers(query_string: bytes, ancestors: list[str]) -> list[tu
     allowlist so the in-app WebView and listing embeds are not blocked.
     """
     embed = _embed_requested(query_string)
-    if embed:
-        sources = " ".join(ancestors) if ancestors else "*"
-        frame = f"frame-ancestors {sources}"
+    if embed and ancestors:
+        frame = "frame-ancestors " + " ".join(ancestors)
     else:
         frame = "frame-ancestors 'none'"
     policy = (
@@ -163,6 +162,11 @@ class GuardMiddleware:
         if path.startswith("/api/") and not self._within_limit(path, method, headers, ip, settings):
             await _send_json(send, 429, {"detail": "Too many requests"})
             return
+        if path == "/health" and headers.get("x-api-key"):
+            # The counter is a database row so replicas share one limit.
+            if not allow_shared_rate(_bucket(headers, ip), settings.rate_limit_per_minute, 60):
+                await _send_json(send, 429, {"detail": "Too many requests"})
+                return
 
         if method == "OPTIONS" and origin:
             if not allowed:
@@ -186,7 +190,7 @@ class GuardMiddleware:
                 if allowed and origin:
                     extra.append((b"access-control-allow-origin", origin.encode()))
                     extra.append((b"vary", b"Origin"))
-                if path.startswith("/v/"):
+                if path.startswith("/v/") or path.startswith("/p/"):
                     extra.extend(
                         share_security_headers(scope.get("query_string") or b"", settings.embed_frame_ancestors)
                     )

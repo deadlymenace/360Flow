@@ -81,6 +81,10 @@ class Settings:
     trusted_proxy_count: int
     gemini_daily_limit: int
     worldlabs_daily_limit: int
+    global_daily_worlds_cap: int
+    world_delay_max_hours: int
+    world_delay_max_attempts: int
+    job_claim_stale_seconds: int
     share_link_ttl_days: int
     embed_frame_ancestors: list[str]
     max_image_pixels: int
@@ -91,6 +95,12 @@ class Settings:
     worldlabs_model: str
     worldlabs_draft_model: str | None
     worldlabs_public: bool
+    worldlabs_low_credit_threshold: int
+    worldlabs_concurrency: int
+    worldlabs_retry_attempts: int
+    worldlabs_retry_base_seconds: float
+    worldlabs_retry_max_seconds: float
+    worker_concurrency: int
     stitch_concurrency: int
     jobs_inline: bool
     mock_stage_delay: float
@@ -173,6 +183,10 @@ def get_settings() -> Settings:
         trusted_proxy_count=max(0, _int("TRUSTED_PROXY_COUNT", 1)),
         gemini_daily_limit=max(0, _int("GEMINI_JOBS_PER_DEVICE_PER_DAY", 20)),
         worldlabs_daily_limit=max(0, _int("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", 10)),
+        global_daily_worlds_cap=max(0, _int("GLOBAL_DAILY_WORLDS_CAP", 100)),
+        world_delay_max_hours=max(1, _int("WORLD_DELAY_MAX_HOURS", 24)),
+        world_delay_max_attempts=max(1, _int("WORLD_DELAY_MAX_ATTEMPTS", 48)),
+        job_claim_stale_seconds=max(30, _int("JOB_CLAIM_STALE_SECONDS", 120)),
         share_link_ttl_days=max(0, _int("SHARE_LINK_TTL_DAYS", 30)),
         embed_frame_ancestors=ancestors,
         max_image_pixels=max(1, _int("MAX_IMAGE_PIXELS", 24_000_000)),
@@ -183,6 +197,12 @@ def get_settings() -> Settings:
         worldlabs_model=_blank("WORLDLABS_MODEL") or "marble-1.1",
         worldlabs_draft_model=draft_model,
         worldlabs_public=_bool("WORLDLABS_PUBLIC", False),
+        worldlabs_low_credit_threshold=max(0, _int("WORLDLABS_LOW_CREDIT_THRESHOLD", 6000)),
+        worldlabs_concurrency=max(1, _int("WORLDLABS_CONCURRENCY", 2)),
+        worldlabs_retry_attempts=max(1, _int("WORLDLABS_RETRY_ATTEMPTS", 5)),
+        worldlabs_retry_base_seconds=max(0.0, _float("WORLDLABS_RETRY_BASE_SECONDS", 0.5)),
+        worldlabs_retry_max_seconds=max(0.0, _float("WORLDLABS_RETRY_MAX_SECONDS", 32)),
+        worker_concurrency=max(1, _int("WORKER_CONCURRENCY", 3)),
         stitch_concurrency=max(1, _int("STITCH_CONCURRENCY", 1)),
         jobs_inline=_bool("JOBS_INLINE", False),
         mock_stage_delay=_float("MOCK_STAGE_DELAY", 3),

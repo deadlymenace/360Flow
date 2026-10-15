@@ -13,6 +13,7 @@ class ProjectStatus(str, Enum):
     STAGING = "staging"
     STAGED = "staged"
     GENERATING_3D = "generating_3d"
+    DELAYED = "delayed"
     COMPLETE = "complete"
     FAILED = "failed"
 
@@ -29,8 +30,10 @@ class Project(BaseModel):
     share_token: str
     share_url: Optional[str] = None
     share_expires_at: Optional[datetime] = None
+    preview_url: Optional[str] = None
     has_original: bool = False
     has_staged: bool = False
+    staged_published: bool = False
     staging_provider: Optional[str] = None
     world_provider: Optional[str] = None
     world_viewer_url: Optional[str] = None
@@ -47,6 +50,7 @@ class Project(BaseModel):
     staging_error: Optional[str] = None
     active_job: Optional[str] = None
     disclosure: Optional[str] = None
+    provider_error: Optional[str] = None
 
 
 class CreateProjectRequest(BaseModel):
@@ -54,7 +58,7 @@ class CreateProjectRequest(BaseModel):
 
 
 class StageRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=2000)
+    prompt: str = Field(min_length=1, max_length=400)
 
 
 class UploadMetadata(BaseModel):

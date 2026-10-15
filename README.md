@@ -10,7 +10,7 @@ The working app is the Expo project in `mobile/`. The API is the FastAPI service
 2. The API stitches those photos into an exact 2:1 equirectangular JPEG. The left and right edges are sealed so they match. A 16-shot ring covers about ±54° of latitude, so the zenith and nadir are inpainted caps, not photographed ceiling and floor. Optional upward and downward shots can be added later if the ceiling and floor need real geometry.
 3. The app and the public share page show the panorama immediately.
 4. World Labs Marble builds a 3D walkthrough from that original panorama (`is_pano`). A fast draft (`marble-1.0-draft`, about 20 seconds) is shown while the full world (`marble-1.1`) generates. Full worlds have taken about 10 minutes, and the client keeps polling for at least 15.
-5. Staging is optional. A prompt or furniture preset asks Gemini to add furniture and decor on five overlapping views, keeping the original ceiling and floor. The unstaged panorama stays stored. Every staged view, every staged 3D world, and every exported staged JPEG carries the label **Virtually staged (AI)** and can be compared with the original. A staged panorama can get its own 3D world.
+5. Staging is optional. A prompt or furniture preset asks Gemini to add furniture and decor on five overlapping views, keeping the original ceiling and floor. The unstaged panorama stays stored. Every staged view, every staged 3D world, and every exported staged JPEG carries the label **Virtually staged (AI)** and can be compared with the original. The owner sees that comparison privately first. The public share page keeps showing only the original panorama and original 3D until the owner taps **Publish staged view**. Unpublish hides the staged view again. A staged panorama can get its own 3D world.
 
 ## Run it locally
 
@@ -75,7 +75,7 @@ An iOS build that you can install through TestFlight needs an Apple Developer ac
 
 ## Mock providers and real APIs
 
-`GET /health` reports which path is active:
+`GET /health` returns `{"status": "ok"}`. The same request with the operator `X-API-Key` reports which path is active:
 
 | Field | Empty key | Key set |
 | --- | --- | --- |
@@ -89,18 +89,18 @@ Project records use `gemini_mock` / `gemini` and `worldlabs_mock` / `worldlabs`.
 
 Leave `GEMINI_API_KEY` unset and staging applies a local color grade. It does not add furniture. Set the key and the API calls the [Gemini image API](https://ai.google.dev/gemini-api/docs/image-generation): `POST https://generativelanguage.googleapis.com/v1/models/{model}:generateContent` with header `x-goog-api-key`, inline JPEG bytes, and `responseModalities` of `TEXT` and `IMAGE`. The default model is `gemini-3.1-flash-image`. Override with `GEMINI_MODEL` if you need a different id. A provider quota or `429 RESOURCE_EXHAUSTED` response tells the client `AI staging is unavailable right now (provider quota)`. Any other Gemini failure says `Staging failed. Try again.` and leaves the panorama and 3D world in place. Staging status is stored separately from the project status. It does not silently fall back to the mock.
 
-Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the panorama on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean panorama (the original, or the unlabeled staged JPEG for a staged world) and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true`. The draft model `marble-1.0-draft` runs first. Its world id and Marble URL are stored while `marble-1.1` (`WORLDLABS_MODEL`) continues, and the app shows that draft. A draft failure is logged and the full model still runs. The full-world poll waits 20 minutes. Set `WORLDLABS_DRAFT_MODEL` to `off` to skip the draft. Worlds are private unless `WORLDLABS_PUBLIC` is true. The name sent to Marble is the project id. Deleting a capture deletes the draft world, the full world, and the same pair for a staged world. A world that finishes after the capture was deleted is deleted too.
+Leave `WORLDLABS_API_KEY` unset and world generation returns mock asset URLs and no Marble link. The viewer then shows the panorama on a sphere and says a navigable world has not been generated yet. Set the key and the API uploads the clean panorama (the original, or the unlabeled staged JPEG for a staged world) and calls [Marble](https://docs.worldlabs.ai/api) `worlds:generate` with `is_pano: true`. The draft model `marble-1.0-draft` runs first. Its world id and Marble URL are stored while `marble-1.1` (`WORLDLABS_MODEL`) continues, and the app shows that draft. A draft failure other than a rate limit or out-of-credits response is logged and the full model still runs. HTTP 429 is retried with exponential backoff and jitter, never sooner than a `Retry-After` header, and only up to `WORLDLABS_RETRY_ATTEMPTS`. Once a draft operation id exists, a later attempt polls that operation instead of calling `worlds:generate` again. `WORLDLABS_CONCURRENCY` (default 2) caps how many World Labs jobs run at once, separately from `WORKER_CONCURRENCY`. The full-world poll waits 20 minutes. Set `WORLDLABS_DRAFT_MODEL` to `off` to skip the draft. Worlds are private unless `WORLDLABS_PUBLIC` is true. The name sent to Marble is the project id. Deleting a capture, or regenerating a world, deletes the previous full world and the previous draft world at World Labs. Each deletion is logged with its world id. A world that finishes after the capture was deleted is deleted too.
 
 ## Staging label and preservation
 
 The unstaged panorama is stored at `panoramas/{id}.jpg` and is never overwritten by staging. The clean staged JPEG is stored at `staged/{id}.jpg`.
 
-- In the app, Original / Compare / Staged switches the 360 viewer. Staged and Compare show **Virtually staged (AI)**.
-- The public page `/v/{share_token}` has the same modes and the same label. `/v/{share_token}/world` is the original walkthrough and hides the label. `/v/{share_token}/world?source=staged` keeps the label.
-- `GET /v/{token}/staged.jpg` and the in-app export download that JPEG with the label burned into a bar along the bottom.
-- The sphere texture (`/v/{token}/texture.jpg`) is the clean staged JPEG so the bar is not smeared across the south pole. The on-screen label is still shown.
+- In the app, Original / Compare / Staged switches the 360 viewer. Staged and Compare show **Virtually staged (AI)**. That viewer uses a private preview URL returned only on the owner's project. The Share button still sends the public link.
+- The public page `/v/{share_token}` shows the original panorama and the original 3D walkthrough. Staged controls, `staged.jpg`, `texture.jpg`, and `/world?source=staged` stay off that page until the owner publishes. `/v/{share_token}/world` is the original walkthrough and hides the label. After publish, `/v/{share_token}/world?source=staged` keeps the label.
+- After publish, `GET /v/{token}/staged.jpg` downloads the JPEG with the label burned into a bar along the bottom. Before publish, that URL is 404. The in-app export uses the private preview URL, so the owner can save the labeled JPEG first.
+- After publish, the sphere texture (`/v/{token}/texture.jpg`) is the clean staged JPEG so the bar is not smeared across the south pole. The on-screen label is still shown. The owner preview uses the same clean texture.
 
-The user's prompt only chooses style and furniture. `build_staging_prompt` in `backend/services/disclosure.py` always puts a fixed instruction first: preserve walls, windows, doors, glass, floors, ceilings, and fixtures, and only add movable furniture and decor. Presets in the app describe furniture only.
+The user's prompt only chooses style and furniture. `build_staging_prompt` in `backend/services/disclosure.py` is the fixed instruction: preserve walls, windows, doors, glass, floors, ceilings, and fixtures, and only add movable furniture and decor. The style text is a separate quoted content part, length-capped, and is not concatenated into those rules. Presets in the app describe furniture only. A view where Gemini answers with text and no image is retried once; a second text-only answer fails that staging run.
 
 This is best effort. Gemini can still change architecture even when the prompt forbids it. Each view is checked against the original edges; a view that moves walls or windows is retried once and then kept as the original photo, with a note on the project. The original panorama stays available so a person can compare and discard a bad result. The product does not claim the model guarantees preservation.
 
@@ -164,11 +164,20 @@ Backend (`backend/.env.example`):
 | `GEMINI_IMAGE_SIZE` | `1K`, `2K`, or `4K` (default `1K`) |
 | `GEMINI_JOBS_PER_DEVICE_PER_DAY` | Paid staging cap. Default 20. `0` disables it |
 | `WORLDLABS_JOBS_PER_DEVICE_PER_DAY` | Paid world cap, including the automatic world. Default 10. `0` disables it |
+| `GLOBAL_DAILY_WORLDS_CAP` | Paid worlds for every device combined, per UTC day. Default 100. `0` disables it |
+| `WORLD_DELAY_MAX_HOURS` | Fail a credit-delayed 3D tour after this many hours. Default 24 |
+| `WORLD_DELAY_MAX_ATTEMPTS` | Fail a credit-delayed 3D tour after this many attempts. Default 48 |
 | `WORLDLABS_API_KEY` | Blank uses the world mock |
 | `WORLDLABS_DRAFT_MODEL` | Default `marble-1.0-draft`. `off` skips the fast preview |
 | `WORLDLABS_MODEL` | Full world. Default `marble-1.1` |
+| `WORLDLABS_LOW_CREDIT_THRESHOLD` | Admin health warns below this balance. Default 6000 |
 | `WORLDLABS_PUBLIC` | Default `false`. Worlds are private |
-| `STITCH_CONCURRENCY` | Stitch and generation jobs at once |
+| `WORLDLABS_CONCURRENCY` | World Labs jobs at once. Default 2. Separate from `WORKER_CONCURRENCY` |
+| `WORLDLABS_RETRY_ATTEMPTS` | HTTP 429 attempts per World Labs request. Default 5 |
+| `WORLDLABS_RETRY_BASE_SECONDS` | First backoff delay before jitter. Default 0.5 |
+| `WORLDLABS_RETRY_MAX_SECONDS` | Cap on a 429 wait, including Retry-After. Default 32 |
+| `WORKER_CONCURRENCY` | Stitch, staging, and world jobs at once. Default 3 |
+| `STITCH_CONCURRENCY` | CPU threads for panorama stitching. Default 1 |
 | `JOBS_INLINE` | Await jobs inside the request. Tests only |
 | `MOCK_STAGE_DELAY` | Seconds the mock staging waits |
 | `MOCK_WORLD_DELAY` | Seconds the mock world job waits |
@@ -177,7 +186,7 @@ Backend (`backend/.env.example`):
 | `LOG_LEVEL` | Uvicorn/app log level |
 | `TRUSTED_PROXY_COUNT` | X-Forwarded-For hops to trust. Default 1 (Railway) |
 | `SHARE_LINK_TTL_DAYS` | Share link lifetime. Default 30. `0` does not expire |
-| `EMBED_FRAME_ANCESTORS` | Parents allowed when `embed=1`. Empty allows any |
+| `EMBED_FRAME_ANCESTORS` | Parents allowed when `embed=1`. Empty keeps `frame-ancestors 'none'` |
 
 Mobile (`mobile/.env.example`):
 
@@ -191,11 +200,11 @@ The app does not create user accounts, so there is no account to delete. Each ca
 
 Before the first upload, the app shows a consent screen. Agreeing lets the app send room photos to the 360Flow API. The API stitches them and sends the panorama to World Labs to build the 3D walkthrough. Virtual staging is optional; choosing it sends the panorama to Google Gemini. Until the person agrees, the upload does not start.
 
-`DELETE /api/v1/projects/{id}` removes that capture for the device that owns it. Another device gets 404. It deletes the database row, the uploaded photos, the panorama, the staged image, and any files stored for that capture on local disk or R2. When `WORLDLABS_API_KEY` is set, it also asks World Labs to delete the full world, the draft world, and the staged pair. The share link then returns 404. `POST /api/v1/projects/{id}/share/rotate` issues a new share token and retires the old one. In the app, Delete on the home screen and on the panorama screen asks for confirmation before calling it.
+`DELETE /api/v1/projects/{id}` removes that capture for the device that owns it. Another device gets 404. It deletes the database row, the uploaded photos, the panorama, the staged image, and any files stored for that capture on local disk or R2. When `WORLDLABS_API_KEY` is set, it also asks World Labs to delete the full world, the draft world, and the staged pair. The share link then returns 404. `POST /api/v1/projects/{id}/share/rotate` issues a new share token and retires the old one. Rotating the share link does not change the owner's private preview. A staged image is not on the public page until `POST /api/v1/projects/{id}/staged/publish`. `POST /api/v1/projects/{id}/staged/unpublish` hides it again. Starting a new stage, or uploading a new capture, clears that approval. Another device gets 404 for both. In the app, Delete on the home screen and on the panorama screen asks for confirmation before calling it.
 
-`/docs` and `/openapi.json` stay off unless `ENABLE_DOCS=true`. Share pages send `X-Content-Type-Options`, `Referrer-Policy`, `Strict-Transport-Security`, `X-Robots-Tag: noindex`, and a Content-Security-Policy. `frame-ancestors` is `'none'` unless the URL has `embed=1`, which uses `EMBED_FRAME_ANCESTORS` (any parent when that list is empty). Share links are built from `PUBLIC_BASE_URL` only and expire after `SHARE_LINK_TTL_DAYS` (default 30). Rotating a link starts a new window. Invalid request bodies return `422` with `Invalid request` and do not echo the submitted values.
+`/docs` and `/openapi.json` stay off unless `ENABLE_DOCS=true`. Share pages send `X-Content-Type-Options`, `Referrer-Policy`, `Strict-Transport-Security`, `X-Robots-Tag: noindex`, and a Content-Security-Policy. `frame-ancestors` is `'none'` unless the URL has `embed=1` and `EMBED_FRAME_ANCESTORS` lists parents. An empty list keeps `'none'`. Share links are built from `PUBLIC_BASE_URL` only and expire after `SHARE_LINK_TTL_DAYS` (default 30). Rotating a link starts a new window. Invalid request bodies return `422` with `Invalid request` and do not echo the submitted values.
 
-Paid Gemini and World Labs calls are capped per device per day (`GEMINI_JOBS_PER_DEVICE_PER_DAY`, `WORLDLABS_JOBS_PER_DEVICE_PER_DAY`). The world that starts automatically after upload counts against that cap. A Marble delete that fails is stored and retried in the background. Client IP for rate limits comes from the rightmost trusted `X-Forwarded-For` hop (`TRUSTED_PROXY_COUNT`, default 1 for Railway). Failed authentication is limited by that IP.
+Paid Gemini and World Labs calls are capped per device per day (`GEMINI_JOBS_PER_DEVICE_PER_DAY`, `WORLDLABS_JOBS_PER_DEVICE_PER_DAY`). `GLOBAL_DAILY_WORLDS_CAP` limits paid worlds across every device. The count is an atomic increment, and it is taken when the job is queued. The world that starts automatically after upload counts against both caps. A project has one open job. Replacing a capture or regenerating a world deletes the old full world and the old draft world at World Labs before their ids are cleared, and logs each world id. A delete that fails stays queued for retry. A tour that is waiting on credits can be retried or cancelled, and it fails after `WORLD_DELAY_MAX_HOURS` or `WORLD_DELAY_MAX_ATTEMPTS`. Cancelling it before World Labs has accepted a generation refunds that daily quota unit. `X-API-Key` attempts on `/health` share one database rate limit across replicas. The public `/health` body is only `{"status": "ok"}`. A Marble delete that fails is stored and retried in the background. Client IP for rate limits comes from the rightmost trusted `X-Forwarded-For` hop (`TRUSTED_PROXY_COUNT`, default 1 for Railway). Failed authentication is limited by that IP, including `X-API-Key` attempts on `/health`.
 
 ## What you need to supply
 

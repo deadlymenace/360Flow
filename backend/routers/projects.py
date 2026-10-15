@@ -9,14 +9,14 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import Response
 
 from auth import Caller, require_caller
-from db import TRANSIENT_STATUSES, delete_project, get_project, rotate_share_token, update_project
+from db import TRANSIENT_STATUSES, cancel_delayed_project, delete_project, get_project, rotate_share_token, update_project
 from db import create_project as create_project_row
 from db import list_projects as list_project_rows
 from models.project import CreateProjectRequest, Project, StageRequest, UploadMetadata
 from routers.responses import jpeg_response, labeled_jpeg, status_body, to_project
 from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
-from services.pipeline import enqueue, run_stage, run_stitch, run_world
+from services.pipeline import enqueue_job, retry_delayed_project, start_job
 from services.uploads import normalize_upload
 from services.world_gen import delete_worlds
 from storage import delete_project_assets, get_storage, panorama_key, staged_key, upload_key
@@ -102,8 +102,20 @@ def _reject_declared_body(request: Request) -> None:
 
 
 def _reject_if_busy(status: str) -> None:
-    if status in TRANSIENT_STATUSES and not get_settings().jobs_inline:
+    # Delayed 3D keeps the panorama usable: the owner can re-upload, cancel, or retry.
+    busy = tuple(item for item in TRANSIENT_STATUSES if item != "delayed")
+    if status in busy and not get_settings().jobs_inline:
         raise HTTPException(status_code=409, detail="This project is already processing")
+
+
+def _raise_for_enqueue(outcome: str, kind: str) -> None:
+    if outcome == "busy":
+        raise HTTPException(status_code=409, detail="This project is already processing")
+    if outcome == "missing":
+        raise HTTPException(status_code=404, detail="Project not found")
+    if outcome == "quota":
+        message = WORLD_QUOTA_MESSAGE if kind in {"world", "staged_world"} else STAGING_QUOTA_MESSAGE
+        raise HTTPException(status_code=429, detail=message)
 
 
 @router.post("/projects")
@@ -116,12 +128,13 @@ async def create_project(req: CreateProjectRequest, request: Request) -> Project
 async def list_projects(request: Request) -> list[Project]:
     caller = _caller(request)
     rows = list_project_rows(owner_device_id=caller.device_id, admin=caller.is_admin)
-    return [to_project(row) for row in rows]
+    return [to_project(row, admin=caller.is_admin) for row in rows]
 
 
 @router.get("/projects/{project_id}")
 async def get_one(project_id: str, request: Request) -> Project:
-    return to_project(_require(project_id, request))
+    caller = _caller(request)
+    return to_project(_require(project_id, request), admin=caller.is_admin)
 
 
 @router.delete("/projects/{project_id}", status_code=204)
@@ -174,50 +187,39 @@ async def upload_images(
         for image in images
     ]
 
+    outcome, job_id = await enqueue_job(
+        project_id,
+        "stitch",
+        project_fields={
+            "image_count": count,
+            "error": None,
+            "provider_error": None,
+            "hfov_deg": meta.hfov_deg,
+            "yaws_json": json.dumps(meta.yaws_deg) if meta.yaws_deg is not None else None,
+            "lens": meta.lens,
+            "panorama_key": None,
+            "staged_key": None,
+            "staging_prompt": None,
+            "staging_provider": None,
+            "staging_notes": None,
+            "staging_status": None,
+            "staging_error": None,
+            "staged_published": 0,
+        },
+        replace_delayed=True,
+        retire_worlds="all",
+        start=False,
+    )
+    _raise_for_enqueue(outcome, "stitch")
     storage = get_storage()
     storage.delete_prefix(f"uploads/{project_id}/")
     storage.delete_prefix(panorama_key(project_id))
     storage.delete_prefix(staged_key(project_id))
     for index, payload in enumerate(payloads):
         storage.put_bytes(upload_key(project_id, index), payload, "image/jpeg")
-
-    update_project(
-        project_id,
-        status="stitching",
-        image_count=count,
-        error=None,
-        hfov_deg=meta.hfov_deg,
-        yaws_json=json.dumps(meta.yaws_deg) if meta.yaws_deg is not None else None,
-        lens=meta.lens,
-        panorama_key=None,
-        staged_key=None,
-        staging_prompt=None,
-        staging_provider=None,
-        world_provider=None,
-        world_id=None,
-        world_marble_url=None,
-        world_splat_url=None,
-        world_mesh_url=None,
-        world_thumbnail_url=None,
-        world_operation_id=None,
-        world_preview_url=None,
-        world_preview_id=None,
-        staged_world_provider=None,
-        staged_world_id=None,
-        staged_world_marble_url=None,
-        staged_world_preview_url=None,
-        staged_world_splat_url=None,
-        staged_world_mesh_url=None,
-        staged_world_thumbnail_url=None,
-        staged_world_operation_id=None,
-        staged_world_preview_id=None,
-        staging_notes=None,
-        staging_status=None,
-        staging_error=None,
-        active_job="stitch",
-    )
     logger.info("Project %s: stored %d images", project_id, count)
-    await enqueue(run_stitch(project_id))
+    if job_id:
+        await start_job(job_id)
     latest = get_project(project_id)
     return {"status": latest.status if latest else "stitching", "image_count": count}
 
@@ -230,24 +232,44 @@ async def get_status(project_id: str, request: Request):
 @router.post("/projects/{project_id}/retry")
 async def retry_project(project_id: str, request: Request):
     project = _require(project_id, request)
+    if project.status == "delayed":
+        outcome = await retry_delayed_project(project_id)
+        if outcome == "expired":
+            latest = get_project(project_id)
+            return {"status": latest.status if latest else "failed", "error": latest.error if latest else None}
+        if outcome != "queued":
+            raise HTTPException(status_code=409, detail="This project is already processing")
+        latest = get_project(project_id)
+        return {"status": latest.status if latest else "generating_3d"}
     if project.status != "failed":
-        raise HTTPException(status_code=400, detail="Only a failed project can be retried")
+        raise HTTPException(status_code=400, detail="Only a failed or delayed project can be retried")
     storage = get_storage()
     uploads = storage.list_keys(f"uploads/{project_id}/")
     job = project.active_job
     if job == "stage":
-        await enqueue(run_stage(project_id))
-        return {"status": "staging"}
-    if job == "staged_world":
-        await enqueue(run_world(project_id, source="staged"))
-        return {"status": "generating_3d"}
-    if job == "world":
-        await enqueue(run_world(project_id, source="original"))
-        return {"status": "generating_3d"}
-    if not uploads:
+        kind = "stage"
+    elif job == "staged_world":
+        kind = "staged_world"
+    elif job == "world":
+        kind = "world"
+    elif uploads:
+        kind = "stitch"
+    else:
         raise HTTPException(status_code=400, detail="No uploaded images to retry")
-    await enqueue(run_stitch(project_id))
-    return {"status": "stitching"}
+    outcome, _job_id = await enqueue_job(project_id, kind)
+    _raise_for_enqueue(outcome, kind)
+    latest = get_project(project_id)
+    return {"status": latest.status if latest else kind}
+
+
+@router.post("/projects/{project_id}/cancel")
+async def cancel_project(project_id: str, request: Request):
+    """Stop a delayed 3D tour and leave the panorama in place."""
+    _require(project_id, request)
+    status = cancel_delayed_project(project_id)
+    if status is None:
+        raise HTTPException(status_code=400, detail="Only a delayed 3D tour can be cancelled")
+    return {"status": status}
 
 
 @router.get("/projects/{project_id}/panorama")
@@ -268,6 +290,28 @@ async def get_staged(project_id: str, request: Request, download: bool = Query(d
     return labeled_jpeg(data, f"{project_id}-staged.jpg", download)
 
 
+@router.post("/projects/{project_id}/staged/publish")
+async def publish_staged(project_id: str, request: Request) -> Project:
+    """Let the public share page show the staged panorama and staged 3D."""
+    project = _require(project_id, request)
+    if not project.staged_key:
+        raise HTTPException(status_code=400, detail="No staged image to publish")
+    updated = update_project(project_id, staged_published=1)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return to_project(updated)
+
+
+@router.post("/projects/{project_id}/staged/unpublish")
+async def unpublish_staged(project_id: str, request: Request) -> Project:
+    """Hide the staged view from the public share page again."""
+    _require(project_id, request)
+    updated = update_project(project_id, staged_published=0)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return to_project(updated)
+
+
 @router.post("/projects/{project_id}/stage")
 async def stage_project(project_id: str, req: StageRequest, request: Request):
     project = _require(project_id, request)
@@ -278,8 +322,12 @@ async def stage_project(project_id: str, req: StageRequest, request: Request):
     _reject_if_busy(project.status)
     if project.staging_status == "staging" and not get_settings().jobs_inline:
         raise HTTPException(status_code=409, detail="This project is already processing")
-    update_project(project_id, staging_prompt=req.prompt, staging_status="staging", staging_error=None)
-    await enqueue(run_stage(project_id))
+    outcome, _job_id = await enqueue_job(
+        project_id,
+        "stage",
+        project_fields={"staging_prompt": req.prompt, "staged_published": 0},
+    )
+    _raise_for_enqueue(outcome, "stage")
     latest = get_project(project_id)
     return {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
 
@@ -319,7 +367,9 @@ async def generate_3d(project_id: str, request: Request, source: str = Query(def
     if world_quota_blocks(project.owner_device_id):
         raise HTTPException(status_code=429, detail=WORLD_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
-    await enqueue(run_world(project_id, source=source))
+    kind = "staged_world" if source == "staged" else "world"
+    outcome, _job_id = await enqueue_job(project_id, kind, retire_worlds="staged" if source == "staged" else "original")
+    _raise_for_enqueue(outcome, kind)
     latest = get_project(project_id)
     return {"status": latest.status if latest else "generating_3d"}
 
@@ -330,7 +380,9 @@ async def get_generate_3d_status(project_id: str, request: Request):
     provider = project.world_provider
     if provider is None:
         provider = "worldlabs" if get_settings().worldlabs_api_key else "worldlabs_mock"
-    share = to_project(project).share_url or ""
+    body = to_project(project)
+    share = body.share_url or ""
+    private = body.preview_url or share
     assets = None
     if project.panorama_key and (project.world_provider or project.world_marble_url or project.world_preview_url):
         assets = {
@@ -344,7 +396,7 @@ async def get_generate_3d_status(project_id: str, request: Request):
     staged_assets = None
     if project.staged_key and (project.staged_world_provider or project.staged_world_marble_url):
         staged_assets = {
-            "viewer_url": f"{share}/world?source=staged",
+            "viewer_url": f"{private}/world?source=staged",
             "marble_url": project.staged_world_marble_url,
             "preview_url": project.staged_world_preview_url,
             "splat_url": project.staged_world_splat_url,

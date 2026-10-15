@@ -30,13 +30,7 @@ def _has_disclosure_bar(image: np.ndarray) -> bool:
 
 def test_health(client):
     body = client.get("/health").json()
-    assert body["status"] == "ok"
-    assert body["storage"] == "local"
-    assert body["database"] == "sqlite"
-    assert body["staging"] == "mock"
-    assert body["world"] == "mock"
-    assert body["auth"] == "device"
-    assert body["admin"] is False
+    assert body == {"status": "ok"}
 
 
 def test_project_survives_reopen(client):
@@ -143,36 +137,159 @@ def test_full_pipeline_with_mocks(client):
     assert staged_status["staged_assets"]["viewer_url"].endswith("/world?source=staged")
     assert staged_status["staged_assets"]["marble_url"] is None
 
+    project = client.get(f"/api/v1/projects/{project_id}").json()
+    assert project["staged_published"] is False
+    assert project["has_staged"] is True
+    preview_url = project["preview_url"]
+    assert preview_url and preview_url.endswith(f"/p/{preview_url.rstrip('/').rsplit('/', 1)[-1]}")
+    preview_token = preview_url.rstrip("/").rsplit("/", 1)[-1]
+    assert preview_token != token
+
     page = client.get(f"/v/{token}?view=staged")
     assert page.status_code == 200
-    assert DISCLOSURE_TEXT in page.text
-    assert "Original" in page.text and "Staged" in page.text and "Compare" in page.text
-    assert 'class="chip "' in page.text
+    assert 'data-mode="staged"' not in page.text
+    assert 'data-mode="compare"' not in page.text
+    assert "Open staged 3D" not in page.text
+    assert "Download staged" not in page.text
+    assert "staged room" not in page.text
+    assert preview_token not in page.text
+    assert "Open 3D walkthrough" in client.get(f"/v/{token}").text
+    assert client.get(f"/v/{token}/staged.jpg").status_code == 404
+    assert client.get(f"/v/{token}/texture.jpg").status_code == 404
+    assert client.get(f"/v/{token}/world?source=staged").status_code == 404
+    assert client.get(f"/p/{token}").status_code == 404
+    assert client.get(f"/v/{preview_token}").status_code == 404
 
-    original_page = client.get(f"/v/{token}?view=original")
-    assert 'class="chip hide"' in original_page.text
+    private = client.get(f"/p/{preview_token}?view=compare")
+    assert private.status_code == 200
+    assert 'data-mode="compare"' in private.text
+    assert 'data-mode="staged"' in private.text
+    assert 'class="chip "' in private.text
+    private_staged = client.get(f"/p/{preview_token}/staged.jpg")
+    private_image = cv2.imdecode(np.frombuffer(private_staged.content, np.uint8), cv2.IMREAD_COLOR)
+    assert _has_disclosure_bar(private_image)
+    assert client.get(f"/p/{preview_token}/texture.jpg").status_code == 200
+    private_world = client.get(f"/p/{preview_token}/world?source=staged")
+    assert private_world.status_code == 200
+    assert 'class="chip "' in private_world.text
 
-    public_staged = client.get(f"/v/{token}/staged.jpg")
-    public_image = cv2.imdecode(np.frombuffer(public_staged.content, np.uint8), cv2.IMREAD_COLOR)
-    assert _has_disclosure_bar(public_image)
     public_original = cv2.imdecode(
         np.frombuffer(client.get(f"/v/{token}/panorama.jpg").content, np.uint8),
         cv2.IMREAD_COLOR,
     )
     assert not _has_disclosure_bar(public_original)
-
     original_world = client.get(f"/v/{token}/world")
     assert 'class="chip hide"' in original_world.text
-    staged_page = client.get(f"/v/{token}/world?source=staged")
-    assert staged_page.status_code == 200
-    assert 'class="chip "' in staged_page.text
-    assert DISCLOSURE_TEXT in staged_page.text
+
+
+def test_staged_view_stays_private_until_the_owner_publishes(client):
+    from datetime import datetime, timedelta, timezone
+
+    from db import update_project
+
+    created = client.post("/api/v1/projects", json={"name": "Private stage"}).json()
+    project_id = created["id"]
+    token = created["share_token"]
+    preview_url = created["preview_url"]
+    preview_token = preview_url.rstrip("/").rsplit("/", 1)[-1]
+    refused = client.post(f"/api/v1/projects/{project_id}/staged/publish")
+    assert refused.status_code == 400
+
+    files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+    uploaded = client.post(
+        f"/api/v1/projects/{project_id}/upload",
+        files=files,
+        data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    staged = client.post(f"/api/v1/projects/{project_id}/stage", json={"prompt": "a linen sofa"})
+    assert staged.status_code == 200, staged.text
+    owner_image = client.get(f"/api/v1/projects/{project_id}/staged")
+    assert owner_image.status_code == 200
+    labeled = cv2.imdecode(np.frombuffer(owner_image.content, np.uint8), cv2.IMREAD_COLOR)
+    assert _has_disclosure_bar(labeled)
+
+    other = {"Authorization": f"Bearer {client.raw.post('/api/v1/devices').json()['token']}"}
+    assert client.raw.post(f"/api/v1/projects/{project_id}/staged/publish", headers=other).status_code == 404
+    assert client.raw.post(f"/api/v1/projects/{project_id}/staged/unpublish", headers=other).status_code == 404
+
+    update_project(project_id, active_job="staged_world")
+    public = client.get(f"/v/{token}")
+    assert "staged room" not in public.text
+    assert "Open staged 3D" not in public.text
+    private = client.get(f"/p/{preview_token}")
+    assert "staged room is generating" in private.text
+    update_project(project_id, active_job=None)
+
+    published = client.post(f"/api/v1/projects/{project_id}/staged/publish").json()
+    assert published["staged_published"] is True
+    assert published["preview_url"] == preview_url
+    public_staged = client.get(f"/v/{token}?view=staged")
+    assert 'data-mode="staged"' in public_staged.text
+    assert 'data-mode="compare"' in public_staged.text
+    assert "Download staged" in public_staged.text
+    assert "Open staged 3D" in public_staged.text
+    assert preview_token not in public_staged.text
+    public_image = cv2.imdecode(
+        np.frombuffer(client.get(f"/v/{token}/staged.jpg").content, np.uint8),
+        cv2.IMREAD_COLOR,
+    )
+    assert _has_disclosure_bar(public_image)
+    assert client.get(f"/v/{token}/texture.jpg").status_code == 200
+    public_world = client.get(f"/v/{token}/world?source=staged")
+    assert public_world.status_code == 200
+    assert 'class="chip "' in public_world.text
+
+    hidden = client.post(f"/api/v1/projects/{project_id}/staged/unpublish").json()
+    assert hidden["staged_published"] is False
+    assert client.get(f"/v/{token}/staged.jpg").status_code == 404
+    assert client.get(f"/v/{token}/texture.jpg").status_code == 404
+    assert client.get(f"/v/{token}/world?source=staged").status_code == 404
+    assert 'data-mode="staged"' not in client.get(f"/v/{token}?view=staged").text
+    still_private = client.get(f"/p/{preview_token}/staged.jpg")
+    assert still_private.status_code == 200
+    assert _has_disclosure_bar(cv2.imdecode(np.frombuffer(still_private.content, np.uint8), cv2.IMREAD_COLOR))
+
+    again = client.post(f"/api/v1/projects/{project_id}/staged/publish")
+    assert again.status_code == 200
+    restaged = client.post(f"/api/v1/projects/{project_id}/stage", json={"prompt": "a oak table"})
+    assert restaged.status_code == 200, restaged.text
+    after = client.get(f"/api/v1/projects/{project_id}").json()
+    assert after["staged_published"] is False
+    assert after["has_staged"] is True
+    assert after["preview_url"] == preview_url
+    assert client.get(f"/v/{token}/staged.jpg").status_code == 404
+
+    rotated = client.post(f"/api/v1/projects/{project_id}/share/rotate").json()
+    assert rotated["share_token"] != token
+    assert rotated["preview_url"] == preview_url
+    update_project(
+        project_id,
+        share_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    assert client.get(f"/v/{rotated['share_token']}").status_code == 404
+    assert client.get(f"/p/{preview_token}?view=compare").status_code == 200
+    assert 'data-mode="compare"' in client.get(f"/p/{preview_token}?view=compare").text
+
+    published_again = client.post(f"/api/v1/projects/{project_id}/staged/publish").json()
+    assert published_again["staged_published"] is True
+    replaced = client.post(
+        f"/api/v1/projects/{project_id}/upload",
+        files=files,
+        data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})},
+    )
+    assert replaced.status_code == 200, replaced.text
+    cleared = client.get(f"/api/v1/projects/{project_id}").json()
+    assert cleared["staged_published"] is False
+    assert cleared["has_staged"] is False
+    assert cleared["preview_url"] == preview_url
 
 
 def test_device_token_and_admin_key(client, monkeypatch):
     assert client.raw.get("/api/v1/projects").status_code == 401
     monkeypatch.setenv("API_KEY", "secret-key")
-    assert client.get("/health").json()["admin"] is True
+    assert client.get("/health").json() == {"status": "ok"}
+    assert client.raw.get("/health", headers={"X-API-Key": "secret-key"}).json()["admin"] is True
     assert client.raw.get("/api/v1/projects", headers={"X-API-Key": "wrong-key"}).status_code == 401
     allowed = client.raw.get("/api/v1/projects", headers={"X-API-Key": "secret-key"})
     assert allowed.status_code == 200
@@ -213,6 +330,9 @@ def test_delete_project_removes_files_row_and_share_link(client):
     assert client.get(f"/v/{token}").status_code == 404
     assert client.get(f"/v/{token}/world").status_code == 404
     assert client.get(f"/v/{token}/panorama.jpg").status_code == 404
+    preview_token = created["preview_url"].rstrip("/").rsplit("/", 1)[-1]
+    assert client.get(f"/p/{preview_token}").status_code == 404
+    assert client.get(f"/p/{preview_token}/staged.jpg").status_code == 404
     listed = client.get("/api/v1/projects").json()
     assert all(item["id"] != project_id for item in listed)
     assert any(item["id"] == other["id"] for item in listed)
@@ -316,6 +436,16 @@ def test_gemini_http_error_fails_the_job(client, monkeypatch):
     assert body["error"] == "Staging failed. Try again."
     assert "test-key" not in body["error"]
     assert "API key not valid" not in body["error"]
+    assert "provider_error" not in body
+    project = client.get(f"/api/v1/projects/{project_id}").json()
+    assert project["provider_error"] is None
+    monkeypatch.setenv("API_KEY", "secret-key")
+    admin = client.raw.get(
+        f"/api/v1/projects/{project_id}",
+        headers={"X-API-Key": "secret-key"},
+    ).json()
+    assert admin["provider_error"] == "HTTP 401: API key not valid"
+    assert "test-key" not in admin["provider_error"]
     project = client.get(f"/api/v1/projects/{project_id}").json()
     assert project["status"] == "complete"
     assert project["has_original"] is True
