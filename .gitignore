@@ -32,7 +32,10 @@ mobile/android/
 *.p8
 *.p12
 *.key
+*.pem
 *.mobileprovision
+keys/
+!mobile/certs/certificate.pem
 *.orig.*
 
 # macOS
