@@ -290,7 +290,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#000',
   },
   overlay: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     justifyContent: 'space-between',
   },
   centered: {

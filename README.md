@@ -47,7 +47,7 @@ cp .env.example .env
 npx expo start
 ```
 
-`EXPO_PUBLIC_API_URL` is the backend origin, with or without `/api/v1`. For a phone on the same Wi-Fi during development, set it to `http://<your-lan-ip>:8000`. When that variable is empty, a dev build falls back to the debugger host on port 8000, then `localhost`. A release build (`__DEV__` is false) fails unless the variable is set to an `https://` URL. Android leaves cleartext off, which is the platform default on the target SDK.
+`EXPO_PUBLIC_API_URL` is the backend origin, with or without `/api/v1`. For a phone on the same Wi-Fi during development, set it to `http://<your-lan-ip>:8000`. When that variable is empty, a dev build falls back to the debugger host on port 8000, then `localhost`. A release build (`__DEV__` is false) fails unless the variable is set to an `https://` URL. The `expo-build-properties` plugin sets Android `usesCleartextTraffic` to false. iOS still allows local networking so a dev phone can reach the API on the LAN.
 
 The app registers an anonymous device and keeps that token in the device secure store. It sends `Authorization: Bearer` on API calls. Do not put `API_KEY` in the app. `API_KEY` is an operator key sent as `X-API-Key` and is compared with `hmac.compare_digest`. Share pages under `/v/` stay public until the share token is rotated or the capture is deleted.
 
@@ -75,7 +75,7 @@ An iOS build that you can install through TestFlight needs an Apple Developer ac
 
 ### Over-the-air updates
 
-`expo-updates` publishes a JavaScript bundle to a channel on an existing build. `runtimeVersion` uses the app version policy, so the runtime version is `expo.version` (currently `1.0.0`). Bump that version when native code changes, then ship a new build before publishing an update for it.
+`expo-updates` publishes a JavaScript bundle to a channel on an existing build. `runtimeVersion` uses the app version policy, so the runtime version is `expo.version` (currently `1.1.0`, the Expo SDK 57 app). An SDK 54 build on `1.0.0` will not receive this JavaScript. `eas.json` stores app versions remotely, so if EAS already recorded `1.0.0`, set the remote version to `1.1.0` before the SDK 57 build. Bump the version again when native code changes, then ship a new build before publishing an update for it.
 
 `mobile/eas.json` sets a channel on each build profile: `development`, `preview`, and `production`.
 
