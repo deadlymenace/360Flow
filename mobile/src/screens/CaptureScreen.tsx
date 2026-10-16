@@ -25,14 +25,15 @@ import CaptureMiniMap from '../components/CaptureMiniMap';
 import {
   AIM_HOLD_MS,
   AIM_TOLERANCE_DEG,
-  Attitude,
   CameraBasis,
   MANUAL_TOLERANCE_DEG,
   Quat,
   STEADY_MAX_DEG_PER_SEC,
   TargetProjection,
   basisFromQuat,
+  cameraBasis,
   edgePoint,
+  headingFromLook,
   nearestTarget,
   projectTargets,
   quatFromAttitude,
@@ -43,7 +44,10 @@ import {
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Capture'>;
 
-type Pose = Attitude & {
+type Pose = {
+  /** Unsmoothed optical heading. Origin and per-shot yaws use this, not Euler yaw. */
+  headingDeg: number;
+  /** Smoothed basis used to draw the dots. */
   basis: CameraBasis;
   rate: number;
 };
@@ -125,15 +129,15 @@ export default function CaptureScreen({ navigation, route }: Props) {
     captureLock.current = true;
     aimMsRef.current = 0;
     setCapturing(true);
-    const yawAtShutter = pose.yawDeg;
+    const headingAtShutter = pose.headingDeg;
     try {
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.8,
         skipProcessing: false,
       });
       if (!photo?.uri) return;
-      if (originRef.current == null) originRef.current = yawAtShutter;
-      const actualYaw = wrap360(yawAtShutter - originRef.current);
+      if (originRef.current == null) originRef.current = headingAtShutter;
+      const actualYaw = wrap360(headingAtShutter - originRef.current);
       setLocked(true);
       setSegments((prev) => {
         const updated = [...prev];
@@ -165,6 +169,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
       const yawRad = data.rotation.alpha;
       const pitchRad = data.rotation.beta;
       const rollRad = data.rotation.gamma;
+      const raw = cameraBasis(yawRad, pitchRad, rollRad);
       const sample = quatFromAttitude(yawRad, pitchRad, rollRad);
       const previous = smoothRef.current;
       const smooth = previous
@@ -172,9 +177,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
         : sample;
       smoothRef.current = smooth;
       poseRef.current = {
-        yawDeg: (yawRad * 180) / Math.PI,
-        pitchRad,
-        rollRad,
+        headingDeg: headingFromLook(raw.look),
         basis: basisFromQuat(smooth),
         rate: rotationRateDegPerSec(data.rotationRate),
       };
@@ -205,7 +208,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
         dots = [
           {
             index: 0,
-            yawDeg: pose.yawDeg,
+            yawDeg: 0,
             inView: true,
             x: viewW / 2,
             y: viewH / 2,
@@ -216,7 +219,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
         ];
       } else {
         dots = projectTargets(pose.basis, origin, viewW, viewH, hfovRef.current);
-        headingDeg = wrap360(pose.yawDeg - origin);
+        headingDeg = wrap360(headingFromLook(pose.basis.look) - origin);
         const next = nearestTarget(dots, captured);
         if (next) {
           suggested = next.index;

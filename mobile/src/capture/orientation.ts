@@ -11,12 +11,11 @@ export const AIM_HOLD_MS = 420;
 export type Vec3 = { x: number; y: number; z: number };
 export type Quat = { w: number; x: number; y: number; z: number };
 
-export type Attitude = {
-  /** CoreMotion yaw in degrees, the same heading the stitcher already receives. */
-  yawDeg: number;
-  pitchRad: number;
-  rollRad: number;
-};
+/**
+ * Still width/height with the phone upright. iPhone photo output is 4:3,
+ * and the preview layer is that buffer rotated to portrait.
+ */
+export const PORTRAIT_PHOTO_ASPECT = 3 / 4;
 
 export type CameraBasis = {
   right: Vec3;
@@ -49,7 +48,35 @@ export function targetYawDeg(index: number): number {
   return index * SEGMENT_ANGLE;
 }
 
-/** Horizon direction whose heading matches CoreMotion yaw. Pitch above the horizon is degrees. */
+/**
+ * Azimuth of the back-camera look direction, in degrees.
+ * The horizontal projection is atan2(look.x, look.y), which is the yaw of
+ * `directionFromYawPitch` — including when the phone is rolled near a ±90° pitch,
+ * where CoreMotion's Euler yaw no longer matches the optical axis.
+ */
+export function headingFromLook(look: Vec3): number {
+  return wrap360(Math.atan2(look.x, look.y) * DEG);
+}
+
+/**
+ * Pixel focal length for an aspect-fill camera preview.
+ * `hfovDeg` spans the full photo width. The preview covers the view and crops
+ * the photo axis that sticks out, so a tall portrait screen sees less than the
+ * full horizontal field.
+ */
+export function previewFocalPx(
+  viewWidth: number,
+  viewHeight: number,
+  hfovDeg: number,
+  photoAspect = PORTRAIT_PHOTO_ASPECT,
+): number {
+  const halfTan = Math.tan(((hfovDeg * Math.PI) / 180) / 2);
+  const viewAspect = viewWidth / Math.max(viewHeight, 1);
+  const displayedPhotoWidth = viewAspect < photoAspect ? viewHeight * photoAspect : viewWidth;
+  return displayedPhotoWidth / 2 / halfTan;
+}
+
+/** Horizon direction at `headingFromLook`. Pitch above the horizon is degrees. */
 export function directionFromYawPitch(yawDeg: number, pitchDeg = 0): Vec3 {
   const yaw = (yawDeg * Math.PI) / 180;
   const pitch = (pitchDeg * Math.PI) / 180;
@@ -110,7 +137,7 @@ export function projectToScreen(
   const x = dot(target, basis.right);
   const y = dot(target, basis.up);
   const z = dot(target, basis.look);
-  const focal = width / 2 / Math.tan(((hfovDeg * Math.PI) / 180) / 2);
+  const focal = previewFocalPx(width, height, hfovDeg);
   const planeX = x;
   const planeY = -y;
   if (z <= 0.08) {
