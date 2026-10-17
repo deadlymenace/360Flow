@@ -1,4 +1,4 @@
-import { File, Paths } from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
 import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
 import { Project, StageStatus, StatusResponse, WorldStatus } from '../models/types';
@@ -123,14 +123,18 @@ class APIService {
 
     // SDK 57 fetch rejects React Native `{ uri, name, type }` parts. A File
     // with a `.jpg` name has image/jpeg type and a bytes() body fetch accepts.
-    // The copy keeps the camera original in place for a retry.
-    const staged: File[] = [];
+    // The copy keeps the camera original in place for a retry. Each attempt
+    // gets its own directory so a second upload cannot overwrite the first.
+    const uploadDir = new Directory(
+      Paths.cache,
+      `upload-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+    );
+    uploadDir.create();
     try {
       for (let i = 0; i < imageUris.length; i++) {
         const filename = `segment_${i.toString().padStart(2, '0')}.jpg`;
-        const named = new File(Paths.cache, filename);
+        const named = new File(uploadDir, filename);
         await new File(imageUris[i]).copy(named, { overwrite: true });
-        staged.push(named);
         formData.append('images', named, filename);
         options.onProgress?.((i + 1) / imageUris.length * 0.5);
       }
@@ -146,9 +150,7 @@ class APIService {
         throw new Error(`Upload failed: ${res.status} - ${text}`);
       }
     } finally {
-      for (const file of staged) {
-        if (file.exists) file.delete();
-      }
+      if (uploadDir.exists) uploadDir.delete();
     }
   }
 
