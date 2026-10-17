@@ -102,7 +102,6 @@ export const WORLD_GENERATION_WAIT_MS = 15 * 60 * 1000;
 
 export const SEGMENT_COUNT = 16;
 export const SEGMENT_ANGLE = 360 / SEGMENT_COUNT; // 22.5°
-export const ALIGNMENT_TOLERANCE = 5; // degrees
 
 /** Portrait ultra-wide (iPhone 11+, ~120° diagonal) horizontal field of view. */
 export const ULTRA_WIDE_PORTRAIT_HFOV = 92;
