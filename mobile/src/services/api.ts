@@ -1,4 +1,4 @@
-import { File as ExpoFile, Paths } from 'expo-file-system';
+import { File, Paths } from 'expo-file-system';
 import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
 import { Project, StageStatus, StatusResponse, WorldStatus } from '../models/types';
@@ -121,26 +121,34 @@ class APIService {
       })
     );
 
-    for (let i = 0; i < imageUris.length; i++) {
-      const uri = imageUris[i];
-      const filename = `segment_${i.toString().padStart(2, '0')}.jpg`;
-      formData.append('images', {
-        uri,
-        name: filename,
-        type: 'image/jpeg',
-      } as unknown as Blob);
-      options.onProgress?.((i + 1) / imageUris.length * 0.5);
-    }
+    // SDK 57 fetch rejects React Native `{ uri, name, type }` parts. A File
+    // with a `.jpg` name has image/jpeg type and a bytes() body fetch accepts.
+    // The copy keeps the camera original in place for a retry.
+    const staged: File[] = [];
+    try {
+      for (let i = 0; i < imageUris.length; i++) {
+        const filename = `segment_${i.toString().padStart(2, '0')}.jpg`;
+        const named = new File(Paths.cache, filename);
+        await new File(imageUris[i]).copy(named, { overwrite: true });
+        staged.push(named);
+        formData.append('images', named, filename);
+        options.onProgress?.((i + 1) / imageUris.length * 0.5);
+      }
 
-    const res = await fetchWithTimeout(
-      `${this.baseUrl}/projects/${projectId}/upload`,
-      { method: 'POST', body: formData },
-      120000
-    );
-    options.onProgress?.(1);
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Upload failed: ${res.status} - ${text}`);
+      const res = await fetchWithTimeout(
+        `${this.baseUrl}/projects/${projectId}/upload`,
+        { method: 'POST', body: formData },
+        120000
+      );
+      options.onProgress?.(1);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Upload failed: ${res.status} - ${text}`);
+      }
+    } finally {
+      for (const file of staged) {
+        if (file.exists) file.delete();
+      }
     }
   }
 
@@ -151,8 +159,8 @@ class APIService {
   }
 
   async downloadToCache(url: string, filename: string): Promise<string> {
-    const dest = new ExpoFile(Paths.cache, filename);
-    const output = await ExpoFile.downloadFileAsync(url, dest, {
+    const dest = new File(Paths.cache, filename);
+    const output = await File.downloadFileAsync(url, dest, {
       headers: await authHeaders(),
       idempotent: true,
     });
