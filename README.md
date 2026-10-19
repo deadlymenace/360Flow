@@ -75,7 +75,7 @@ An iOS build that you can install through TestFlight needs an Apple Developer ac
 
 ### Over-the-air updates
 
-`expo-updates` publishes a JavaScript bundle to a channel on an existing build. `runtimeVersion` uses the app version policy, so the runtime version is `expo.version` (currently `1.1.0`, the Expo SDK 57 app). An SDK 54 build on `1.0.0` will not receive this JavaScript. `eas.json` stores app versions remotely, so if EAS already recorded `1.0.0`, set the remote version to `1.1.0` before the SDK 57 build. Bump the version again when native code changes, then ship a new build before publishing an update for it.
+`expo-updates` publishes a JavaScript bundle to a channel on an existing build. `runtimeVersion` uses the app version policy, so the runtime version is `expo.version` (currently `1.1.0`, the Expo SDK 57 app). An SDK 54 build on `1.0.0` will not receive this JavaScript. Bump the version again when native code changes, then ship a new build before publishing an update for it.
 
 `mobile/eas.json` sets a channel on each build profile: `development`, `preview`, and `production`.
 

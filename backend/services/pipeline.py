@@ -46,6 +46,7 @@ from services.stitcher import stitch_images
 from services.world_urls import valid_marble_url, valid_world_id
 from services.world_gen import (
     DRAFT_WORLD_TIMEOUT_S,
+    LeaseLost,
     FULL_WORLD_TIMEOUT_S,
     WORLD_DELAYED_MESSAGE,
     WORLD_DELAY_EXPIRED_MESSAGE,
@@ -266,9 +267,6 @@ async def _schedule(job_id: str) -> None:
     runner.submit(run_job(job_id))
 
 
-class LeaseLost(Exception):
-    """This process no longer owns the job, so it must not call a paid provider."""
-
 
 def _require_lease(job_id: str | None) -> None:
     if not job_id:
@@ -363,7 +361,18 @@ async def _renew_lease(job_id: str, stop: asyncio.Event) -> bool | None:
             raise
         except Exception:
             logger.exception("Lease renewal for job %s failed", job_id)
-            if not _lease_still_held(job_id):
+            try:
+                still_held = _lease_still_held(job_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Both the renewal and the read behind it failed. We cannot prove
+                # we still own the job, so stop it instead of running unleased.
+                logger.exception(
+                    "Could not read the lease for job %s after a failed renewal; stopping the job", job_id
+                )
+                return False
+            if not still_held:
                 return False
             try:
                 await asyncio.wait_for(stop.wait(), timeout=_LEASE_RENEW_BACKOFF_SECONDS)
@@ -592,6 +601,7 @@ async def _run_world(
     if existing is None:
         return
     if job and _rate_limit_already_exceeded(job):
+        _record_paid_operation(project_id, job_id, staged_source)
         _fail_world(
             project_id,
             WORLD_RATE_LIMIT_EXHAUSTED,
@@ -604,6 +614,23 @@ async def _run_world(
         return None
     if job and job.operation_id and job.operation_phase in {"draft", "full"}:
         return await _resume_world(project_id, job, staged_source)
+    paid = _take_paid_operation(existing, staged_source)
+    if job and paid:
+        logger.warning(
+            "Project %s resuming paid World Labs operation %s (%s) instead of generating again",
+            project_id,
+            paid["operation_id"],
+            paid["phase"],
+        )
+        resumed = update_job(
+            job.id,
+            operation_id=paid["operation_id"],
+            operation_phase=paid["phase"],
+            media_asset_id=paid.get("media_asset_id") or job.media_asset_id,
+            status="running",
+        )
+        if resumed is not None:
+            return await _resume_world(project_id, resumed, staged_source)
 
     del resume
     update_project(
@@ -650,10 +677,12 @@ async def _run_world(
     except LeaseLost:
         raise
     except RateLimitExceeded as exc:
+        _record_paid_operation(project_id, job_id, staged_source)
         await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
         return None
     except OperationInFlight:
         if job_id and (current := get_job(job_id)) and _rate_limit_already_exceeded(current):
+            _record_paid_operation(project_id, job_id, staged_source)
             await _fail_world_clean(
                 project_id,
                 created_ids,
@@ -668,6 +697,7 @@ async def _run_world(
         await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
     except ProviderFailure as exc:
         if isinstance(exc, RateLimitExceeded):
+            _record_paid_operation(project_id, job_id, staged_source)
             await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
             return None
         if exc.status_code == 429:
@@ -728,10 +758,12 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
     except LeaseLost:
         raise
     except RateLimitExceeded as exc:
+        _record_paid_operation(project_id, job.id, staged_source)
         await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
         return None
     except OperationInFlight:
         if _rate_limit_already_exceeded(get_job(job.id) or job):
+            _record_paid_operation(project_id, job.id, staged_source)
             await _fail_world_clean(
                 project_id,
                 created_ids,
@@ -746,6 +778,7 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
         await _fail_world_clean(project_id, created_ids, WORLD_FAILED_MESSAGE, None, staged_source)
     except ProviderFailure as exc:
         if isinstance(exc, RateLimitExceeded):
+            _record_paid_operation(project_id, job.id, staged_source)
             await _fail_world_clean(project_id, created_ids, exc.client_message, exc.detail, staged_source)
             return None
         if exc.status_code == 429:
@@ -878,6 +911,53 @@ def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: 
         active_job="staged_world" if staged_source else "world",
     )
     return "poll"
+
+
+def _record_paid_operation(project_id: str, job_id: str | None, staged_source: bool) -> None:
+    """Keep an operation World Labs already charged for when the job fails on the 429 cap.
+
+    A later retry for the same source polls it (and continues to full from a
+    draft) instead of calling worlds:generate again.
+    """
+    if not job_id:
+        return
+    job = get_job(job_id)
+    if job is None or not job.operation_id:
+        return
+    phase = job.operation_phase
+    if phase == "submitting":
+        phase = "draft"
+    if phase not in {"draft", "full"}:
+        return
+    payload = {
+        "source": "staged" if staged_source else "original",
+        "operation_id": job.operation_id,
+        "phase": phase,
+        "media_asset_id": job.media_asset_id,
+    }
+    update_project(project_id, resume_operation=json.dumps(payload))
+    logger.warning(
+        "Project %s failed on the World Labs 429 cap; recorded paid operation %s (%s) for retry",
+        project_id,
+        job.operation_id,
+        phase,
+    )
+
+
+def _take_paid_operation(project: ProjectRecord, staged_source: bool) -> dict | None:
+    if not project.resume_operation:
+        return None
+    try:
+        payload = json.loads(project.resume_operation)
+    except (TypeError, ValueError):
+        update_project(project.id, resume_operation=None)
+        return None
+    if payload.get("source") != ("staged" if staged_source else "original"):
+        return None
+    update_project(project.id, resume_operation=None)
+    if not payload.get("operation_id") or payload.get("phase") not in {"draft", "full"}:
+        return None
+    return payload
 
 
 def _remember_operation(project_id: str, job_id: str | None, operation_id: str, phase: str, staged_source: bool) -> None:

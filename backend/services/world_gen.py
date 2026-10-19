@@ -464,6 +464,10 @@ async def _mock_world(models: list[str], on_preview=None, on_operation=None, on_
     return result
 
 
+class LeaseLost(Exception):
+    """The job runner no longer owns this job, so no further paid call may start."""
+
+
 async def _generate_models(
     client: httpx.AsyncClient,
     headers: dict,
@@ -503,6 +507,9 @@ async def _generate_models(
                 on_submitting=on_submitting,
                 on_tick=on_tick,
             )
+        except LeaseLost:
+            # A lost lease at the draft step must never fall through to the full model.
+            raise
         except ProviderFailure as exc:
             if isinstance(exc, OperationInFlight) or exc.status_code == 429:
                 raise
@@ -519,7 +526,10 @@ async def _generate_models(
             raise
         if phase == "draft":
             if on_preview is not None:
-                await on_preview(parsed)
+                try:
+                    await on_preview(parsed)
+                except LeaseLost:
+                    raise
         else:
             final = parsed
     if final is None:

@@ -66,6 +66,32 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
+HSTS_VALUE = b"max-age=31536000; includeSubDomains"
+
+
+class HSTSMiddleware:
+    """Add Strict-Transport-Security to every HTTP response, including guard rejections."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_hsts(message):
+            if message["type"] == "http.response.start":
+                headers = [
+                    (k, v) for k, v in message.get("headers", []) if k.lower() != b"strict-transport-security"
+                ]
+                headers.append((b"strict-transport-security", HSTS_VALUE))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_hsts)
+
+
 def create_app() -> FastAPI:
     settings = get_settings()
     docs_url = "/docs" if settings.enable_docs else None
@@ -79,6 +105,8 @@ def create_app() -> FastAPI:
         openapi_url=openapi_url,
     )
     app.add_middleware(GuardMiddleware)
+    # Added last so it is outermost and also covers responses the guard sends.
+    app.add_middleware(HSTSMiddleware)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, exc: RequestValidationError):

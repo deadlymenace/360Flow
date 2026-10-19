@@ -175,6 +175,7 @@ async def _edit_view(
             style_part,
             original,
             settings.gemini_image_size,
+            before_generate=before_generate,
         )
         image = decode_image(raw)
         if image.shape[:2] != original.shape[:2]:
@@ -205,6 +206,7 @@ async def _gemini_edit(
     style_part: str,
     image_bgr: np.ndarray,
     image_size: str,
+    before_generate=None,
 ) -> bytes:
     payload = build_gemini_request(instructions, style_part, encode_jpeg(image_bgr, quality=90), image_size)
     timeout = httpx.Timeout(30.0, read=120.0)
@@ -212,6 +214,9 @@ async def _gemini_edit(
     last_detail = "Gemini did not return an image"
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(2):
+            if attempt > 0 and before_generate is not None:
+                # A retry is another paid call; the job must still hold its lease.
+                before_generate()
             response = await client.post(
                 url,
                 headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
