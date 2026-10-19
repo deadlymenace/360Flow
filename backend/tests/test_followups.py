@@ -453,3 +453,66 @@ def test_cancelled_job_writes_nothing_before_rows_are_deleted(client, monkeypatc
     finally:
         db.delete_job(job.id)
         db.delete_project(project.id)
+
+
+class _FakeWorldLabs:
+    """Stands in for httpx.AsyncClient in services.world_gen."""
+
+    deleted: list[str] = []
+    status = 200
+    explode = False
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        if _FakeWorldLabs.explode:
+            raise httpx.ConnectError("world labs down")
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def delete(self, url, headers=None):
+        _FakeWorldLabs.deleted.append(url.rsplit("/", 1)[-1])
+        return httpx.Response(_FakeWorldLabs.status)
+
+
+def _device_with_worlds(client, name: str):
+    token = client.raw.post("/api/v1/devices").json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+    project_id = client.raw.post("/api/v1/projects", json={"name": name}, headers=auth).json()["id"]
+    ids = {
+        "world_id": f"{name}-full",
+        "world_preview_id": f"{name}-draft",
+        "staged_world_id": f"{name}-sfull",
+        "staged_world_preview_id": f"{name}-sdraft",
+    }
+    db.update_project(project_id, **ids)
+    return auth, project_id, set(ids.values())
+
+
+@pytest.mark.parametrize("mode", ["ok", "http_error", "exception"])
+def test_delete_all_my_data_deletes_worlds_best_effort(client, monkeypatch, mode):
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setattr("services.world_gen.httpx.AsyncClient", _FakeWorldLabs)
+    _FakeWorldLabs.deleted = []
+    _FakeWorldLabs.status = 500 if mode == "http_error" else 200
+    _FakeWorldLabs.explode = mode == "exception"
+    auth, project_id, world_ids = _device_with_worlds(client, f"wl{mode.replace('_', '')}")
+    try:
+        response = client.raw.delete("/api/v1/devices/me", headers=auth)
+        assert response.status_code == 204
+        assert db.get_project(project_id) is None
+        assert client.raw.get("/api/v1/projects", headers=auth).status_code == 401
+        pending = set(db.pending_world_delete_ids(force=True))
+        if mode == "ok":
+            assert set(_FakeWorldLabs.deleted) == world_ids
+            assert not (world_ids & pending)
+        elif mode == "http_error":
+            assert set(_FakeWorldLabs.deleted) == world_ids
+            assert world_ids <= pending
+    finally:
+        _FakeWorldLabs.explode = False
+        for world_id in world_ids:
+            db.forget_world_delete(world_id)

@@ -4,10 +4,17 @@
     "target": "ES2022",
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "outDir": ".test-build",
     "rootDir": "src",
     "skipLibCheck": true
   },
-  "include": ["src/services/uploadPolicy.ts", "src/services/uploadPolicy.test.ts"]
+  "include": [
+    "src/services/uploadPolicy.ts",
+    "src/services/uploadPolicy.test.ts",
+    "src/capture/lowLight.ts",
+    "src/capture/lowLight.test.ts"
+  ]
 }
