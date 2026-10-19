@@ -15,10 +15,10 @@ import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import Session
 
-from db import Base, ProjectRow, _EXTRA_COLUMNS, _JOB_EXTRA_COLUMNS, _ensure_columns, _ensure_job_schema
+from db import Base, _database_connect_args, ProjectRow, _EXTRA_COLUMNS, _JOB_EXTRA_COLUMNS, _ensure_columns, _ensure_job_schema
 
 # Shared by SQLite and Postgres. DATETIME is rejected by Postgres.
-_SAFE_TYPE = re.compile(r"^(TEXT|INTEGER|BIGINT|REAL|DOUBLE PRECISION|TIMESTAMP|VARCHAR\(\d+\))$")
+_SAFE_TYPE = re.compile(r"^(TEXT|INTEGER|BIGINT|REAL|DOUBLE PRECISION|TIMESTAMP|TIMESTAMP WITH TIME ZONE|VARCHAR\(\d+\))$")
 
 _OLD_PROJECTS = """
 CREATE TABLE projects (
@@ -81,7 +81,8 @@ def test_postgres_migration_adds_every_column():
         if os.environ.get("CI"):
             pytest.fail("TEST_POSTGRES_URL is required in CI")
         pytest.skip("Set TEST_POSTGRES_URL to run migrations against Postgres")
-    engine = create_engine(url)
+    # Same connect args as the app; the test must pass whatever the server time zone is.
+    engine = create_engine(url, connect_args=_database_connect_args(url))
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS pending_world_deletes"))
         conn.execute(text("DROP TABLE IF EXISTS daily_usage"))
@@ -94,7 +95,10 @@ def test_postgres_migration_adds_every_column():
     columns = {column["name"]: column for column in inspect(engine).get_columns("projects")}
     assert set(_EXTRA_COLUMNS) <= set(columns)
     data_type = _postgres_data_type(engine, "share_expires_at")
-    assert data_type.startswith("timestamp"), data_type
+    assert data_type == "timestamp with time zone", data_type
+    for column in ("preview_expires_at",):
+        assert _postgres_data_type(engine, column) == "timestamp with time zone", column
+    assert _postgres_data_type(engine, "delayed_at", table="jobs") == "timestamp with time zone"
     _assert_share_expiry_roundtrip(engine)
     table_names = set(inspect(engine).get_table_names())
     assert {"devices", "daily_usage", "pending_world_deletes", "jobs", "rate_windows"} <= table_names
@@ -266,4 +270,31 @@ def test_postgres_promotes_naive_lease_timestamps():
     assert lease.tzinfo is not None and started.tzinfo is not None
     assert lease.astimezone(timezone.utc) == datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
     assert started.astimezone(timezone.utc) == datetime(2026, 10, 15, 11, 0, tzinfo=timezone.utc)
+    engine.dispose()
+
+
+def test_postgres_promotes_naive_project_timestamps_outside_utc():
+    """Naive share/preview expiries become timestamptz and keep the UTC instant, even off UTC."""
+    url = os.environ.get("TEST_POSTGRES_URL", "").strip()
+    if not url:
+        if os.environ.get("CI"):
+            pytest.fail("TEST_POSTGRES_URL is required in CI")
+        pytest.skip("Set TEST_POSTGRES_URL to run migrations against Postgres")
+    engine = create_engine(url, connect_args={"options": "-c timezone=Asia/Dubai"})
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS projects"))
+        conn.execute(text(_OLD_PROJECTS))
+        conn.execute(text("ALTER TABLE projects ADD COLUMN share_expires_at TIMESTAMP"))
+        conn.execute(
+            text(
+                "INSERT INTO projects (id, name, status, created_at, updated_at, share_token, share_expires_at) "
+                "VALUES ('p-tz', 'n', 'created', '2026-10-15 12:00:00', '2026-10-15 12:00:00', 'tok-tz', "
+                "'2026-10-15 12:00:00')"
+            )
+        )
+    _ensure_columns(engine)
+    assert _postgres_data_type(engine, "share_expires_at") == "timestamp with time zone"
+    with engine.connect() as conn:
+        value = conn.execute(text("SELECT share_expires_at FROM projects WHERE id = 'p-tz'")).scalar()
+    assert value == datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
     engine.dispose()

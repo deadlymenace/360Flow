@@ -87,6 +87,9 @@ class ProjectRow(Base):
     staged_published: Mapped[int | None] = mapped_column(Integer, nullable=True)
     preview_token: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     preview_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # JSON for a World Labs operation already paid for when a job failed on the
+    # 429 cap. The next 3D run for that source polls it instead of paying again.
+    resume_operation: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class JobRow(Base):
@@ -161,7 +164,7 @@ class PendingDraftCleanupRow(Base):
 
 
 # Types in this map are sent as raw DDL to both SQLite and Postgres.
-# TIMESTAMP is valid in both. DATETIME is not a Postgres type and crashes startup.
+# TIMESTAMP and TIMESTAMP WITH TIME ZONE are valid in both. DATETIME is not a Postgres type and crashes startup.
 _EXTRA_COLUMNS = {
     "world_preview_url": "TEXT",
     "world_preview_id": "VARCHAR(64)",
@@ -179,16 +182,17 @@ _EXTRA_COLUMNS = {
     "active_job": "VARCHAR(32)",
     "owner_device_id": "VARCHAR(36)",
     "staged_world_preview_id": "VARCHAR(64)",
-    "share_expires_at": "TIMESTAMP",
+    "share_expires_at": "TIMESTAMP WITH TIME ZONE",
     "provider_error": "TEXT",
     "staged_published": "INTEGER",
     "preview_token": "VARCHAR(64)",
-    "preview_expires_at": "TIMESTAMP",
+    "preview_expires_at": "TIMESTAMP WITH TIME ZONE",
+    "resume_operation": "TEXT",
 }
 
 _JOB_EXTRA_COLUMNS = {
     "attempt_count": "INTEGER NOT NULL DEFAULT 0",
-    "delayed_at": "TIMESTAMP",
+    "delayed_at": "TIMESTAMP WITH TIME ZONE",
     "lease_owner": "VARCHAR(64)",
     "lease_expires_at": "TIMESTAMP WITH TIME ZONE",
     "rate_limit_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -241,6 +245,7 @@ class ProjectRecord:
     staged_published: bool
     preview_token: str | None
     preview_expires_at: datetime | None
+    resume_operation: str | None = None
 
 
 @dataclass
@@ -287,6 +292,8 @@ def _ensure_columns(engine) -> None:
         for name, ddl in _EXTRA_COLUMNS.items():
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE projects ADD COLUMN {name} {ddl}"))
+        if engine.dialect.name == "postgresql":
+            _promote_naive_timestamps(conn, "projects", _PROJECT_TZ_COLUMNS, existing)
         missing = conn.execute(text("SELECT id FROM projects WHERE preview_token IS NULL")).fetchall()
         for (project_id,) in missing:
             conn.execute(
@@ -310,15 +317,16 @@ def _ensure_columns(engine) -> None:
 def _database_connect_args(database_url: str) -> dict:
     """SQLite stays single-threaded. Postgres sessions pin UTC.
 
-    Lease and rate-limit instants are ``timestamptz``. Older ``timestamp``
-    columns are still read as UTC, which matches how they were written.
+    Every instant column is ``timestamptz``; naive columns left by older
+    deployments are promoted at startup. The UTC pin is a fallback only.
     """
     if database_url.startswith("sqlite"):
         return {"check_same_thread": False}
     return {"options": "-c timezone=UTC"}
 
 
-_LEASE_TZ_COLUMNS = ("lease_expires_at", "rate_limit_started_at")
+_LEASE_TZ_COLUMNS = ("lease_expires_at", "rate_limit_started_at", "delayed_at")
+_PROJECT_TZ_COLUMNS = ("share_expires_at", "preview_expires_at")
 
 
 def _ensure_job_schema(engine) -> None:
@@ -332,7 +340,7 @@ def _ensure_job_schema(engine) -> None:
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}"))
         if engine.dialect.name == "postgresql":
-            _promote_lease_timestamps(conn, existing)
+            _promote_naive_timestamps(conn, "jobs", _LEASE_TZ_COLUMNS, existing)
         conn.execute(
             text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_one_open_per_project "
@@ -341,28 +349,28 @@ def _ensure_job_schema(engine) -> None:
         )
 
 
-def _promote_lease_timestamps(conn, existing: set[str]) -> None:
+def _promote_naive_timestamps(conn, table: str, columns, existing: set[str]) -> None:
     """Turn pre-existing naive lease timestamps into ``timestamptz``.
 
     Those values were written as UTC. ``AT TIME ZONE 'UTC'`` keeps that instant
     when the column gains a time zone.
     """
-    for name in _LEASE_TZ_COLUMNS:
+    for name in columns:
         if name not in existing:
             continue
         data_type = conn.execute(
             text(
                 "SELECT data_type FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
-                "AND table_name = 'jobs' AND column_name = :name"
+                "AND table_name = :table AND column_name = :name"
             ),
-            {"name": name},
+            {"table": table, "name": name},
         ).scalar()
         if str(data_type or "").lower() != "timestamp without time zone":
             continue
         conn.execute(
             text(
-                f"ALTER TABLE jobs ALTER COLUMN {name} "
+                f"ALTER TABLE {table} ALTER COLUMN {name} "
                 f"TYPE TIMESTAMP WITH TIME ZONE "
                 f"USING {name} AT TIME ZONE 'UTC'"
             )
@@ -442,6 +450,7 @@ def _record(row: ProjectRow) -> ProjectRecord:
         staged_published=bool(row.staged_published),
         preview_token=row.preview_token,
         preview_expires_at=row.preview_expires_at,
+        resume_operation=row.resume_operation,
     )
 
 
@@ -465,6 +474,38 @@ def _job_record(row: JobRow) -> JobRecord:
 
 def hash_device_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def cancel_device_jobs(device_id: str) -> list[str]:
+    """Cancel every open job on the device's projects and drop their leases.
+
+    Returns the job ids. A worker that still runs one then fails its lease
+    check and writes nothing; claim and renew refuse a cancelled job.
+    """
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        rows = session.scalars(
+            select(JobRow)
+            .join(ProjectRow, ProjectRow.id == JobRow.project_id)
+            .where(ProjectRow.owner_device_id == device_id)
+            .where(JobRow.status.in_(("pending", "running", "delayed")))
+        ).all()
+        for row in rows:
+            row.status = "cancelled"
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.updated_at = now
+        return [row.id for row in rows]
+
+
+def delete_device(device_id: str) -> bool:
+    """Remove the device row so its token stops working."""
+    with session_scope() as session:
+        row = session.get(DeviceRow, device_id)
+        if row is None:
+            return False
+        session.delete(row)
+        return True
 
 
 def create_device() -> tuple[str, str]:
@@ -693,7 +734,10 @@ def renew_job_lease(job_id: str, owner: str) -> bool:
     until = now + timedelta(seconds=get_settings().job_lease_seconds)
     with session_scope() as session:
         row = session.get(JobRow, job_id)
-        if row is None or row.lease_owner != owner or row.status != "running":
+        if row is None or row.lease_owner is None or row.lease_owner != owner or row.status != "running":
+            return False
+        if row.lease_expires_at is not None and _as_utc(row.lease_expires_at) <= now:
+            # Expired: another replica may already have claimed it. Do not revive.
             return False
         row.lease_expires_at = until
         row.updated_at = now
