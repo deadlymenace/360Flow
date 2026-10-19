@@ -281,7 +281,11 @@ def test_regenerate_deletes_the_old_full_and_draft_worlds(client, monkeypatch, c
 
     with caplog.at_level(logging.INFO, logger="services.world_gen"):
         regenerated = client.post(f"/api/v1/projects/{project_id}/generate-3d")
-    assert regenerated.status_code == 200, regenerated.text
+        assert regenerated.status_code == 200, regenerated.text
+        # Queued during the request; the background retry pass deletes them.
+        assert deleted == []
+        assert {"world-old", "draft-old"} <= set(pending_world_delete_ids(force=True))
+        asyncio.run(world_gen.retry_pending_world_deletes(force=True))
     assert {url.rsplit("/", 1)[-1] for url in deleted} == {"world-old", "draft-old"}
     assert "Deleted Marble world world-old" in caplog.text
     assert "Deleted Marble world draft-old" in caplog.text

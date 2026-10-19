@@ -605,3 +605,29 @@ def test_retry_pass_rechecks_the_shared_world_guard(client, monkeypatch):
         assert "revived-world" not in db.pending_world_delete_ids(force=True)
     finally:
         db.delete_project(keeper)
+
+
+def test_reupload_keeps_a_world_another_project_shares(client, monkeypatch):
+    from tests.test_api import _jpeg
+
+    _use_fake_world_labs(monkeypatch)
+    _fresh_generate(monkeypatch)
+    project_id = client.post("/api/v1/projects", json={"name": "reup-shared"}).json()["id"]
+    db.update_project(project_id, status="complete", world_id="reup-shared-world", world_preview_id="reup-own")
+    other = client.post("/api/v1/projects", json={"name": "reup-other"}).json()["id"]
+    db.update_project(other, world_id="reup-shared-world")
+    try:
+        response = client.post(
+            f"/api/v1/projects/{project_id}/upload",
+            files=[("images", (f"{i}.jpg", _jpeg(i), "image/jpeg")) for i in range(4)],
+        )
+        assert response.status_code == 200, response.text
+        assert _FakeWorldLabs.deleted == []  # no World Labs call during the request
+        pending = set(db.pending_world_delete_ids(force=True))
+        assert "reup-own" in pending
+        assert "reup-shared-world" not in pending
+        _retry_deletes()
+        assert _FakeWorldLabs.deleted == ["reup-own"]
+        assert db.get_project(other).world_id == "reup-shared-world"
+    finally:
+        db.delete_project(other)
