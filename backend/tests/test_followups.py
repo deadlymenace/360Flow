@@ -516,3 +516,45 @@ def test_delete_all_my_data_deletes_worlds_best_effort(client, monkeypatch, mode
         _FakeWorldLabs.explode = False
         for world_id in world_ids:
             db.forget_world_delete(world_id)
+
+
+def _use_fake_world_labs(monkeypatch):
+    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setattr("services.world_gen.httpx.AsyncClient", _FakeWorldLabs)
+    _FakeWorldLabs.deleted = []
+    _FakeWorldLabs.status = 200
+    _FakeWorldLabs.explode = False
+
+
+def test_shared_world_is_kept_until_the_last_project_is_deleted(client, monkeypatch):
+    _use_fake_world_labs(monkeypatch)
+    first = client.post("/api/v1/projects", json={"name": "share-a"}).json()["id"]
+    second = client.post("/api/v1/projects", json={"name": "share-b"}).json()["id"]
+    db.update_project(first, world_id="shared-world", world_preview_id="only-a")
+    db.update_project(second, staged_world_id="shared-world")
+
+    assert client.delete(f"/api/v1/projects/{first}").status_code == 204
+    assert _FakeWorldLabs.deleted == ["only-a"]
+    assert db.get_project(second).staged_world_id == "shared-world"
+
+    assert client.delete(f"/api/v1/projects/{second}").status_code == 204
+    assert _FakeWorldLabs.deleted == ["only-a", "shared-world"]
+
+
+def test_delete_all_my_data_keeps_worlds_used_by_other_and_demo_projects(client, monkeypatch):
+    _use_fake_world_labs(monkeypatch)
+    auth, mine, world_ids = _device_with_worlds(client, "guarded")
+    demo = db.create_project("demo share", owner_device_id=None)
+    db.update_project(demo.id, world_id="guarded-full")
+    other = client.post("/api/v1/projects", json={"name": "other device"}).json()["id"]
+    db.update_project(other, staged_world_preview_id="guarded-sdraft")
+    try:
+        assert client.raw.delete("/api/v1/devices/me", headers=auth).status_code == 204
+        assert db.get_project(mine) is None
+        assert set(_FakeWorldLabs.deleted) == {"guarded-draft", "guarded-sfull"}
+        assert db.get_project(demo.id).world_id == "guarded-full"
+        assert db.get_by_share_token(demo.share_token) is not None
+        assert db.get_project(other).staged_world_preview_id == "guarded-sdraft"
+    finally:
+        db.delete_project(demo.id)
+        db.delete_project(other)

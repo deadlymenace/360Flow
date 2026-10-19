@@ -476,6 +476,26 @@ def hash_device_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+_WORLD_ID_FIELDS = ("world_id", "world_preview_id", "staged_world_id", "staged_world_preview_id")
+
+
+def world_ids_in_use(world_ids, exclude_project_ids=()) -> set[str]:
+    """World ids from ``world_ids`` that a remaining project still references in any world field."""
+    wanted = {item for item in world_ids if item}
+    if not wanted:
+        return set()
+    excluded = set(exclude_project_ids)
+    columns = [getattr(ProjectRow, name) for name in _WORLD_ID_FIELDS]
+    with session_scope() as session:
+        query = select(ProjectRow.id, *columns).where(or_(*[column.in_(wanted) for column in columns]))
+        found: set[str] = set()
+        for row in session.execute(query).all():
+            if row[0] in excluded:
+                continue
+            found.update(value for value in row[1:] if value in wanted)
+        return found
+
+
 def cancel_device_jobs(device_id: str) -> list[str]:
     """Cancel every open job on the device's projects and drop their leases.
 

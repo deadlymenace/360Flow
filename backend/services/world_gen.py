@@ -537,6 +537,20 @@ async def _generate_models(
     return final
 
 
+async def delete_unshared_worlds(world_ids: list[str | None], exclude_project_ids=()) -> None:
+    """Delete worlds unless another remaining project still references them.
+
+    World Labs deletion cannot be undone, so a world that any other project
+    (including ownerless demo/share projects) still points at is kept.
+    """
+    from db import world_ids_in_use
+
+    shared = world_ids_in_use(world_ids, exclude_project_ids)
+    for world_id in sorted(shared):
+        logger.warning("Keeping World Labs world %s: another project still references it", world_id)
+    await delete_worlds([item for item in world_ids if item and item not in shared])
+
+
 async def delete_worlds(world_ids: list[str | None]) -> None:
     """Ask Marble to delete worlds this API created.
 
