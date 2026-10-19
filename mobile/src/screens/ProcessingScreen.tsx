@@ -6,13 +6,7 @@ import { RootStackParamList } from '../navigation';
 import { api } from '../services/api';
 import { HapticFeedback } from '../utils/haptics';
 import { DRAFT_ETA_S, FULL_ETA_MIN, STITCH_SLOW_MS } from '../models/types';
-import {
-  UploadError,
-  classifyError,
-  friendlyUploadMessage,
-  nextStepAfterFailure,
-  nextStepAfterStatusCheck,
-} from '../services/uploadPolicy';
+import { friendlyUploadMessage, newUploadSession, runUploadSession } from '../services/uploadPolicy';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Processing'>;
 
@@ -21,7 +15,7 @@ type Phase = 'preparing' | 'sending' | 'checking' | 'stitching' | 'slow' | 'done
 const POLL_MS = 2000;
 const RECONNECT_AFTER_FAILURES = 3;
 
-function sleep(ms: number) {
+function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -87,55 +81,31 @@ export default function ProcessingScreen({ navigation, route }: Props) {
     }, STITCH_SLOW_MS);
   }, [projectId]);
 
-  /**
-   * Upload with the billing-safe retry policy (see services/uploadPolicy.ts):
-   * auto-retry only when nothing left the phone; after a timeout or lost
-   * response, GET the status and re-upload only if the server is still
-   * waiting for photos. Otherwise go straight to polling.
-   */
+  // One session per photo set: remembers whether any attempt reached the
+  // send step, so a manual Retry checks status before uploading again.
+  const sessionRef = useRef(newUploadSession());
+
+  /** Billing-safe upload; the policy lives in services/uploadPolicy.ts. */
   const startUpload = useCallback(async () => {
     if (busyRef.current || !imageUris?.length) return;
     busyRef.current = true;
     setErrorMsg(null);
-    let attempt = 1;
     try {
-      while (mountedRef.current) {
-        try {
-          await api.uploadImages(projectId, imageUris, {
+      const outcome = await runUploadSession(sessionRef.current, {
+        upload: () =>
+          api.uploadImages(projectId, imageUris, {
             yaws,
             hfov,
             lens,
             onStage: (stage) => mountedRef.current && setPhase(stage),
-          });
-          startPolling();
-          return;
-        } catch (e) {
-          const err = e instanceof UploadError ? e : classifyError(e, 'send');
-          const first = nextStepAfterFailure(err, attempt);
-          let step: { action: string; delayMs?: number } = first;
-          if (first.action === 'check-status') {
-            if (mountedRef.current) setPhase('checking');
-            let status: string | null = null;
-            try {
-              status = (await api.getStatus(projectId)).status;
-            } catch {
-              status = null;
-            }
-            step = nextStepAfterStatusCheck(status, attempt);
-            if (step.action === 'poll') {
-              startPolling();
-              return;
-            }
-          }
-          if (step.action === 'retry-upload') {
-            attempt += 1;
-            await sleep(step.delayMs ?? 1500);
-            continue;
-          }
-          fail(friendlyUploadMessage(err));
-          return;
-        }
-      }
+          }),
+        getStatus: async () => (await api.getStatus(projectId)).status,
+        sleep,
+        onPhase: (p) => mountedRef.current && setPhase(p),
+      });
+      if (!mountedRef.current) return;
+      if (outcome.result === 'poll') startPolling();
+      else fail(friendlyUploadMessage(outcome.error));
     } finally {
       busyRef.current = false;
     }
@@ -168,8 +138,8 @@ export default function ProcessingScreen({ navigation, route }: Props) {
 
   const handleRetry = () => {
     setErrorMsg(null);
-    // Manual Retry also goes through the status check inside startUpload when
-    // the outcome is unknown, so it cannot start a second paid run.
+    // Manual Retry reuses the session: if any attempt reached the send step,
+    // runUploadSession checks status first, so it cannot start a second paid run.
     if (imageUris && imageUris.length > 0) {
       startUpload();
     } else {
@@ -196,7 +166,7 @@ export default function ProcessingScreen({ navigation, route }: Props) {
           <Text style={styles.phaseTitle} accessibilityRole="header">{uploadTitle}</Text>
           <IndeterminateBar />
           <Text style={styles.subtitle}>
-            {phase === 'sending' ? 'This takes about 20–60 s on mobile data.' : ' '}
+            {phase === 'sending' ? 'This can take up to 2 minutes on mobile data.' : ' '}
           </Text>
           <Text style={styles.keepOpen}>Keep 360Flow open until the upload finishes.</Text>
         </View>

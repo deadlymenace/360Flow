@@ -7,15 +7,21 @@
  *
  *  - We only auto-retry when the request clearly never left the phone
  *    (`stage: 'prepare'`: device registration or copying the photos failed
- *    before `fetch` was called, or the device was already known offline).
- *  - On a timeout, a lost response, or a transport error *during* the POST we
- *    cannot know whether the server received it. We first GET the project's
- *    status and re-upload only if the project is still waiting for photos
- *    (`created`). Any other status means the upload landed (or a job is
- *    running), so we go to polling instead of uploading again.
+ *    before `fetch` was called).
+ *  - Any failure *during* the POST whose outcome we cannot know (timeout after
+ *    UPLOAD_TIMEOUT_MS, lost response, transport error, or a 5xx such as a
+ *    502/504 from a proxy that may have forwarded the body) is "unknown". We
+ *    GET the project's status and re-upload only if it is still `created`
+ *    (waiting for photos). Any other status means go to polling/Processing.
+ *  - Once any attempt in an upload session reached the send step, every later
+ *    attempt, including a manual Retry, checks status first.
+ *  - A 409 means the project is already processing: poll, don't error.
  *
- * Pure functions only, so `uploadPolicy.test.ts` can run under plain Node.
+ * Pure logic with injected I/O, so `uploadPolicy.test.ts` runs under plain Node.
  */
+
+/** Upload POST timeout used by api.ts. User copy says "up to 2 minutes". */
+export const UPLOAD_TIMEOUT_MS = 120_000;
 
 export type UploadStage = 'prepare' | 'send';
 
@@ -67,7 +73,7 @@ export function friendlyUploadMessage(err: UploadError): string {
     case 'offline':
       return "No connection. Your photos are safe on this phone. Retry when you're back online.";
     case 'timeout':
-      return 'Upload is slow. Try Wi-Fi, then Retry. Your photos are safe on this phone.';
+      return "Upload didn't finish within 2 minutes. Try Wi-Fi, then Retry. Your photos are safe on this phone.";
     case 'server':
       return 'Server problem. Your photos are safe on this phone. Retry in a moment.';
     case 'client':
@@ -87,7 +93,15 @@ export function clearlyNeverSent(err: UploadError): boolean {
 
 /** True when we cannot tell whether the server accepted the upload. */
 export function outcomeUnknown(err: UploadError): boolean {
-  return err.stage === 'send' && (err.kind === 'timeout' || err.kind === 'offline' || err.kind === 'unknown');
+  return (
+    err.stage === 'send' &&
+    (err.kind === 'timeout' || err.kind === 'offline' || err.kind === 'unknown' || err.kind === 'server')
+  );
+}
+
+/** 409: the server says this project is already processing. */
+export function isAlreadyProcessing(err: UploadError): boolean {
+  return err.kind === 'client' && err.status === 409;
 }
 
 /** Project statuses that mean the server is still waiting for photos. */
@@ -98,6 +112,7 @@ export function isWaitingForPhotos(status: string): boolean {
 export type NextStep =
   | { action: 'retry-upload'; delayMs: number }
   | { action: 'check-status' }
+  | { action: 'poll' }
   | { action: 'show-error' };
 
 /**
@@ -105,6 +120,7 @@ export type NextStep =
  * `attempt` is 1 for the first try. We auto-retry at most once.
  */
 export function nextStepAfterFailure(err: UploadError, attempt: number): NextStep {
+  if (isAlreadyProcessing(err)) return { action: 'poll' };
   if (outcomeUnknown(err)) return { action: 'check-status' };
   if (clearlyNeverSent(err) && attempt < 2 && err.kind !== 'client') {
     return { action: 'retry-upload', delayMs: backoffMs(attempt) };
@@ -128,4 +144,73 @@ export function nextStepAfterStatusCheck(
 
 export function backoffMs(attempt: number): number {
   return Math.min(8000, 1500 * 2 ** (attempt - 1));
+}
+
+/** Per-upload-session state. Create one per Processing screen / photo set. */
+export type UploadSession = {
+  /** True once any attempt got as far as sending the POST. */
+  reachedSend: boolean;
+};
+
+export function newUploadSession(): UploadSession {
+  return { reachedSend: false };
+}
+
+export type UploadDeps = {
+  /** Performs the upload. Must throw an `UploadError` (or anything classifiable). */
+  upload: () => Promise<void>;
+  /** Returns the project's status string. Throws on network failure. */
+  getStatus: () => Promise<string>;
+  sleep: (ms: number) => Promise<void>;
+  /** Called when a status check starts, so the UI can show "Checking upload…". */
+  onPhase?: (phase: 'checking') => void;
+};
+
+export type UploadOutcome = { result: 'poll' } | { result: 'error'; error: UploadError };
+
+async function statusOrNull(deps: UploadDeps): Promise<string | null> {
+  deps.onPhase?.('checking');
+  try {
+    return await deps.getStatus();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Run one upload attempt sequence (first try or a manual Retry) for a session.
+ * Never uploads after a send-stage attempt without first seeing `created`.
+ */
+export async function runUploadSession(session: UploadSession, deps: UploadDeps): Promise<UploadOutcome> {
+  let lastError: UploadError | null = null;
+  // Manual Retry after an earlier send attempt: check status before anything.
+  if (session.reachedSend) {
+    const status = await statusOrNull(deps);
+    if (status == null) {
+      return { result: 'error', error: new UploadError('offline', 'send', 'Status check failed') };
+    }
+    if (!isWaitingForPhotos(status)) return { result: 'poll' };
+  }
+  let attempt = 1;
+  for (;;) {
+    try {
+      await deps.upload();
+      return { result: 'poll' };
+    } catch (e) {
+      const err = e instanceof UploadError ? e : classifyError(e, 'send');
+      lastError = err;
+      if (err.stage === 'send') session.reachedSend = true;
+      let step: NextStep | ReturnType<typeof nextStepAfterStatusCheck> = nextStepAfterFailure(err, attempt);
+      if (step.action === 'check-status') {
+        step = nextStepAfterStatusCheck(await statusOrNull(deps), attempt);
+      }
+      if (step.action === 'poll') return { result: 'poll' };
+      if (step.action === 'retry-upload') {
+        attempt += 1;
+        await deps.sleep(step.delayMs);
+        continue;
+      }
+      return { result: 'error', error: lastError };
+    }
+  }
 }

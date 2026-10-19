@@ -2,7 +2,7 @@ import { Directory, File, Paths } from 'expo-file-system';
 import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
 import { Project, StageStatus, StatusResponse, WorldStatus } from '../models/types';
-import { TimeoutError, UploadStage, classifyError, errorForStatus } from './uploadPolicy';
+import { TimeoutError, UPLOAD_TIMEOUT_MS, UploadStage, classifyError, errorForStatus } from './uploadPolicy';
 
 const DEVICE_TOKEN_KEY = 'device_token';
 
@@ -172,7 +172,7 @@ class APIService {
       const res = await fetchWithTimeout(
         `${this.baseUrl}/projects/${projectId}/upload`,
         { method: 'POST', body: formData },
-        120000
+        UPLOAD_TIMEOUT_MS, // 120 s; see uploadPolicy.ts
       );
       if (!res.ok) {
         if (__DEV__) console.warn('Upload failed', res.status, await res.text().catch(() => ''));
