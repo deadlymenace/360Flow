@@ -205,6 +205,8 @@ async def upload_images(
             "staging_status": None,
             "staging_error": None,
             "staged_published": 0,
+            # New photos: an operation paid for on the old ones must not resume.
+            "resume_operation": None,
         },
         replace_delayed=True,
         retire_worlds="all",

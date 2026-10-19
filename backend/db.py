@@ -477,7 +477,7 @@ def hash_device_token(token: str) -> str:
 
 
 def delete_device(device_id: str) -> bool:
-    """Remove a device so its token stops working. Its projects are left in place."""
+    """Remove the device row so its token stops working."""
     with session_scope() as session:
         row = session.get(DeviceRow, device_id)
         if row is None:

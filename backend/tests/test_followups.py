@@ -118,6 +118,114 @@ def test_gemini_text_only_retry_rechecks_the_lease(monkeypatch):
     assert checks["n"] == 1
 
 
+def _save_paid_operation(monkeypatch, project_id: str, kind: str = "world") -> dict:
+    """Run one job that pays for a draft and then fails on the 429 cap."""
+    monkeypatch.setenv("WORLDLABS_RATE_LIMIT_MAX_ATTEMPTS", "2")
+    generates = {"n": 0}
+
+    async def generate(*args, on_submitting=None, on_operation=None, on_media=None, **kwargs):
+        generates["n"] += 1
+        await on_media("media-1")
+        await on_submitting("draft")
+        await on_operation("paid-op-1", "draft")
+        hook = world_gen._rate_limit_hook.get()
+        for _ in range(5):
+            hook()
+        raise AssertionError("cap should have raised")
+
+    monkeypatch.setattr(pipeline, "generate_world", generate)
+    job = db.create_job(project_id, kind)
+    asyncio.run(pipeline.run_job(job.id))
+    project = db.get_project(project_id)
+    assert project.error == WORLD_RATE_LIMIT_EXHAUSTED
+    assert json.loads(project.resume_operation)["operation_id"] == "paid-op-1"
+    return generates
+
+
+def _watch_resume(monkeypatch) -> list:
+    polled = []
+
+    async def poll(operation_id, timeout_s, on_tick=None):
+        polled.append(operation_id)
+        return {"world_id": None, "marble_url": None, "provider": "worldlabs", "operation_id": operation_id}
+
+    async def cont(image, label, media_asset_id, **kwargs):
+        return {"world_id": "full-2", "marble_url": "https://marble.worldlabs.ai/world/full-2",
+                "provider": "worldlabs", "operation_id": "full-op"}
+
+    monkeypatch.setattr(pipeline, "poll_world_operation", poll)
+    monkeypatch.setattr(pipeline, "continue_full_world", cont)
+    return polled
+
+
+def _fresh_generate(monkeypatch) -> dict:
+    calls = {"n": 0}
+
+    async def generate(*args, **kwargs):
+        calls["n"] += 1
+        return {"world_id": "fresh-1", "marble_url": "https://marble.worldlabs.ai/world/fresh-1",
+                "provider": "worldlabs", "operation_id": "fresh-op"}
+
+    monkeypatch.setattr(pipeline, "generate_world", generate)
+    return calls
+
+
+def test_changed_panorama_does_not_resume_the_old_operation(client, monkeypatch):
+    project_id = _ready_project("hash-mismatch")
+    _save_paid_operation(monkeypatch, project_id)
+    get_storage().put_bytes(panorama_key(project_id), b"\xff\xd8different", "image/jpeg")
+    polled = _watch_resume(monkeypatch)
+    fresh = _fresh_generate(monkeypatch)
+    asyncio.run(pipeline.run_job(db.create_job(project_id, "world").id))
+    project = db.get_project(project_id)
+    assert polled == []
+    assert fresh["n"] == 1
+    assert project.resume_operation is None
+    assert project.world_id == "fresh-1"
+
+
+def test_upload_after_a_saved_operation_does_not_resume(client, monkeypatch):
+    from tests.test_api import _jpeg
+
+    project_id = client.post("/api/v1/projects", json={"name": "reupload"}).json()["id"]
+    key = panorama_key(project_id)
+    get_storage().put_bytes(key, b"\xff\xd8old", "image/jpeg")
+    db.update_project(project_id, panorama_key=key, status="stitched")
+    _save_paid_operation(monkeypatch, project_id)
+    db.update_project(project_id, status="failed")
+    polled = _watch_resume(monkeypatch)
+    _fresh_generate(monkeypatch)
+    response = client.post(
+        f"/api/v1/projects/{project_id}/upload",
+        files=[("images", (f"{i}.jpg", _jpeg(i), "image/jpeg")) for i in range(4)],
+    )
+    assert response.status_code == 200, response.text
+    assert db.get_project(project_id).resume_operation is None
+    assert polled == []
+
+
+def test_restage_after_a_saved_operation_does_not_resume(client, monkeypatch):
+    from storage import staged_key
+
+    project_id = _ready_project("restage")
+    skey = staged_key(project_id)
+    get_storage().put_bytes(skey, b"\xff\xd8staged-old", "image/jpeg")
+    db.update_project(project_id, staged_key=skey, staging_status="staged", staging_prompt="sofa")
+    _save_paid_operation(monkeypatch, project_id, kind="staged_world")
+
+    async def fake_stage(image_bytes, user_prompt, before_generate=None):
+        return b"\xff\xd8staged-new", "gemini_mock", None
+
+    monkeypatch.setattr(pipeline, "stage_image", fake_stage)
+    asyncio.run(pipeline.run_job(db.create_job(project_id, "stage").id))
+    assert db.get_project(project_id).resume_operation is None
+    polled = _watch_resume(monkeypatch)
+    fresh = _fresh_generate(monkeypatch)
+    asyncio.run(pipeline.run_job(db.create_job(project_id, "staged_world").id))
+    assert polled == []
+    assert fresh["n"] == 1
+
+
 def test_rate_limit_failure_resumes_the_paid_operation(client, monkeypatch):
     monkeypatch.setenv("WORLDLABS_RATE_LIMIT_MAX_ATTEMPTS", "2")
     project_id = _ready_project("paid-op")
@@ -141,6 +249,7 @@ def test_rate_limit_failure_resumes_the_paid_operation(client, monkeypatch):
     assert project.error == WORLD_RATE_LIMIT_EXHAUSTED
     recorded = json.loads(project.resume_operation)
     assert recorded["operation_id"] == "paid-op-1"
+    assert len(recorded["image_sha256"]) == 64  # same panorama: hash matches and it resumes
     assert recorded["phase"] == "draft"
 
     polled, continued = [], []
@@ -175,9 +284,28 @@ def test_api_responses_send_hsts(client):
         assert "max-age=" in response.headers.get("strict-transport-security", "")
 
 
-def test_device_can_delete_itself(client):
+def test_delete_all_my_data(client):
+    from storage import staged_key, upload_key
+
     token = client.raw.post("/api/v1/devices").json()["token"]
     auth = {"Authorization": f"Bearer {token}"}
+    created = client.raw.post("/api/v1/projects", json={"name": "mine"}, headers=auth).json()
+    project_id, share = created["id"], created["share_token"]
+    storage = get_storage()
+    keys = [upload_key(project_id, 0), panorama_key(project_id), staged_key(project_id)]
+    for key in keys:
+        storage.put_bytes(key, b"\xff\xd8x", "image/jpeg")
+    db.update_project(project_id, panorama_key=keys[1], staged_key=keys[2], status="stitched")
+    other = client.post("/api/v1/projects", json={"name": "not mine"}).json()["id"]
+    assert db.get_by_share_token(share) is not None
+
     assert client.raw.delete("/api/v1/devices/me").status_code == 401
     assert client.raw.delete("/api/v1/devices/me", headers=auth).status_code == 204
+
+    assert db.get_project(project_id) is None
+    assert db.get_by_share_token(share) is None
+    assert client.raw.get(f"/v/{share}").status_code == 404
+    for key in keys:
+        assert not storage.list_keys(key)
+    assert db.get_project(other) is not None
     assert client.raw.get("/api/v1/projects", headers=auth).status_code == 401

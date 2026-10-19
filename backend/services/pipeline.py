@@ -11,6 +11,7 @@ Set JOBS_INLINE=1 to await the work inside the request (used by tests).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import tempfile
@@ -535,6 +536,7 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
             staging_status="staged",
             staged_key=key,
             staging_provider=provider,
+            **_clear_staged_resume(project_id),
             staging_notes=notes,
             staging_error=None,
         )
@@ -929,8 +931,14 @@ def _record_paid_operation(project_id: str, job_id: str | None, staged_source: b
         phase = "draft"
     if phase not in {"draft", "full"}:
         return
+    project = get_project(project_id)
+    image_hash = _source_image_hash(project, staged_source) if project is not None else None
+    if image_hash is None:
+        logger.warning("Project %s: no source image to fingerprint; not recording operation %s", project_id, job.operation_id)
+        return
     payload = {
         "source": "staged" if staged_source else "original",
+        "image_sha256": image_hash,
         "operation_id": job.operation_id,
         "phase": phase,
         "media_asset_id": job.media_asset_id,
@@ -957,7 +965,36 @@ def _take_paid_operation(project: ProjectRecord, staged_source: bool) -> dict | 
     update_project(project.id, resume_operation=None)
     if not payload.get("operation_id") or payload.get("phase") not in {"draft", "full"}:
         return None
+    current = _source_image_hash(project, staged_source)
+    if not current or payload.get("image_sha256") != current:
+        logger.warning(
+            "Project %s: source image changed since operation %s was paid for; starting fresh",
+            project.id,
+            payload.get("operation_id"),
+        )
+        return None
     return payload
+
+
+def _source_image_hash(project: ProjectRecord, staged_source: bool) -> str | None:
+    """SHA-256 of the image a 3D run for this source would send to World Labs."""
+    try:
+        image, _ = _world_inputs(project, staged_source)
+    except Exception:
+        return None
+    return hashlib.sha256(image).hexdigest()
+
+
+def _clear_staged_resume(project_id: str) -> dict:
+    """A new staged image invalidates a saved staged operation. An original one is kept."""
+    project = get_project(project_id)
+    if project is None or not project.resume_operation:
+        return {}
+    try:
+        source = json.loads(project.resume_operation).get("source")
+    except (TypeError, ValueError, AttributeError):
+        return {"resume_operation": None}
+    return {"resume_operation": None} if source == "staged" else {}
 
 
 def _remember_operation(project_id: str, job_id: str | None, operation_id: str, phase: str, staged_source: bool) -> None:
