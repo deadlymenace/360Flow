@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from auth import Caller, require_caller
 from db import cancel_device_jobs, create_device, delete_device, delete_project, list_projects
 from services.pipeline import abort_local_jobs
-from services.world_gen import delete_unshared_worlds
+from services.world_gen import queue_unshared_world_deletes
 from storage import delete_project_assets
 
 router = APIRouter()
@@ -30,10 +30,10 @@ async def delete_all_my_data(caller: Caller = Depends(require_caller)) -> Respon
     so a paid provider call that returns later writes nothing. Then deletes every project owned by the calling device: uploaded photos,
     panoramas and staged images in storage, the project rows with their jobs,
     and so their share and preview links. Then the device token is revoked, so
-    it returns 401 from then on. Last, World Labs is asked to delete the
-    hosted worlds, best-effort: a failure is logged (and queued for retry by
-    delete_worlds) and never blocks the data deletion. A world that another
-    remaining project still references is kept and logged.
+    it returns 401 from then on. Last, the hosted World Labs worlds are queued
+    for deletion; World Labs is not called during the request. The background
+    retry pass deletes them. A world that another remaining project still
+    references is kept and logged, here and again before each delete.
     """
     if caller.device_id is None:
         raise HTTPException(status_code=400, detail="Admin key has no device to delete")
@@ -51,9 +51,9 @@ async def delete_all_my_data(caller: Caller = Depends(require_caller)) -> Respon
         raise HTTPException(status_code=404, detail="Device not found")
     try:
         # Rows are already gone, so any remaining reference is another project.
-        await delete_unshared_worlds(world_ids)
+        queue_unshared_world_deletes(world_ids, "queued by Delete all my data")
     except Exception:
-        logger.exception("World Labs delete failed for device %s; data was still deleted", caller.device_id)
+        logger.exception("Could not queue World Labs deletes for device %s; data was still deleted", caller.device_id)
     logger.info(
         "Deleted device %s, %d projects, cancelled %d jobs", caller.device_id, len(projects), len(cancelled)
     )

@@ -14,6 +14,7 @@ import httpx
 
 from config import get_settings
 from db import (
+    world_ids_in_use,
     due_draft_cleanups,
     forget_draft_cleanup,
     forget_world_delete,
@@ -537,18 +538,25 @@ async def _generate_models(
     return final
 
 
-async def delete_unshared_worlds(world_ids: list[str | None], exclude_project_ids=()) -> None:
-    """Delete worlds unless another remaining project still references them.
+def queue_unshared_world_deletes(world_ids: list[str | None], reason: str) -> int:
+    """Queue worlds for background deletion, skipping any still in use.
 
-    World Labs deletion cannot be undone, so a world that any other project
-    (including ownerless demo/share projects) still points at is kept.
+    Call after the deleted project rows are gone: any project that still
+    references a world (another device's, or an ownerless demo/share project)
+    keeps it. World Labs deletion cannot be undone. No World Labs call is made
+    here; ``retry_pending_world_deletes`` does the deletes and checks again.
     """
-    from db import world_ids_in_use
-
-    shared = world_ids_in_use(world_ids, exclude_project_ids)
+    ids = list(dict.fromkeys(valid_world_id(item) for item in world_ids if valid_world_id(item)))
+    if not ids or not get_settings().worldlabs_api_key:
+        # Same as delete_worlds: no key means mock worlds, nothing to delete.
+        return 0
+    shared = world_ids_in_use(ids)
     for world_id in sorted(shared):
         logger.warning("Keeping World Labs world %s: another project still references it", world_id)
-    await delete_worlds([item for item in world_ids if item and item not in shared])
+    queued = [item for item in ids if item not in shared]
+    if queued:
+        queue_world_deletes(queued, reason)
+    return len(queued)
 
 
 async def delete_worlds(world_ids: list[str | None]) -> None:
@@ -595,6 +603,11 @@ async def retry_pending_world_deletes(*, force: bool = False) -> int:
     timeout = httpx.Timeout(30.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for world_id in ids:
+            if world_ids_in_use([world_id]):
+                # A project points at this world again (or still); never delete it.
+                logger.warning("Not deleting World Labs world %s: a project still references it", world_id)
+                forget_world_delete(world_id)
+                continue
             ok, error = await _delete_one(client, headers, world_id)
             if ok:
                 forget_world_delete(world_id)

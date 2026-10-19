@@ -492,8 +492,14 @@ def _device_with_worlds(client, name: str):
     return auth, project_id, set(ids.values())
 
 
+def _retry_deletes():
+    from services.world_gen import retry_pending_world_deletes
+
+    return asyncio.run(retry_pending_world_deletes(force=True))
+
+
 @pytest.mark.parametrize("mode", ["ok", "http_error", "exception"])
-def test_delete_all_my_data_deletes_worlds_best_effort(client, monkeypatch, mode):
+def test_delete_all_my_data_queues_worlds_and_retry_deletes_them(client, monkeypatch, mode):
     monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
     monkeypatch.setattr("services.world_gen.httpx.AsyncClient", _FakeWorldLabs)
     _FakeWorldLabs.deleted = []
@@ -503,14 +509,20 @@ def test_delete_all_my_data_deletes_worlds_best_effort(client, monkeypatch, mode
     try:
         response = client.raw.delete("/api/v1/devices/me", headers=auth)
         assert response.status_code == 204
+        assert _FakeWorldLabs.deleted == []  # no World Labs call in the request
         assert db.get_project(project_id) is None
         assert client.raw.get("/api/v1/projects", headers=auth).status_code == 401
+        assert world_ids <= set(db.pending_world_delete_ids(force=True))
+        if mode == "exception":
+            with pytest.raises(httpx.ConnectError):
+                _retry_deletes()  # main.py's loop logs this and tries again later
+        else:
+            _retry_deletes()
         pending = set(db.pending_world_delete_ids(force=True))
         if mode == "ok":
             assert set(_FakeWorldLabs.deleted) == world_ids
             assert not (world_ids & pending)
-        elif mode == "http_error":
-            assert set(_FakeWorldLabs.deleted) == world_ids
+        else:
             assert world_ids <= pending
     finally:
         _FakeWorldLabs.explode = False
@@ -534,10 +546,13 @@ def test_shared_world_is_kept_until_the_last_project_is_deleted(client, monkeypa
     db.update_project(second, staged_world_id="shared-world")
 
     assert client.delete(f"/api/v1/projects/{first}").status_code == 204
+    assert _FakeWorldLabs.deleted == []
+    _retry_deletes()
     assert _FakeWorldLabs.deleted == ["only-a"]
     assert db.get_project(second).staged_world_id == "shared-world"
 
     assert client.delete(f"/api/v1/projects/{second}").status_code == 204
+    _retry_deletes()
     assert _FakeWorldLabs.deleted == ["only-a", "shared-world"]
 
 
@@ -551,6 +566,7 @@ def test_delete_all_my_data_keeps_worlds_used_by_other_and_demo_projects(client,
     try:
         assert client.raw.delete("/api/v1/devices/me", headers=auth).status_code == 204
         assert db.get_project(mine) is None
+        _retry_deletes()
         assert set(_FakeWorldLabs.deleted) == {"guarded-draft", "guarded-sfull"}
         assert db.get_project(demo.id).world_id == "guarded-full"
         assert db.get_by_share_token(demo.share_token) is not None
@@ -558,3 +574,34 @@ def test_delete_all_my_data_keeps_worlds_used_by_other_and_demo_projects(client,
     finally:
         db.delete_project(demo.id)
         db.delete_project(other)
+
+
+def test_world_shared_across_two_devices_is_kept_by_the_other(client, monkeypatch):
+    _use_fake_world_labs(monkeypatch)
+    auth_a, project_a, _ = _device_with_worlds(client, "deva")
+    token_b = client.raw.post("/api/v1/devices").json()["token"]
+    auth_b = {"Authorization": f"Bearer {token_b}"}
+    project_b = client.raw.post("/api/v1/projects", json={"name": "devb"}, headers=auth_b).json()["id"]
+    db.update_project(project_b, world_id="deva-full")
+    assert client.raw.delete("/api/v1/devices/me", headers=auth_a).status_code == 204
+    assert "deva-full" not in db.pending_world_delete_ids(force=True)
+    _retry_deletes()
+    assert "deva-full" not in _FakeWorldLabs.deleted
+    assert set(_FakeWorldLabs.deleted) == {"deva-draft", "deva-sfull", "deva-sdraft"}
+    assert db.get_project(project_b).world_id == "deva-full"
+    assert client.raw.delete("/api/v1/devices/me", headers=auth_b).status_code == 204
+    _retry_deletes()
+    assert "deva-full" in _FakeWorldLabs.deleted
+
+
+def test_retry_pass_rechecks_the_shared_world_guard(client, monkeypatch):
+    _use_fake_world_labs(monkeypatch)
+    db.queue_world_deletes(["revived-world"], "queued earlier")
+    keeper = client.post("/api/v1/projects", json={"name": "revived"}).json()["id"]
+    db.update_project(keeper, world_id="revived-world")
+    try:
+        _retry_deletes()
+        assert "revived-world" not in _FakeWorldLabs.deleted
+        assert "revived-world" not in db.pending_world_delete_ids(force=True)
+    finally:
+        db.delete_project(keeper)
