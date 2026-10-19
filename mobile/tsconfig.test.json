@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "outDir": ".test-build",
+    "rootDir": "src",
+    "skipLibCheck": true
+  },
+  "include": ["src/services/uploadPolicy.ts", "src/services/uploadPolicy.test.ts"]
+}

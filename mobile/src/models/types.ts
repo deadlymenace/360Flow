@@ -97,8 +97,15 @@ export interface CaptureSegment {
   capturedAt: Date | null;
 }
 
-/** Full Marble worlds have taken about 9 minutes. Keep polling at least this long. */
-export const WORLD_GENERATION_WAIT_MS = 15 * 60 * 1000;
+/** Single source of truth for wait-time copy. Drafts take ~30 s; full worlds 7–10 min. */
+export const DRAFT_ETA_S = 30;
+export const FULL_ETA_MIN = '7–10';
+/** Upper bound of FULL_ETA_MIN in minutes, used for "~N min left" estimates. */
+export const FULL_ETA_MAX_MIN = 10;
+/** Keep polling for the full world at least this long before saying it is slow. */
+export const WORLD_GENERATION_WAIT_MS = 12 * 60 * 1000;
+/** Stitching is quick. After this long with no panorama, offer Retry. */
+export const STITCH_SLOW_MS = 3 * 60 * 1000;
 
 export const SEGMENT_COUNT = 16;
 export const SEGMENT_ANGLE = 360 / SEGMENT_COUNT; // 22.5°
@@ -159,15 +166,15 @@ export function makeSegments(): CaptureSegment[] {
 
 export function getStatusLabel(status: ProjectStatus): string {
   switch (status) {
-    case 'created': return 'New';
+    case 'created': return 'Not captured yet';
     case 'uploading': return 'Uploading...';
     case 'stitching': return 'Stitching...';
-    case 'stitched': return 'Panorama Ready';
+    case 'stitched': return 'Panorama ready';
     case 'staging': return 'Staging...';
     case 'staged': return 'Staged';
-    case 'generating_3d': return 'Generating 3D...';
+    case 'generating_3d': return 'Building 3D…';
     case 'delayed': return '3D delayed';
-    case 'complete': return '3D Ready';
+    case 'complete': return '3D tour ready';
     case 'failed': return 'Failed';
   }
 }
@@ -183,4 +190,36 @@ export function getStatusColor(status: ProjectStatus): string {
     default:
       return '#FF9800';
   }
+}
+
+/**
+ * Live, human status for a Home row. Uses only fields the backend already returns.
+ */
+export function liveStatusLabel(project: Project): string {
+  const buildingWorld =
+    project.status === 'generating_3d' ||
+    project.active_job === 'world' ||
+    project.active_job === 'staged_world';
+  if (project.status === 'created') return 'Not captured yet · Tap to capture';
+  if (project.status === 'delayed') return '3D delayed, finishing shortly';
+  if (buildingWorld) {
+    if (project.world_preview_url && !project.world_marble_url) return '3D preview ready';
+    return `Full tour in ~${FULL_ETA_MIN} min`;
+  }
+  if (project.staging_status === 'staging') return 'Staging…';
+  return getStatusLabel(project.status);
+}
+
+export function relativeTime(iso: string, now: number = Date.now()): string {
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return '';
+  const s = Math.max(0, Math.round((now - then) / 1000));
+  if (s < 60) return 'just now';
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} min ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h} h ago`;
+  const d = Math.round(h / 24);
+  if (d < 7) return `${d} d ago`;
+  return new Date(iso).toLocaleDateString();
 }

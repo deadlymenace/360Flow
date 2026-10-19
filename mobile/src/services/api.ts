@@ -2,6 +2,7 @@ import { Directory, File, Paths } from 'expo-file-system';
 import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
 import { Project, StageStatus, StatusResponse, WorldStatus } from '../models/types';
+import { TimeoutError, UploadStage, classifyError, errorForStatus } from './uploadPolicy';
 
 const DEVICE_TOKEN_KEY = 'device_token';
 
@@ -61,26 +62,45 @@ const REQUEST_TIMEOUT = 10000;
 
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = REQUEST_TIMEOUT): Promise<Response> {
   const headers = await authHeaders(options.headers as Record<string, string> | undefined);
-  return Promise.race([
-    fetch(url, { ...options, headers }),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Request timed out — is the backend running?')), timeout)
-    ),
-  ]);
+  // Abort on timeout (not just stop waiting) so a slow upload cannot land after
+  // we have decided it failed. The status check in uploadPolicy covers the
+  // window where the server already had the full body.
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      fetch(url, { ...options, headers, signal: controller.signal }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new TimeoutError(__DEV__ ? 'Request timed out — is the backend running?' : 'Request timed out'));
+        }, timeout);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export interface UploadOptions {
   yaws?: number[];
   hfov?: number;
   lens?: string;
-  onProgress?: (progress: number) => void;
+  /** 'preparing' while copying photos locally, 'sending' once the POST starts. */
+  onStage?: (stage: 'preparing' | 'sending') => void;
 }
 
 class APIService {
-  private baseUrl: string;
+  private explicitBaseUrl?: string;
 
-  constructor(baseUrl: string = getBaseUrl()) {
-    this.baseUrl = baseUrl;
+  constructor(baseUrl?: string) {
+    this.explicitBaseUrl = baseUrl;
+  }
+
+  // Resolved lazily so a missing EXPO_PUBLIC_API_URL surfaces as a request
+  // error on screen instead of a crash at import time.
+  private get baseUrl(): string {
+    return this.explicitBaseUrl ?? getBaseUrl();
   }
 
   async createProject(name: string): Promise<Project> {
@@ -110,7 +130,14 @@ class APIService {
     if (!res.ok) throw new Error(`Delete project failed: ${res.status}`);
   }
 
+  /**
+   * Throws `UploadError`. `stage: 'prepare'` means nothing was sent to the
+   * server; `stage: 'send'` means the POST may have reached it. See
+   * `uploadPolicy.ts` for why that distinction matters for billing.
+   */
   async uploadImages(projectId: string, imageUris: string[], options: UploadOptions = {}): Promise<void> {
+    let stage: UploadStage = 'prepare';
+    options.onStage?.('preparing');
     const formData = new FormData();
     formData.append(
       'metadata',
@@ -129,28 +156,36 @@ class APIService {
       Paths.cache,
       `upload-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
     );
-    uploadDir.create();
     try {
+      uploadDir.create();
+      // Register the device before the POST so a token failure is a clean 'prepare' error.
+      await deviceToken();
       for (let i = 0; i < imageUris.length; i++) {
         const filename = `segment_${i.toString().padStart(2, '0')}.jpg`;
         const named = new File(uploadDir, filename);
         await new File(imageUris[i]).copy(named, { overwrite: true });
         formData.append('images', named, filename);
-        options.onProgress?.((i + 1) / imageUris.length * 0.5);
       }
 
+      stage = 'send';
+      options.onStage?.('sending');
       const res = await fetchWithTimeout(
         `${this.baseUrl}/projects/${projectId}/upload`,
         { method: 'POST', body: formData },
         120000
       );
-      options.onProgress?.(1);
       if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Upload failed: ${res.status} - ${text}`);
+        if (__DEV__) console.warn('Upload failed', res.status, await res.text().catch(() => ''));
+        throw errorForStatus(res.status, 'send');
       }
+    } catch (e) {
+      throw classifyError(e, stage);
     } finally {
-      if (uploadDir.exists) uploadDir.delete();
+      try {
+        if (uploadDir.exists) uploadDir.delete();
+      } catch {
+        // Cache cleanup is best effort.
+      }
     }
   }
 

@@ -9,6 +9,7 @@ import ProcessingScreen from './screens/ProcessingScreen';
 import PanoramaScreen from './screens/PanoramaScreen';
 import PrivacyConsentScreen from './screens/PrivacyConsentScreen';
 import WorldScreen from './screens/WorldScreen';
+import CaptureCoachScreen from './screens/CaptureCoachScreen';
 
 export type ViewerMode = 'original' | 'staged' | 'compare';
 
@@ -20,7 +21,16 @@ export type ReviewSegment = {
 
 export type RootStackParamList = {
   Home: undefined;
-  Capture: { projectId: string; projectName: string };
+  Capture: {
+    projectId: string;
+    projectName: string;
+    /** Set by Review: clear this segment and aim at it again. */
+    retakeIndex?: number;
+    /** Changes on every retake request so the same index can be retaken twice. */
+    retakeNonce?: number;
+  };
+  /** First-run coach. `next` opens Capture after; without it the coach just closes (Tips). */
+  CaptureCoach: { next?: { projectId: string; projectName: string } } | undefined;
   Review: {
     projectId: string;
     projectName: string;
@@ -63,6 +73,7 @@ export default function Navigation() {
       >
         <Stack.Screen name="Home" component={HomeScreen} />
         <Stack.Screen name="Capture" component={CaptureScreen} />
+        <Stack.Screen name="CaptureCoach" component={CaptureCoachScreen} options={{ presentation: 'modal' }} />
         <Stack.Screen name="Review" component={ReviewScreen} />
         <Stack.Screen name="Processing" component={ProcessingScreen} />
         <Stack.Screen name="PrivacyConsent" component={PrivacyConsentScreen} />

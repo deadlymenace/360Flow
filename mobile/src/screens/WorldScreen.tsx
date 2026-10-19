@@ -1,16 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
-import { WebView } from 'react-native-webview';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import WebViewFrame from '../components/WebViewFrame';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
 import { api } from '../services/api';
-import { DISCLOSURE_TEXT, Project, WORLD_GENERATION_WAIT_MS } from '../models/types';
+import { DISCLOSURE_TEXT, FULL_ETA_MIN, Project, WORLD_GENERATION_WAIT_MS } from '../models/types';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'World'>;
 
 export default function WorldScreen({ navigation, route }: Props) {
   const { projectId, projectName, source = 'original' } = route.params;
   const staged = source === 'staged';
+  const insets = useSafeAreaInsets();
   const [project, setProject] = useState<Project | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [waitedLong, setWaitedLong] = useState(false);
@@ -28,7 +30,7 @@ export default function WorldScreen({ navigation, route }: Props) {
           setError(null);
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Could not load the world');
+        if (!cancelled) setError(__DEV__ && err instanceof Error ? err.message : "Couldn't reach 360Flow. Retrying…");
       }
     };
     load();
@@ -55,8 +57,14 @@ export default function WorldScreen({ navigation, route }: Props) {
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()}>
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+        <TouchableOpacity
+          onPress={() => navigation.goBack()}
+          style={styles.hit}
+          hitSlop={12}
+          accessibilityRole="button"
+          accessibilityLabel="Back to panorama"
+        >
           <Text style={styles.back}>← Panorama</Text>
         </TouchableOpacity>
         <Text style={styles.title} numberOfLines={1}>{projectName}</Text>
@@ -66,6 +74,15 @@ export default function WorldScreen({ navigation, route }: Props) {
         {!project && !error && (
           <View style={styles.centered}>
             <ActivityIndicator size="large" color="#6C63FF" />
+          </View>
+        )}
+        {project && !viewerUrl && !delayed && !error && (
+          <View style={styles.centered}>
+            <ActivityIndicator size="large" color="#6C63FF" />
+            <Text style={styles.waiting}>
+              Building your 3D tour. A preview usually appears in under a minute; the full walkthrough takes{' '}
+              {FULL_ETA_MIN} min.
+            </Text>
           </View>
         )}
         {delayed && !viewerUrl && (
@@ -81,7 +98,7 @@ export default function WorldScreen({ navigation, route }: Props) {
             <Text style={styles.error}>{error}</Text>
           </View>
         )}
-        {viewerUrl && <WebView key={viewerUrl} source={{ uri: viewerUrl }} style={styles.web} />}
+        {viewerUrl && <WebViewFrame uri={viewerUrl} style={styles.web} label="the 3D tour" />}
         {delayed && viewerUrl && (
           <View style={styles.draft} pointerEvents="none">
             <Text style={styles.draftText}>
@@ -92,13 +109,13 @@ export default function WorldScreen({ navigation, route }: Props) {
         {showingDraft && stillGenerating && !delayed && (
           <View style={styles.draft} pointerEvents="none">
             <Text style={styles.draftText}>
-              Draft walkthrough. The full 3D world is still generating and can take about 15 minutes.
+              3D preview. The full walkthrough is still building ({FULL_ETA_MIN} min). You can leave; we'll keep working.
             </Text>
           </View>
         )}
         {waitedLong && stillGenerating && !fullUrl && !showingDraft && (
           <View style={styles.draft} pointerEvents="none">
-            <Text style={styles.draftText}>Still generating the full walkthrough.</Text>
+            <Text style={styles.draftText}>Taking longer than usual. Still building the full walkthrough.</Text>
           </View>
         )}
         {staged && (
@@ -114,15 +131,15 @@ export default function WorldScreen({ navigation, route }: Props) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0e0e18' },
   header: {
-    paddingTop: 56,
     paddingHorizontal: 16,
-    paddingBottom: 10,
+    paddingBottom: 6,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     backgroundColor: '#1a1a2e',
   },
-  back: { color: '#6C63FF', fontWeight: '600', width: 90 },
+  back: { color: '#8F88FF', fontWeight: '600', fontSize: 16 },
+  hit: { minHeight: 44, width: 90, justifyContent: 'center' },
   title: { color: '#fff', fontWeight: '700', flex: 1, textAlign: 'center' },
   viewer: { flex: 1 },
   web: { flex: 1, backgroundColor: '#000' },

@@ -5,22 +5,27 @@ import {
   TouchableOpacity,
   StyleSheet,
   AccessibilityInfo,
+  Alert,
+  Linking,
   useWindowDimensions,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { DeviceMotion, DeviceMotionMeasurement } from 'expo-sensors';
-import Svg, { Circle } from 'react-native-svg';
+import Svg, { Circle, Line } from 'react-native-svg';
 import { useIsFocused } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
 import {
   CaptureSegment,
+  SEGMENT_ANGLE,
   SEGMENT_COUNT,
   ULTRA_WIDE_PORTRAIT_HFOV,
   WIDE_PORTRAIT_HFOV,
   makeSegments,
 } from '../models/types';
 import { HapticFeedback } from '../utils/haptics';
+import { api } from '../services/api';
 import CaptureMiniMap from '../components/CaptureMiniMap';
 import {
   AIM_HOLD_MS,
@@ -60,15 +65,31 @@ type Frame = {
   aim: number;
   headingDeg: number;
   tilted: boolean;
+  /** Aimed at an open dot but turning faster than STEADY_MAX_DEG_PER_SEC. */
+  fast: boolean;
+  /** Elevation of the camera look vector, degrees (+ up). */
+  elevationDeg: number;
+  /** Roll of the phone around the look axis, degrees. */
+  rollDeg: number;
   edge: { x: number; y: number; angle: number } | null;
 };
 
 const RETICLE = 88;
 const RING_R = 34;
 const RING = 2 * Math.PI * RING_R;
+/** Same threshold auto-capture uses; the manual shutter now honours it too. */
+const TILT_LIMIT_DEG = 18;
+/** Horizon cue turns green inside this band. Tune on device. */
+const LEVEL_OK_DEG = 5;
+const SENSOR_WATCHDOG_MS = 1500;
+const AUTO_REVIEW_MS = 600;
+const FAILURES_BEFORE_RESTART_HINT = 3;
+
+type MotionState = 'checking' | 'ok' | 'unavailable' | 'denied' | 'stalled';
 
 export default function CaptureScreen({ navigation, route }: Props) {
-  const { projectId, projectName } = route.params;
+  const { projectId, projectName, retakeIndex, retakeNonce } = route.params;
+  const insets = useSafeAreaInsets();
   const focused = useIsFocused();
   const { width, height } = useWindowDimensions();
   const [permission, requestPermission] = useCameraPermissions();
@@ -79,6 +100,19 @@ export default function CaptureScreen({ navigation, route }: Props) {
   const [locked, setLocked] = useState(false);
   const [reduceMotion, setReduceMotion] = useState(false);
   const [frame, setFrame] = useState<Frame | null>(null);
+  const [motion, setMotion] = useState<MotionState>('checking');
+  /** Person chose to continue without motion sensors: manual shutter with fixed yaws. */
+  const [manualOnly, setManualOnly] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [lastShot, setLastShot] = useState<number | null>(null);
+  const [showTurnHint, setShowTurnHint] = useState(false);
+  const [completeFlash, setCompleteFlash] = useState(false);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const failuresRef = useRef(0);
+  const manualOnlyRef = useRef(false);
+  const wasFillingRef = useRef(false);
+  const completedRef = useRef(false);
+  const leavingRef = useRef(false);
   const cameraRef = useRef<CameraView>(null);
   const segmentsRef = useRef(segments);
   const originRef = useRef<number | null>(null);
@@ -95,6 +129,95 @@ export default function CaptureScreen({ navigation, route }: Props) {
   useEffect(() => {
     segmentsRef.current = segments;
   }, [segments]);
+  useEffect(() => {
+    manualOnlyRef.current = manualOnly;
+  }, [manualOnly]);
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
+
+  const showToast = useCallback((message: string, ms = 2600) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast(message);
+    AccessibilityInfo.announceForAccessibility(message);
+    toastTimer.current = setTimeout(() => setToast(null), ms);
+  }, []);
+
+  // P0-1: check motion availability and permission before relying on it.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const available = await DeviceMotion.isAvailableAsync();
+        if (cancelled) return;
+        if (!available) {
+          setMotion('unavailable');
+          return;
+        }
+        let perm = await DeviceMotion.getPermissionsAsync();
+        if (!perm.granted && perm.canAskAgain) perm = await DeviceMotion.requestPermissionsAsync();
+        if (cancelled) return;
+        setMotion(perm.granted ? 'ok' : 'denied');
+      } catch {
+        if (!cancelled) setMotion('unavailable');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // P0-2: confirm before a back gesture or button throws photos away.
+  useEffect(() => {
+    const unsub = navigation.addListener('beforeRemove', (e) => {
+      const count = segmentsRef.current.filter((seg) => seg.imageUri !== null).length;
+      const type = e.data.action.type;
+      const userBack = type === 'GO_BACK' || type === 'POP';
+      if (count === 0 || !userBack || leavingRef.current) return;
+      e.preventDefault();
+      Alert.alert(
+        `Discard ${count} photo${count === 1 ? '' : 's'}?`,
+        'Your photos for this room are only on this screen. Leaving now throws them away.',
+        [
+          { text: 'Keep capturing', style: 'cancel' },
+          {
+            text: 'Discard photos',
+            style: 'destructive',
+            onPress: () => {
+              leavingRef.current = true;
+              navigation.dispatch(e.data.action);
+            },
+          },
+          {
+            // P0-11: don't leave a ghost "0 photos" room behind.
+            text: 'Discard and delete room',
+            style: 'destructive',
+            onPress: () => {
+              leavingRef.current = true;
+              api.deleteProject(projectId).catch(() => {
+                // The row stays as "Not captured yet" and can be deleted from Home.
+              });
+              navigation.dispatch(e.data.action);
+            },
+          },
+        ],
+      );
+    });
+    return unsub;
+  }, [navigation, projectId]);
+
+  // P0-3: Review asked to retake a photo. Clear it and point at its dot.
+  useEffect(() => {
+    if (retakeIndex == null || retakeIndex < 0 || retakeIndex >= SEGMENT_COUNT) return;
+    completedRef.current = false;
+    setCompleteFlash(false);
+    setSegments((prev) => {
+      const updated = [...prev];
+      updated[retakeIndex] = { ...updated[retakeIndex], imageUri: null, actualYaw: null, capturedAt: null };
+      return updated;
+    });
+    showToast(`Aim at dot ${retakeIndex + 1} to retake it`);
+  }, [retakeIndex, retakeNonce, showToast]);
   useEffect(() => {
     hfovRef.current = hfov;
   }, [hfov]);
@@ -125,19 +248,26 @@ export default function CaptureScreen({ navigation, route }: Props) {
     if (captureLock.current || !cameraRef.current) return;
     if (index < 0 || index >= SEGMENT_COUNT) return;
     const pose = poseRef.current;
-    if (!pose) return;
+    // Without motion data only the manual fallback may shoot, using fixed yaws.
+    if (!pose && !manualOnlyRef.current) return;
     captureLock.current = true;
     aimMsRef.current = 0;
     setCapturing(true);
-    const headingAtShutter = pose.headingDeg;
+    const headingAtShutter = pose ? pose.headingDeg : null;
     try {
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.8,
         skipProcessing: false,
       });
-      if (!photo?.uri) return;
-      if (originRef.current == null) originRef.current = headingAtShutter;
-      const actualYaw = wrap360(headingAtShutter - originRef.current);
+      if (!photo?.uri) throw new Error('No photo returned');
+      let actualYaw: number;
+      if (headingAtShutter == null) {
+        actualYaw = index * SEGMENT_ANGLE;
+      } else {
+        if (originRef.current == null) originRef.current = headingAtShutter;
+        actualYaw = wrap360(headingAtShutter - originRef.current);
+      }
+      const firstShot = !segmentsRef.current.some((seg) => seg.imageUri !== null);
       setLocked(true);
       setSegments((prev) => {
         const updated = [...prev];
@@ -150,22 +280,38 @@ export default function CaptureScreen({ navigation, route }: Props) {
         return updated;
       });
       HapticFeedback.capture();
+      failuresRef.current = 0;
+      setLastShot(index);
+      if (firstShot) setShowTurnHint(true);
+      const done = segmentsRef.current.filter((seg) => seg.imageUri !== null).length + 1;
+      AccessibilityInfo.announceForAccessibility(`Photo ${Math.min(done, SEGMENT_COUNT)} of ${SEGMENT_COUNT}`);
     } catch (e) {
-      console.warn('Capture error:', e);
+      if (__DEV__) console.warn('Capture error:', e);
+      HapticFeedback.error();
+      failuresRef.current += 1;
+      if (failuresRef.current >= FAILURES_BEFORE_RESTART_HINT) {
+        showToast("Photos keep failing. Go back and open the capture again to restart the camera.", 4000);
+      } else {
+        showToast("Photo didn't save, hold steady and try again");
+      }
     } finally {
       captureLock.current = false;
       setCapturing(false);
     }
-  }, []);
+  }, [showToast]);
 
   const captureRef = useRef(captureAt);
   captureRef.current = captureAt;
 
   useEffect(() => {
-    if (!permission?.granted) return;
+    if (!permission?.granted || (motion !== 'ok' && motion !== 'stalled')) return;
     DeviceMotion.setUpdateInterval(33);
+    const watchdog = setTimeout(() => {
+      if (!poseRef.current) setMotion('stalled');
+    }, SENSOR_WATCHDOG_MS);
     const sub = DeviceMotion.addListener((data: DeviceMotionMeasurement) => {
       if (!data.rotation) return;
+      if (!poseRef.current) setMotion((m) => (m === 'stalled' ? 'ok' : m));
       const yawRad = data.rotation.alpha;
       const pitchRad = data.rotation.beta;
       const rollRad = data.rotation.gamma;
@@ -227,13 +373,18 @@ export default function CaptureScreen({ navigation, route }: Props) {
         }
       }
       const elevation = Math.asin(Math.min(1, Math.max(-1, pose.basis.look.z))) * (180 / Math.PI);
-      const tilted = Math.abs(elevation) > 18;
+      const tilted = Math.abs(elevation) > TILT_LIMIT_DEG;
+      // Roll: how far the phone's horizontal axis dips out of the horizon.
+      const rollDeg = Math.asin(Math.min(1, Math.max(-1, pose.basis.right.z))) * (180 / Math.PI);
       const open = suggested >= 0 && !captured[suggested];
       const aimed = open && alignDeg <= AIM_TOLERANCE_DEG && !tilted;
       const steady = pose.rate <= STEADY_MAX_DEG_PER_SEC;
       if (aimed && steady && !captureLock.current) aimMsRef.current += dt;
       else aimMsRef.current = 0;
       const aim = Math.min(1, aimMsRef.current / AIM_HOLD_MS);
+      const filling = aim > 0;
+      if (filling && !wasFillingRef.current) void HapticFeedback.light();
+      wasFillingRef.current = filling;
       if (aim >= 1 && open) {
         aimMsRef.current = 0;
         void captureRef.current(suggested);
@@ -260,6 +411,9 @@ export default function CaptureScreen({ navigation, route }: Props) {
         aim: reduceRef.current ? (aim > 0 ? 1 : 0) : aim,
         headingDeg,
         tilted,
+        fast: aimed && !steady,
+        elevationDeg: elevation,
+        rollDeg,
         edge,
       };
       frameRef.current = nextFrame;
@@ -267,17 +421,30 @@ export default function CaptureScreen({ navigation, route }: Props) {
     };
     raf = requestAnimationFrame(tick);
     return () => {
+      clearTimeout(watchdog);
       cancelAnimationFrame(raf);
       sub.remove();
     };
-  }, [permission?.granted]);
+  }, [permission?.granted, motion === 'ok' || motion === 'stalled']);
 
   const handleManual = useCallback(() => {
+    if (manualOnlyRef.current && !poseRef.current) {
+      // Sensor-free fallback: shoot the next open slot at its nominal yaw.
+      const next = segmentsRef.current.findIndex((seg) => seg.imageUri === null);
+      if (next >= 0) void captureRef.current(next);
+      return;
+    }
+    const current = frameRef.current;
+    // Same tilt rule as auto-capture: a tilted shot breaks the stitch.
+    if (current?.tilted) {
+      HapticFeedback.error();
+      showToast(`Level the phone first. It's tilted more than ${TILT_LIMIT_DEG}°.`);
+      return;
+    }
     if (originRef.current == null) {
       void captureRef.current(0);
       return;
     }
-    const current = frameRef.current;
     if (!current) return;
     let openDot: TargetProjection | null = null;
     let filledDot: TargetProjection | null = null;
@@ -294,8 +461,60 @@ export default function CaptureScreen({ navigation, route }: Props) {
     }
     if (filledDot && filledDot.angleDeg <= AIM_TOLERANCE_DEG) {
       void captureRef.current(filledDot.index);
+      return;
     }
-  }, []);
+    showToast(openDot ? 'Turn to the highlighted dot first' : 'Aim at a dot');
+  }, [showToast]);
+
+  const handleRetakeLast = useCallback(() => {
+    if (lastShot == null) return;
+    completedRef.current = false;
+    setCompleteFlash(false);
+    setSegments((prev) => {
+      const updated = [...prev];
+      updated[lastShot] = { ...updated[lastShot], imageUri: null, actualYaw: null, capturedAt: null };
+      return updated;
+    });
+    showToast(`Photo ${lastShot + 1} removed. Aim at its dot again.`);
+    setLastShot(null);
+  }, [lastShot, showToast]);
+
+  const goToReview = useCallback(() => {
+    navigation.navigate('Review', {
+      projectId,
+      projectName,
+      hfov: hfovRef.current,
+      lens: selectedLens,
+      segments: segmentsRef.current.map((segment) => ({
+        id: segment.id,
+        imageUri: segment.imageUri,
+        actualYaw: segment.actualYaw,
+      })),
+    });
+  }, [navigation, projectId, projectName, selectedLens]);
+  const goToReviewRef = useRef(goToReview);
+  goToReviewRef.current = goToReview;
+
+  const capturedTotal = segments.filter((segment) => segment.imageUri !== null).length;
+
+  // P0-5: celebrate and move on automatically at 16/16.
+  useEffect(() => {
+    if (capturedTotal !== SEGMENT_COUNT || completedRef.current) return;
+    completedRef.current = true;
+    HapticFeedback.success();
+    setCompleteFlash(true);
+    AccessibilityInfo.announceForAccessibility('All 16 photos captured. Opening review.');
+    const timer = setTimeout(() => {
+      if (focusedRef.current) goToReviewRef.current();
+    }, AUTO_REVIEW_MS);
+    return () => clearTimeout(timer);
+  }, [capturedTotal]);
+
+  useEffect(() => {
+    if (!showTurnHint) return;
+    const timer = setTimeout(() => setShowTurnHint(false), 3500);
+    return () => clearTimeout(timer);
+  }, [showTurnHint]);
 
   const handleLenses = useCallback((event: { lenses: string[] }) => {
     const available = event.lenses ?? [];
@@ -329,18 +548,59 @@ export default function CaptureScreen({ navigation, route }: Props) {
         <Text style={styles.permissionSubtext}>
           360Flow needs your camera to capture room photos
         </Text>
-        <TouchableOpacity style={styles.grantButton} onPress={requestPermission}>
-          <Text style={styles.grantButtonText}>Grant Permission</Text>
+        <TouchableOpacity
+          style={styles.grantButton}
+          onPress={permission.canAskAgain ? requestPermission : () => Linking.openSettings()}
+          accessibilityRole="button"
+        >
+          <Text style={styles.grantButtonText}>{permission.canAskAgain ? 'Allow camera' : 'Open Settings'}</Text>
         </TouchableOpacity>
+        <BackLink onPress={() => navigation.goBack()} />
       </View>
     );
   }
 
-  const capturedCount = segments.filter((segment) => segment.imageUri !== null).length;
+  if ((motion === 'unavailable' || motion === 'denied') && !manualOnly) {
+    return (
+      <View style={styles.centered}>
+        <Text style={styles.permissionText} accessibilityRole="header">
+          {motion === 'denied' ? 'Motion access is off' : 'Motion sensors unavailable'}
+        </Text>
+        <Text style={styles.permissionSubtext}>
+          360Flow uses motion to place the dots and shoot automatically.
+          {motion === 'denied' ? ' Turn on Motion & Fitness for 360Flow in Settings.' : ''}
+        </Text>
+        {motion === 'denied' ? (
+          <TouchableOpacity style={styles.grantButton} onPress={() => Linking.openSettings()} accessibilityRole="button">
+            <Text style={styles.grantButtonText}>Open Settings</Text>
+          </TouchableOpacity>
+        ) : null}
+        <TouchableOpacity
+          style={styles.secondaryButton}
+          onPress={() => setManualOnly(true)}
+          accessibilityRole="button"
+          accessibilityHint="Take 16 photos with the shutter, turning about one sixteenth of a circle each time"
+        >
+          <Text style={styles.secondaryButtonText}>Continue with manual shutter</Text>
+        </TouchableOpacity>
+        <BackLink onPress={() => navigation.goBack()} />
+      </View>
+    );
+  }
+
+  const capturedCount = capturedTotal;
   const isComplete = capturedCount === SEGMENT_COUNT;
   const progressPct = (capturedCount / SEGMENT_COUNT) * 100;
   const capturedFlags = frame?.captured ?? segments.map((segment) => segment.imageUri !== null);
-  const hint = hintText(isComplete, locked, frame, capturing);
+  const sensorless = manualOnly && !poseRef.current;
+  const hint = sensorless
+    ? `Turn a little right after each photo, then tap the shutter (${capturedCount}/${SEGMENT_COUNT})`
+    : hintText(isComplete, locked, frame, capturing, showTurnHint);
+  const ringColor = completeFlash ? '#4CAF50' : frame?.fast ? '#FFB300' : '#7CFFB2';
+  const levelOk =
+    frame != null && Math.abs(frame.rollDeg) <= LEVEL_OK_DEG && Math.abs(frame.elevationDeg) <= LEVEL_OK_DEG;
+  const horizonColor = levelOk ? '#4CAF50' : frame?.tilted ? '#FFD54F' : 'rgba(255,255,255,0.8)';
+  const bubbleY = frame ? Math.max(-26, Math.min(26, -frame.elevationDeg * 1.4)) : 0;
 
   return (
     <View style={styles.container}>
@@ -354,27 +614,67 @@ export default function CaptureScreen({ navigation, route }: Props) {
 
       <View style={styles.overlay} pointerEvents="box-none">
         <View>
-          <View style={styles.topBar}>
-            <TouchableOpacity onPress={() => navigation.goBack()}>
+          <View style={[styles.topBar, { paddingTop: insets.top + 8 }]}>
+            <TouchableOpacity
+              onPress={() => navigation.goBack()}
+              style={styles.hit}
+              hitSlop={12}
+              accessibilityRole="button"
+              accessibilityLabel="Back"
+            >
               <Text style={styles.backText}>← Back</Text>
             </TouchableOpacity>
-            <Text style={styles.roomName}>{projectName}</Text>
-            <Text style={styles.countText}>
-              {capturedCount}/{SEGMENT_COUNT}
-            </Text>
+            <Text style={styles.roomName} numberOfLines={1} maxFontSizeMultiplier={1.4}>{projectName}</Text>
+            <View style={styles.topRight}>
+              <Text
+                style={styles.countText}
+                maxFontSizeMultiplier={1.4}
+                accessibilityLabel={`${capturedCount} of ${SEGMENT_COUNT} photos`}
+              >
+                {capturedCount}/{SEGMENT_COUNT}
+              </Text>
+              <TouchableOpacity
+                onPress={() => navigation.navigate('CaptureCoach')}
+                style={styles.tipsButton}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="Capture tips"
+              >
+                <Text style={styles.tipsText}>?</Text>
+              </TouchableOpacity>
+            </View>
           </View>
           <View style={styles.progressTrack}>
             <View style={[styles.progressFill, { width: `${progressPct}%` }]} />
           </View>
-          <Text style={styles.lensText}>
-            {selectedLens ? `${selectedLens} · ${hfov}°` : `Ultra-wide · ${hfov}°`}
-          </Text>
+          {__DEV__ ? (
+            <Text style={styles.lensText}>
+              {selectedLens ? `${selectedLens} · ${hfov}°` : `Ultra-wide · ${hfov}°`}
+            </Text>
+          ) : null}
+          {motion === 'stalled' ? (
+            <View style={styles.banner} accessibilityRole="alert">
+              <Text style={styles.bannerText}>Sensors not responding. Auto-capture is off.</Text>
+              {!manualOnly ? (
+                <TouchableOpacity onPress={() => setManualOnly(true)} style={styles.hit} accessibilityRole="button">
+                  <Text style={styles.bannerAction}>Use manual shutter</Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          ) : null}
           {frame?.tilted ? (
-            <Text style={styles.tiltWarning}>Hold the phone upright — tilt is too high</Text>
+            <Text style={styles.tiltWarning} maxFontSizeMultiplier={1.4} accessibilityRole="alert">
+              Hold the phone upright — tilt is too high
+            </Text>
           ) : null}
         </View>
 
-        <View style={StyleSheet.absoluteFill} pointerEvents="none">
+        <View
+          style={StyleSheet.absoluteFill}
+          pointerEvents="none"
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+        >
           {frame?.dots.map((dot) => {
             if (!dot.inView) return null;
             const done = capturedFlags[dot.index];
@@ -400,12 +700,28 @@ export default function CaptureScreen({ navigation, route }: Props) {
           >
             <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={8} stroke="#fff" strokeWidth={2} fill="none" />
             <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={2} fill="#fff" />
-            {frame && frame.aim > 0 && !reduceMotion ? (
+            {frame && !sensorless ? (
+              <Line
+                x1={RETICLE / 2 - 22}
+                y1={RETICLE / 2 + bubbleY}
+                x2={RETICLE / 2 + 22}
+                y2={RETICLE / 2 + bubbleY}
+                stroke={horizonColor}
+                strokeWidth={2}
+                strokeLinecap="round"
+                transform={`rotate(${-frame.rollDeg} ${RETICLE / 2} ${RETICLE / 2})`}
+              />
+            ) : null}
+            {completeFlash ? (
+              <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={RING_R} stroke={ringColor} strokeWidth={5} fill="none" />
+            ) : frame && frame.fast ? (
+              <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={RING_R} stroke={ringColor} strokeWidth={4} fill="none" />
+            ) : frame && frame.aim > 0 && !reduceMotion ? (
               <Circle
                 cx={RETICLE / 2}
                 cy={RETICLE / 2}
                 r={RING_R}
-                stroke="#7CFFB2"
+                stroke={ringColor}
                 strokeWidth={4}
                 fill="none"
                 strokeDasharray={`${RING} ${RING}`}
@@ -422,53 +738,82 @@ export default function CaptureScreen({ navigation, route }: Props) {
           ) : null}
         </View>
 
-        <View style={styles.bottomBar} pointerEvents="box-none">
-          <CaptureMiniMap
-            captured={capturedFlags}
-            headingDeg={frame?.headingDeg ?? 0}
-            suggested={frame?.suggested ?? 0}
-          />
-          {isComplete ? (
-            <TouchableOpacity
-              style={styles.reviewButton}
-              onPress={() =>
-                navigation.navigate('Review', {
-                  projectId,
-                  projectName,
-                  hfov,
-                  lens: selectedLens,
-                  segments: segments.map((segment) => ({
-                    id: segment.id,
-                    imageUri: segment.imageUri,
-                    actualYaw: segment.actualYaw,
-                  })),
-                })
-              }
-            >
-              <Text style={styles.reviewButtonText}>Review Photos →</Text>
-            </TouchableOpacity>
-          ) : (
-            <TouchableOpacity
-              style={[styles.captureButton, capturing && styles.captureButtonCapturing]}
-              onPress={handleManual}
-              disabled={capturing}
-              activeOpacity={0.7}
-            >
-              <View style={[styles.captureButtonInner, capturing && styles.captureButtonInnerCapturing]} />
-            </TouchableOpacity>
-          )}
-          <Text style={styles.hintText}>{hint}</Text>
+        {toast ? (
+          <View style={styles.toast} pointerEvents="none" accessibilityLiveRegion="polite">
+            <Text style={styles.toastText} maxFontSizeMultiplier={1.4}>{toast}</Text>
+          </View>
+        ) : null}
+
+        <View style={[styles.bottomBar, { paddingBottom: insets.bottom + 20 }]} pointerEvents="box-none">
+          <View accessible accessibilityLabel={`Map: ${capturedCount} of ${SEGMENT_COUNT} photos done`}>
+            <CaptureMiniMap
+              captured={capturedFlags}
+              headingDeg={frame?.headingDeg ?? 0}
+              suggested={frame?.suggested ?? 0}
+            />
+          </View>
+          <View style={styles.shutterRow}>
+            <View style={styles.sideSlot}>
+              {lastShot != null && !isComplete ? (
+                <TouchableOpacity
+                  style={styles.sideButton}
+                  onPress={handleRetakeLast}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Retake last photo, number ${lastShot + 1}`}
+                >
+                  <Text style={styles.sideButtonText}>↺ Retake last</Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+            {isComplete ? (
+              <TouchableOpacity style={styles.reviewButton} onPress={goToReview} accessibilityRole="button">
+                <Text style={styles.reviewButtonText}>Check photos →</Text>
+              </TouchableOpacity>
+            ) : (
+              <TouchableOpacity
+                style={[styles.captureButton, capturing && styles.captureButtonCapturing]}
+                onPress={handleManual}
+                disabled={capturing}
+                activeOpacity={0.7}
+                accessibilityRole="button"
+                accessibilityLabel={`Take photo manually, ${capturedCount} of ${SEGMENT_COUNT} done`}
+                accessibilityState={{ disabled: capturing, busy: capturing }}
+              >
+                <View style={[styles.captureButtonInner, capturing && styles.captureButtonInnerCapturing]} />
+              </TouchableOpacity>
+            )}
+            <View style={styles.sideSlot} />
+          </View>
+          <Text style={styles.hintText} maxFontSizeMultiplier={1.4} accessibilityLiveRegion="polite">
+            {hint}
+          </Text>
         </View>
       </View>
     </View>
   );
 }
 
-function hintText(complete: boolean, locked: boolean, frame: Frame | null, capturing: boolean): string {
-  if (complete) return 'All segments captured!';
+function BackLink({ onPress }: { onPress: () => void }) {
+  return (
+    <TouchableOpacity onPress={onPress} style={[styles.hit, { marginTop: 16 }]} accessibilityRole="button">
+      <Text style={styles.backLinkText}>Back</Text>
+    </TouchableOpacity>
+  );
+}
+
+function hintText(
+  complete: boolean,
+  locked: boolean,
+  frame: Frame | null,
+  capturing: boolean,
+  turnHint: boolean,
+): string {
+  if (complete) return 'All 16 photos captured!';
   if (capturing) return 'Capturing…';
-  if (!locked) return 'Hold steady to capture your starting view';
   if (frame?.tilted) return 'Level the phone, then aim at a dot';
+  if (frame?.fast) return 'Slow down, hold still';
+  if (!locked) return 'Face the most interesting wall, then hold still';
+  if (turnHint) return 'Turn right ➜';
   if (frame && frame.suggested >= 0 && frame.alignDeg <= AIM_TOLERANCE_DEG) {
     return frame.aim > 0 ? 'Hold steady' : 'Tap to capture, or hold steady';
   }
@@ -520,10 +865,86 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingTop: 60,
-    paddingHorizontal: 20,
-    paddingBottom: 12,
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    gap: 8,
   },
+  hit: {
+    minHeight: 44,
+    minWidth: 44,
+    justifyContent: 'center',
+  },
+  topRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  tipsButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tipsText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    width: 28,
+    height: 28,
+    lineHeight: 26,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.8)',
+    textAlign: 'center',
+    overflow: 'hidden',
+  },
+  banner: {
+    marginHorizontal: 16,
+    marginTop: 8,
+    padding: 10,
+    borderRadius: 10,
+    backgroundColor: 'rgba(244,67,54,0.85)',
+    alignItems: 'center',
+  },
+  bannerText: { color: '#fff', fontWeight: '700', textAlign: 'center' },
+  bannerAction: { color: '#fff', fontWeight: '700', textDecorationLine: 'underline' },
+  toast: {
+    position: 'absolute',
+    left: 24,
+    right: 24,
+    top: '58%',
+    backgroundColor: 'rgba(0,0,0,0.78)',
+    borderRadius: 12,
+    padding: 12,
+  },
+  toastText: { color: '#fff', fontWeight: '600', textAlign: 'center', fontSize: 15 },
+  shutterRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'stretch',
+  },
+  sideSlot: { flex: 1, alignItems: 'center' },
+  sideButton: {
+    minHeight: 44,
+    paddingHorizontal: 12,
+    justifyContent: 'center',
+    borderRadius: 22,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+  },
+  sideButtonText: { color: '#fff', fontWeight: '600', fontSize: 14 },
+  secondaryButton: {
+    marginTop: 12,
+    minHeight: 48,
+    paddingHorizontal: 20,
+    justifyContent: 'center',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#3d3866',
+  },
+  secondaryButtonText: { color: '#fff', fontWeight: '600', fontSize: 16 },
+  backLinkText: { color: '#8F88FF', fontSize: 16, fontWeight: '600', textAlign: 'center' },
   backText: {
     color: '#fff',
     fontSize: 16,
@@ -608,7 +1029,6 @@ const styles = StyleSheet.create({
   },
   bottomBar: {
     alignItems: 'center',
-    paddingBottom: 40,
     gap: 10,
   },
   captureButton: {
@@ -644,8 +1064,10 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   hintText: {
-    color: 'rgba(255,255,255,0.85)',
-    fontSize: 13,
+    color: 'rgba(255,255,255,0.9)',
+    fontSize: 15,
     fontWeight: '600',
+    textAlign: 'center',
+    paddingHorizontal: 24,
   },
 });
