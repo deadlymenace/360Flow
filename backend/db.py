@@ -476,6 +476,28 @@ def hash_device_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def cancel_device_jobs(device_id: str) -> list[str]:
+    """Cancel every open job on the device's projects and drop their leases.
+
+    Returns the job ids. A worker that still runs one then fails its lease
+    check and writes nothing; claim and renew refuse a cancelled job.
+    """
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        rows = session.scalars(
+            select(JobRow)
+            .join(ProjectRow, ProjectRow.id == JobRow.project_id)
+            .where(ProjectRow.owner_device_id == device_id)
+            .where(JobRow.status.in_(("pending", "running", "delayed")))
+        ).all()
+        for row in rows:
+            row.status = "cancelled"
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.updated_at = now
+        return [row.id for row in rows]
+
+
 def delete_device(device_id: str) -> bool:
     """Remove the device row so its token stops working."""
     with session_scope() as session:

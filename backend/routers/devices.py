@@ -7,7 +7,8 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from auth import Caller, require_caller
-from db import create_device, delete_device, delete_project, list_projects
+from db import cancel_device_jobs, create_device, delete_device, delete_project, list_projects
+from services.pipeline import abort_local_jobs
 from storage import delete_project_assets
 
 router = APIRouter()
@@ -24,13 +25,16 @@ async def register_device():
 async def delete_all_my_data(caller: Caller = Depends(require_caller)) -> Response:
     """Delete all my data (App Store guideline 5.1.1(v)).
 
-    Deletes every project owned by the calling device: uploaded photos,
+    First cancels the device's queued and running jobs and drops their leases,
+    so a paid provider call that returns later writes nothing. Then deletes every project owned by the calling device: uploaded photos,
     panoramas and staged images in storage, the project rows with their jobs,
     and so their share and preview links. Then the device token is revoked, so
     it returns 401 from then on.
     """
     if caller.device_id is None:
         raise HTTPException(status_code=400, detail="Admin key has no device to delete")
+    cancelled = cancel_device_jobs(caller.device_id)
+    abort_local_jobs(cancelled)
     projects = list_projects(caller.device_id)
     for project in projects:
         # TODO: also delete hosted World Labs worlds (world_id, world_preview_id,
@@ -40,5 +44,7 @@ async def delete_all_my_data(caller: Caller = Depends(require_caller)) -> Respon
         delete_project(project.id)
     if not delete_device(caller.device_id):
         raise HTTPException(status_code=404, detail="Device not found")
-    logger.info("Deleted device %s and %d projects", caller.device_id, len(projects))
+    logger.info(
+        "Deleted device %s, %d projects, cancelled %d jobs", caller.device_id, len(projects), len(cancelled)
+    )
     return Response(status_code=204)

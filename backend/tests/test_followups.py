@@ -309,3 +309,147 @@ def test_delete_all_my_data(client):
         assert not storage.list_keys(key)
     assert db.get_project(other) is not None
     assert client.raw.get("/api/v1/projects", headers=auth).status_code == 401
+
+
+def _device_project(name: str):
+    device_id, token = db.create_device()
+    project = db.create_project(name, owner_device_id=device_id)
+    key = panorama_key(project.id)
+    get_storage().put_bytes(key, b"\xff\xd8pano", "image/jpeg")
+    db.update_project(project.id, panorama_key=key, status="stitched", staging_prompt="sofa")
+    return device_id, project
+
+
+@pytest.mark.parametrize("in_process", [True, False])
+@pytest.mark.parametrize("kind", ["world", "stage"])
+def test_job_finishing_after_delete_all_writes_nothing(client, monkeypatch, kind, in_process):
+    from auth import Caller
+    from routers import devices
+    from storage import project_asset_prefixes, staged_key
+
+    device_id, project = _device_project(f"late-{kind}-{in_process}")
+    job = db.create_job(project.id, kind)
+    release = asyncio.Event()
+    finished = {"provider": False}
+    deleted_worlds = []
+
+    async def generate(*args, on_operation=None, **kwargs):
+        await release.wait()
+        finished["provider"] = True
+        await on_operation("late-op", "full")
+        return {"world_id": "late-world", "marble_url": "https://marble.worldlabs.ai/world/late-world",
+                "provider": "worldlabs", "operation_id": "late-op"}
+
+    async def stage(image_bytes, prompt, before_generate=None):
+        await release.wait()
+        finished["provider"] = True
+        return b"\xff\xd8late-staged", "gemini", None
+
+    async def record_deletes(ids):
+        deleted_worlds.extend(ids)
+
+    monkeypatch.setattr(pipeline, "generate_world", generate)
+    monkeypatch.setattr(pipeline, "stage_image", stage)
+    monkeypatch.setattr(pipeline, "delete_worlds", record_deletes)
+    if not in_process:
+        # Another replica runs the job: no local abort hook, only the write guards.
+        monkeypatch.setattr(pipeline, "abort_local_jobs", lambda ids: 0)
+        monkeypatch.setattr(devices, "abort_local_jobs", lambda ids: 0)
+
+    async def scenario():
+        task = asyncio.create_task(pipeline.run_job(job.id))
+        for _ in range(200):
+            current = db.get_job(job.id)
+            if current is not None and current.lease_owner == db.WORKER_ID:
+                break
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)
+        await devices.delete_all_my_data(Caller(device_id=device_id, is_admin=False))
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert db.get_project(project.id) is None
+    assert db.get_job(job.id) is None
+    storage = get_storage()
+    for prefix in project_asset_prefixes(project.id):
+        assert not storage.list_keys(prefix), prefix
+    assert not storage.list_keys(staged_key(project.id))
+    if not in_process:
+        assert finished["provider"] is True
+
+
+def test_delete_all_leaves_other_devices_and_demo_shares(client):
+    _, mine = _device_project("mine-only")
+    other_device, theirs = _device_project("theirs")
+    demo = db.create_project("demo", owner_device_id=None)
+    demo_key = panorama_key(demo.id)
+    get_storage().put_bytes(demo_key, b"\xff\xd8demo", "image/jpeg")
+    db.update_project(demo.id, panorama_key=demo_key, status="stitched")
+    their_job = db.create_job(theirs.id, "world")
+    token = client.raw.post("/api/v1/devices").json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+    assert client.raw.delete("/api/v1/devices/me", headers=auth).status_code == 204
+    try:
+        for project, key in ((theirs, panorama_key(theirs.id)), (demo, demo_key)):
+            kept = db.get_project(project.id)
+            assert kept is not None
+            assert kept.share_token == project.share_token
+            assert db.get_by_share_token(project.share_token) is not None
+            assert client.raw.get(f"/v/{project.share_token}").status_code == 200
+            assert get_storage().list_keys(key)
+        assert db.get_project(mine.id) is not None
+        assert db.get_job(their_job.id).status == "pending"
+        assert db.device_id_for_token(token) is None
+    finally:
+        db.delete_job(their_job.id)
+
+
+@pytest.mark.parametrize("kind", ["world", "stage"])
+def test_cancelled_job_writes_nothing_before_rows_are_deleted(client, monkeypatch, kind):
+    """The window between cancelling jobs and deleting rows: a late result must not write."""
+    from storage import staged_key
+
+    device_id, project = _device_project(f"window-{kind}")
+    job = db.create_job(project.id, kind)
+    release = asyncio.Event()
+
+    async def generate(*args, on_operation=None, **kwargs):
+        await release.wait()
+        return {"world_id": "late-world", "marble_url": "https://marble.worldlabs.ai/world/late-world",
+                "provider": "worldlabs", "operation_id": "late-op"}
+
+    async def stage(image_bytes, prompt, before_generate=None):
+        await release.wait()
+        return b"\xff\xd8late-staged", "gemini", None
+
+    async def no_deletes(ids):
+        return None
+
+    monkeypatch.setattr(pipeline, "generate_world", generate)
+    monkeypatch.setattr(pipeline, "stage_image", stage)
+    monkeypatch.setattr(pipeline, "delete_worlds", no_deletes)
+
+    async def scenario():
+        task = asyncio.create_task(pipeline.run_job(job.id))
+        for _ in range(200):
+            current = db.get_job(job.id)
+            if current is not None and current.lease_owner == db.WORKER_ID:
+                break
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0.02)
+        assert db.cancel_device_jobs(device_id) == [job.id]
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+        saved = db.get_project(project.id)
+        assert saved.world_id is None
+        assert saved.status != "complete"
+        assert saved.staging_status != "staged"
+        assert not get_storage().list_keys(staged_key(project.id))
+        assert db.get_job(job.id).status == "cancelled"
+    finally:
+        db.delete_job(job.id)
+        db.delete_project(project.id)

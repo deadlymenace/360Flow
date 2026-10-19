@@ -11,6 +11,7 @@ Set JOBS_INLINE=1 to await the work inside the request (used by tests).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -75,6 +76,10 @@ logger = logging.getLogger(__name__)
 _stitch_pool: ThreadPoolExecutor | None = None
 _world_semaphore: asyncio.Semaphore | None = None
 _in_flight: set[str] = set()
+# Abort callbacks for jobs running in this process, by job id.
+_abort_hooks: dict[str, object] = {}
+# The job this task is running, so write guards can check its lease.
+_current_job: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_job", default=None)
 _INTERRUPTED_WORLD = "3D generation was interrupted. Retry from the app."
 _INTERRUPTED_WORLD_DETAIL = (
     "Interrupted before a World Labs operation id was saved; not started again, to avoid a second charge."
@@ -283,6 +288,36 @@ def _require_lease(job_id: str | None) -> None:
         raise LeaseLost()
 
 
+def _guard_write(project_id: str) -> None:
+    """Call before a storage write or DB update that follows a provider call.
+
+    Raises LeaseLost when the project is gone or this process no longer owns
+    the job, so a late provider result writes nothing.
+    """
+    if get_project(project_id) is None:
+        raise LeaseLost()
+    _require_lease(_current_job.get())
+
+
+def _may_write(project_id: str) -> bool:
+    try:
+        _guard_write(project_id)
+    except LeaseLost:
+        return False
+    return True
+
+
+def abort_local_jobs(job_ids) -> int:
+    """Cancel jobs this process is running (used by Delete all my data)."""
+    stopped = 0
+    for job_id in job_ids:
+        hook = _abort_hooks.get(job_id)
+        if hook is not None:
+            hook()
+            stopped += 1
+    return stopped
+
+
 def _lease_still_held(job_id: str) -> bool:
     job = get_job(job_id)
     if job is None or job.lease_owner != WORKER_ID or job.lease_expires_at is None:
@@ -403,6 +438,8 @@ async def run_job(job_id: str) -> None:
         if job_task is not None and not job_task.done():
             job_task.cancel()
 
+    _abort_hooks[job_id] = _on_lease_lost
+    job_token = _current_job.set(job_id)
     try:
         job = claim_job_lease(job_id, WORKER_ID)
         if job is None:
@@ -444,6 +481,8 @@ async def run_job(job_id: str) -> None:
             except Exception:
                 logger.exception("Lease heartbeat for job %s failed", job_id)
         _in_flight.discard(job_id)
+        _abort_hooks.pop(job_id, None)
+        _current_job.reset(job_token)
         if owned and not abandoned:
             if keep:
                 release_job_lease(job_id, WORKER_ID)
@@ -486,13 +525,17 @@ async def run_stitch(project_id: str) -> str | None:
                 raise RuntimeError("Stitching failed. Try recapturing with more overlap between photos.")
             if _deleted(project_id):
                 return None
+            _guard_write(project_id)
             key = panorama_key(project_id)
             storage.put_file(key, output, "image/jpeg")
+        _guard_write(project_id)
         saved = update_project(project_id, status="stitched", panorama_key=key, error=None, active_job=None)
         if saved is None:
             delete_project_assets(project_id)
             return None
         logger.info("Project %s stitched", project_id)
+    except LeaseLost:
+        raise
     except Exception:
         if _deleted(project_id):
             logger.info("Project %s deleted during stitch", project_id)
@@ -529,8 +572,10 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
         )
         if _deleted(project_id):
             return
+        _guard_write(project_id)
         key = staged_key(project_id)
         storage.put_bytes(key, staged_bytes, "image/jpeg")
+        _guard_write(project_id)
         saved = update_project(
             project_id,
             staging_status="staged",
@@ -556,6 +601,9 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
 def _fail_stage(project_id: str, message: str, detail: str | None = None) -> None:
     if _deleted(project_id):
         logger.info("Project %s deleted during staging", project_id)
+        return
+    if not _may_write(project_id):
+        logger.warning("Project %s: not recording a staging failure without the lease", project_id)
         return
     client_message = message or "Staging failed. Try again."
     if detail:
@@ -822,6 +870,7 @@ def _store_preview(project_id: str, result: dict, staged_source: bool, created_i
         created_ids.append(world_id)
     if _deleted(project_id):
         return
+    _guard_write(project_id)
     if staged_source:
         update_project(
             project_id,
@@ -845,6 +894,7 @@ async def _store_world(project_id: str, result: dict, staged_source: bool, creat
     if _deleted(project_id):
         await delete_worlds(created_ids)
         return
+    _guard_write(project_id)
     operation_id = result.get("operation_id")
     stored_operation = operation_id[:64] if isinstance(operation_id, str) else None
     if staged_source:
@@ -886,6 +936,7 @@ async def _store_world(project_id: str, result: dict, staged_source: bool, creat
 
 def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: bool) -> str | None:
     """Leave the job queued so the next run polls the operation World Labs already accepted."""
+    _guard_write(project_id)
     if not job_id:
         return None
     job = get_job(job_id)
@@ -923,6 +974,7 @@ def _record_paid_operation(project_id: str, job_id: str | None, staged_source: b
     """
     if not job_id:
         return
+    _guard_write(project_id)
     job = get_job(job_id)
     if job is None or not job.operation_id:
         return
@@ -998,6 +1050,7 @@ def _clear_staged_resume(project_id: str) -> dict:
 
 
 def _remember_operation(project_id: str, job_id: str | None, operation_id: str, phase: str, staged_source: bool) -> None:
+    _guard_write(project_id)
     if job_id:
         update_job(job_id, operation_id=operation_id, operation_phase=phase, status="running")
     field = "staged_world_operation_id" if staged_source else "world_operation_id"
@@ -1013,6 +1066,7 @@ def _delay_world(project_id: str, job_id: str | None, detail: str, staged_source
     """
     from datetime import datetime, timezone
 
+    _guard_write(project_id)
     phase = None
     operation_id = None
     attempts = 1
@@ -1049,6 +1103,9 @@ def _delay_world(project_id: str, job_id: str | None, detail: str, staged_source
 
 
 def _fail_world(project_id: str, message: str, detail: str | None, staged_source: bool) -> None:
+    if not _may_write(project_id):
+        logger.warning("Project %s: not recording a 3D failure without the project or lease", project_id)
+        return
     if detail:
         logger.error("Project %s world provider error: %s", project_id, detail)
     else:
