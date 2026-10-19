@@ -15,11 +15,17 @@ import { useFocusEffect } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
 import { api } from '../services/api';
-import { Project, getStatusLabel, getStatusColor } from '../models/types';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { Project, getStatusColor, liveStatusLabel, relativeTime } from '../models/types';
+import { hasSeenCaptureCoach } from '../services/privacy';
+
+const TRANSIENT = new Set(['uploading', 'stitching', 'staging', 'generating_3d', 'delayed']);
+const LIVE_REFRESH_MS = 5000;
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Home'>;
 
 export default function HomeScreen({ navigation }: Props) {
+  const insets = useSafeAreaInsets();
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -47,6 +53,24 @@ export default function HomeScreen({ navigation }: Props) {
     }, [loadProjects])
   );
 
+  // Live row status while anything is still building and Home is visible.
+  const anyBusy = projects.some(
+    (p) => TRANSIENT.has(p.status) || p.active_job != null || p.staging_status === 'staging',
+  );
+  useFocusEffect(
+    useCallback(() => {
+      if (!anyBusy) return;
+      const timer = setInterval(loadProjects, LIVE_REFRESH_MS);
+      return () => clearInterval(timer);
+    }, [anyBusy, loadProjects])
+  );
+
+  const openCapture = (project: Project) => {
+    const next = { projectId: project.id, projectName: project.name };
+    if (hasSeenCaptureCoach()) navigation.navigate('Capture', next);
+    else navigation.navigate('CaptureCoach', { next });
+  };
+
   const handleRefresh = () => {
     setRefreshing(true);
     loadProjects();
@@ -61,9 +85,9 @@ export default function HomeScreen({ navigation }: Props) {
       const project = await api.createProject(name);
       setShowModal(false);
       setRoomName('');
-      navigation.navigate('Capture', { projectId: project.id, projectName: project.name });
+      openCapture(project);
     } catch (e: any) {
-      Alert.alert('Error', e.message);
+      Alert.alert("Couldn't create the capture", __DEV__ ? e.message : 'Check your connection and try again.');
     } finally {
       setCreating(false);
     }
@@ -75,7 +99,7 @@ export default function HomeScreen({ navigation }: Props) {
 
   const handleProjectPress = (project: Project) => {
     if (project.status === 'created') {
-      navigation.navigate('Capture', { projectId: project.id, projectName: project.name });
+      openCapture(project);
       return;
     }
     if (project.status === 'uploading' || project.status === 'stitching') {
@@ -132,32 +156,50 @@ export default function HomeScreen({ navigation }: Props) {
     );
   };
 
-  const renderProject = ({ item }: { item: Project }) => (
+  const renderProject = ({ item }: { item: Project }) => {
+    const label = liveStatusLabel(item);
+    const meta =
+      item.status === 'created'
+        ? relativeTime(item.created_at)
+        : `${item.image_count} photos · ${relativeTime(item.created_at)}`;
+    return (
     <View style={styles.projectRow}>
-      <TouchableOpacity style={styles.projectInfo} onPress={() => handleProjectPress(item)}>
-        <Text style={styles.projectName}>{item.name}</Text>
-        <Text style={styles.projectMeta}>
-          {item.image_count} photos · {new Date(item.created_at).toLocaleDateString()}
-        </Text>
+      <TouchableOpacity
+        style={styles.projectInfo}
+        onPress={() => handleProjectPress(item)}
+        accessibilityRole="button"
+        accessibilityLabel={`${item.name}. ${label}. ${meta}`}
+      >
+        <Text style={styles.projectName} numberOfLines={1}>{item.name}</Text>
+        <Text style={styles.projectMeta}>{meta}</Text>
       </TouchableOpacity>
       <View style={styles.rowActions}>
-        <View style={[styles.statusBadge, { backgroundColor: getStatusColor(item.status) + '20' }]}>
-          <Text style={[styles.statusText, { color: getStatusColor(item.status) }]}>
-            {getStatusLabel(item.status)}
-          </Text>
+        <View
+          style={[styles.statusBadge, { backgroundColor: getStatusColor(item.status) + '20' }]}
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+        >
+          <Text style={[styles.statusText, { color: getStatusColor(item.status) }]}>{label}</Text>
         </View>
-        <TouchableOpacity onPress={() => confirmDelete(item)} accessibilityLabel={`Delete ${item.name}`}>
+        <TouchableOpacity
+          onPress={() => confirmDelete(item)}
+          style={styles.deleteHit}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel={`Delete ${item.name}`}
+        >
           <Text style={styles.deleteText}>Delete</Text>
         </TouchableOpacity>
       </View>
     </View>
-  );
+    );
+  };
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
+      <View style={[styles.header, { paddingTop: insets.top + 12 }]}>
         <Text style={styles.title}>360Flow</Text>
-        <TouchableOpacity style={styles.addButton} onPress={() => setShowModal(true)}>
+        <TouchableOpacity style={styles.addButton} onPress={() => setShowModal(true)} accessibilityRole="button">
           <Text style={styles.addButtonText}>+ New Capture</Text>
         </TouchableOpacity>
       </View>
@@ -185,13 +227,20 @@ export default function HomeScreen({ navigation }: Props) {
           <Text style={styles.emptySubtitle}>
             Tap "New Capture" to scan your first room
           </Text>
+          <TouchableOpacity
+            style={styles.howLink}
+            onPress={() => navigation.navigate('CaptureCoach')}
+            accessibilityRole="button"
+          >
+            <Text style={styles.howLinkText}>How it works</Text>
+          </TouchableOpacity>
         </View>
       ) : (
         <FlatList
           data={projects}
           keyExtractor={(item) => item.id}
           renderItem={renderProject}
-          contentContainerStyle={styles.list}
+          contentContainerStyle={[styles.list, { paddingBottom: insets.bottom + 16 }]}
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -221,6 +270,7 @@ export default function HomeScreen({ navigation }: Props) {
               <TouchableOpacity
                 style={styles.cancelButton}
                 onPress={() => { setShowModal(false); setRoomName(''); }}
+                accessibilityRole="button"
               >
                 <Text style={styles.cancelButtonText}>Cancel</Text>
               </TouchableOpacity>
@@ -228,6 +278,8 @@ export default function HomeScreen({ navigation }: Props) {
                 style={[styles.createButton, !roomName.trim() && styles.disabledButton]}
                 onPress={handleCreate}
                 disabled={!roomName.trim() || creating}
+                accessibilityRole="button"
+                accessibilityState={{ disabled: !roomName.trim() || creating, busy: creating }}
               >
                 {creating ? (
                   <ActivityIndicator size="small" color="#fff" />
@@ -253,9 +305,11 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingHorizontal: 20,
-    paddingTop: 60,
     paddingBottom: 16,
   },
+  howLink: { minHeight: 44, justifyContent: 'center', marginTop: 12, paddingHorizontal: 12 },
+  howLinkText: { color: '#8F88FF', fontSize: 15, fontWeight: '600' },
+  deleteHit: { minHeight: 32, minWidth: 44, justifyContent: 'center', alignItems: 'flex-end' },
   title: {
     fontSize: 28,
     fontWeight: '700',
@@ -264,7 +318,8 @@ const styles = StyleSheet.create({
   addButton: {
     backgroundColor: '#6C63FF',
     paddingHorizontal: 16,
-    paddingVertical: 10,
+    minHeight: 44,
+    justifyContent: 'center',
     borderRadius: 12,
   },
   addButtonText: {
@@ -316,8 +371,8 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   projectMeta: {
-    fontSize: 12,
-    color: '#888',
+    fontSize: 13,
+    color: '#b8b5d1',
   },
   statusBadge: {
     paddingHorizontal: 10,

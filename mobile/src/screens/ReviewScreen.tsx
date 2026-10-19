@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
@@ -7,7 +7,9 @@ import {
   StyleSheet,
   ScrollView,
   Dimensions,
+  Modal,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
 import { SEGMENT_ANGLE, SEGMENT_COUNT } from '../models/types';
@@ -22,6 +24,14 @@ type Props = NativeStackScreenProps<RootStackParamList, 'Review'>;
 
 export default function ReviewScreen({ navigation, route }: Props) {
   const { projectId, projectName, hfov, lens, segments } = route.params;
+  const insets = useSafeAreaInsets();
+  const [preview, setPreview] = useState<number | null>(null);
+  const previewSeg = preview != null ? segments.find((s) => s.id === preview) : null;
+
+  const retake = (index: number) => {
+    setPreview(null);
+    navigation.popTo('Capture', { projectId, projectName, retakeIndex: index, retakeNonce: Date.now() });
+  };
 
   const capturedCount = segments.filter((s) => s.imageUri !== null).length;
   const allCaptured = capturedCount === SEGMENT_COUNT;
@@ -45,21 +55,30 @@ export default function ReviewScreen({ navigation, route }: Props) {
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()}>
+      <View style={[styles.header, { paddingTop: insets.top + 8 }]}>
+        <TouchableOpacity
+          onPress={() => navigation.goBack()}
+          style={styles.hit}
+          hitSlop={12}
+          accessibilityRole="button"
+          accessibilityLabel="Back to capture"
+        >
           <Text style={styles.backText}>← Back</Text>
         </TouchableOpacity>
-        <Text style={styles.title}>Review Photos</Text>
+        <Text style={styles.title} accessibilityRole="header">Check your photos</Text>
         <View style={{ width: 60 }} />
       </View>
+      <Text style={styles.subhint}>Tap any photo to retake it</Text>
 
       <ScrollView contentContainerStyle={styles.grid}>
         {segments.map((seg) => (
           <TouchableOpacity
             key={seg.id}
             style={styles.thumbContainer}
-            onPress={() => navigation.goBack()}
+            onPress={() => (seg.imageUri ? setPreview(seg.id) : retake(seg.id))}
             activeOpacity={0.7}
+            accessibilityRole="button"
+            accessibilityLabel={seg.imageUri ? `Photo ${seg.id + 1}. Tap to preview or retake` : `Photo ${seg.id + 1} missing. Tap to capture`}
           >
             {seg.imageUri ? (
               <Image source={{ uri: seg.imageUri }} style={styles.thumb} />
@@ -75,18 +94,51 @@ export default function ReviewScreen({ navigation, route }: Props) {
         ))}
       </ScrollView>
 
-      <View style={styles.bottomBar}>
+      <View style={[styles.bottomBar, { paddingBottom: insets.bottom + 16 }]}>
         <Text style={styles.statusText}>
-          {capturedCount} of {SEGMENT_COUNT} segments captured
+          {capturedCount} of {SEGMENT_COUNT} photos
         </Text>
         <TouchableOpacity
           style={[styles.uploadButton, !allCaptured && styles.disabledButton]}
           onPress={handleUpload}
           disabled={!allCaptured}
+          accessibilityRole="button"
+          accessibilityState={{ disabled: !allCaptured }}
         >
-          <Text style={styles.uploadButtonText}>Upload & Stitch</Text>
+          <Text style={styles.uploadButtonText}>Create 360° tour</Text>
         </TouchableOpacity>
       </View>
+
+      <Modal visible={previewSeg != null} animationType="fade" onRequestClose={() => setPreview(null)}>
+        <View style={[styles.previewContainer, { paddingTop: insets.top + 8, paddingBottom: insets.bottom + 16 }]}>
+          <View style={styles.previewHeader}>
+            <TouchableOpacity
+              onPress={() => setPreview(null)}
+              style={styles.hit}
+              hitSlop={12}
+              accessibilityRole="button"
+              accessibilityLabel="Close preview"
+            >
+              <Text style={styles.backText}>Close</Text>
+            </TouchableOpacity>
+            <Text style={styles.title}>Photo {previewSeg ? previewSeg.id + 1 : ''}</Text>
+            <View style={{ width: 60 }} />
+          </View>
+          {previewSeg?.imageUri ? (
+            <Image
+              source={{ uri: previewSeg.imageUri }}
+              style={styles.previewImage}
+              resizeMode="contain"
+              accessibilityLabel={`Photo ${previewSeg.id + 1}`}
+            />
+          ) : null}
+          {previewSeg ? (
+            <TouchableOpacity style={styles.uploadButton} onPress={() => retake(previewSeg.id)} accessibilityRole="button">
+              <Text style={styles.uploadButtonText}>Retake #{previewSeg.id + 1}</Text>
+            </TouchableOpacity>
+          ) : null}
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -100,12 +152,16 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingTop: 60,
     paddingHorizontal: 20,
-    paddingBottom: 16,
+    paddingBottom: 8,
   },
+  hit: { minHeight: 44, minWidth: 60, justifyContent: 'center' },
+  subhint: { color: '#b8b5d1', fontSize: 14, textAlign: 'center', marginBottom: 4 },
+  previewContainer: { flex: 1, backgroundColor: '#000', paddingHorizontal: 16, gap: 16 },
+  previewHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  previewImage: { flex: 1, width: '100%' },
   backText: {
-    color: '#6C63FF',
+    color: '#8F88FF',
     fontSize: 16,
     fontWeight: '500',
   },
@@ -159,12 +215,11 @@ const styles = StyleSheet.create({
   },
   bottomBar: {
     padding: 20,
-    paddingBottom: 40,
     alignItems: 'center',
     gap: 12,
   },
   statusText: {
-    color: '#888',
+    color: '#b8b5d1',
     fontSize: 14,
   },
   uploadButton: {

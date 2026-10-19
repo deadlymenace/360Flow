@@ -46,3 +46,4 @@ keys/
 # generated native folders
 /ios
 /android
+.test-build/

@@ -18,3 +18,28 @@ export function acceptAiDisclosure(): void {
   }
   file.write('accepted');
 }
+
+const COACH_FILE = 'capture-coach-seen.txt';
+
+function coachFile(): ExpoFile {
+  return new ExpoFile(Paths.document, COACH_FILE);
+}
+
+/** True after the first-run capture coach has been shown once. */
+export function hasSeenCaptureCoach(): boolean {
+  try {
+    return coachFile().exists;
+  } catch {
+    return true;
+  }
+}
+
+export function markCaptureCoachSeen(): void {
+  try {
+    const file = coachFile();
+    if (!file.exists) file.create();
+    file.write('seen');
+  } catch {
+    // A missing flag only means the coach shows again.
+  }
+}
