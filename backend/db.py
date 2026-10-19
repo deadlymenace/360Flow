@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy import DateTime, Float, Index, Integer, String, Text, create_engine, inspect, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
+import logging
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from config import Settings, get_settings
@@ -266,6 +267,7 @@ class JobRecord:
 
 
 _engine = None
+logger = logging.getLogger(__name__)
 _Session: sessionmaker[Session] | None = None
 
 
@@ -474,6 +476,33 @@ def _job_record(row: JobRow) -> JobRecord:
 
 def hash_device_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+_WORLD_ID_FIELDS = ("world_id", "world_preview_id", "staged_world_id", "staged_world_preview_id")
+
+
+def world_ids_in_use(world_ids, exclude_project_ids=(), session: Session | None = None) -> set[str]:
+    """World ids from ``world_ids`` that a remaining project still references in any world field."""
+    wanted = {item for item in world_ids if item}
+    if not wanted:
+        return set()
+    if session is not None:
+        return _world_ids_in_use(session, wanted, set(exclude_project_ids))
+    with session_scope() as scoped:
+        return _world_ids_in_use(scoped, wanted, set(exclude_project_ids))
+
+
+def _world_ids_in_use(session: Session, wanted: set[str], excluded: set[str]) -> set[str]:
+    if not wanted:
+        return set()
+    columns = [getattr(ProjectRow, name) for name in _WORLD_ID_FIELDS]
+    query = select(ProjectRow.id, *columns).where(or_(*[column.in_(wanted) for column in columns]))
+    found: set[str] = set()
+    for row in session.execute(query).all():
+        if row[0] in excluded:
+            continue
+        found.update(value for value in row[1:] if value in wanted)
+    return found
 
 
 def cancel_device_jobs(device_id: str) -> list[str]:
@@ -1184,14 +1213,22 @@ def _begin_job(
     retired: list[str] = []
     if retire_worlds:
         retired = _world_ids(row, retire_worlds)
-        _queue_deletes_in_session(session, retired, "replaced by a new capture")
         clearing = _ORIGINAL_WORLD_FIELDS if retire_worlds == "original" else ()
         if retire_worlds == "staged":
             clearing = _STAGED_WORLD_FIELDS
         if retire_worlds == "all":
             clearing = _ORIGINAL_WORLD_FIELDS + _STAGED_WORLD_FIELDS
+        # Clear this project's world fields first, then keep any world another
+        # project still references (World Labs deletes cannot be undone), then
+        # queue the rest in this transaction. The retry pass calls World Labs.
         for field in clearing:
             setattr(row, field, None)
+        session.flush()
+        shared = _world_ids_in_use(session, set(retired), set())
+        for world_id in sorted(shared):
+            logger.warning("Keeping World Labs world %s: another project still references it", world_id)
+        retired = [world_id for world_id in retired if world_id not in shared]
+        _queue_deletes_in_session(session, retired, "replaced by a new capture")
     for key, value in project_fields.items():
         setattr(row, key, value)
     row.active_job = kind

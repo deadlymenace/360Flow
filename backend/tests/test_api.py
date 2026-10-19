@@ -392,6 +392,13 @@ def test_delete_notifies_world_labs_for_every_stored_world(client, monkeypatch):
     removed = client.delete(f"/api/v1/projects/{created['id']}")
     assert removed.status_code == 204
     assert client.raw.get(f"/v/{created['share_token']}").status_code == 404
+    # Queued, not called during the request; the background pass deletes them.
+    assert deleted_urls == []
+    import asyncio
+
+    from services.world_gen import retry_pending_world_deletes
+
+    assert asyncio.run(retry_pending_world_deletes(force=True)) == 4
     assert sorted(deleted_urls) == sorted(
         [
             "https://api.worldlabs.ai/marble/v1/worlds/world-full",

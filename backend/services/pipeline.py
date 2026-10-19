@@ -161,8 +161,9 @@ async def enqueue_job(
         if current is None or current.staging_status != "staged":
             update_project(project_id, staging_status="failed", staging_error=STAGING_QUOTA_MESSAGE, active_job=None)
     job_id = job.id if job is not None else None
-    if retired_world_ids:
-        await delete_worlds(retired_world_ids)
+    # begin_job cleared the retired world fields, skipped worlds other projects
+    # still use, and queued the rest; the background retry pass deletes them.
+    del retired_world_ids
     if outcome == "queued" and job_id is not None and start:
         await _schedule(job_id)
     return outcome, job_id

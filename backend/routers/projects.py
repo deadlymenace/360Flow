@@ -18,7 +18,7 @@ from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
 from services.pipeline import enqueue_job, retry_delayed_project, start_job
 from services.uploads import normalize_upload
-from services.world_gen import delete_worlds
+from services.world_gen import queue_unshared_world_deletes
 from storage import delete_project_assets, get_storage, panorama_key, staged_key, upload_key
 from config import get_settings
 
@@ -141,17 +141,18 @@ async def get_one(project_id: str, request: Request) -> Project:
 async def remove_project(project_id: str, request: Request) -> Response:
     """Delete the capture, its files, hosted worlds, and its share link."""
     project = _require(project_id, request)
-    await delete_worlds(
-        [
-            project.world_id,
-            project.world_preview_id,
-            project.staged_world_id,
-            project.staged_world_preview_id,
-        ]
-    )
+    world_ids = [
+        project.world_id,
+        project.world_preview_id,
+        project.staged_world_id,
+        project.staged_world_preview_id,
+    ]
     delete_project_assets(project_id)
     if not delete_project(project_id):
         raise HTTPException(status_code=404, detail="Project not found")
+    # After the row is gone: keep any world another project still uses.
+    # World Labs is called by the background retry pass, not in this request.
+    queue_unshared_world_deletes(world_ids, "queued by project delete")
     return Response(status_code=204)
 
 

@@ -27,6 +27,7 @@ import {
 import { HapticFeedback } from '../utils/haptics';
 import { api } from '../services/api';
 import CaptureMiniMap from '../components/CaptureMiniMap';
+import { LOW_LIGHT_HINT, isLowLight } from '../capture/lowLight';
 import {
   AIM_HOLD_MS,
   AIM_TOLERANCE_DEG,
@@ -258,6 +259,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.8,
         skipProcessing: false,
+        exif: true,
       });
       if (!photo?.uri) throw new Error('No photo returned');
       let actualYaw: number;
@@ -285,6 +287,11 @@ export default function CaptureScreen({ navigation, route }: Props) {
       if (firstShot) setShowTurnHint(true);
       const done = segmentsRef.current.filter((seg) => seg.imageUri !== null).length + 1;
       AccessibilityInfo.announceForAccessibility(`Photo ${Math.min(done, SEGMENT_COUNT)} of ${SEGMENT_COUNT}`);
+      // P1-16: a gentle hint only. The photo is kept and capture carries on;
+      // the existing Retake last button lets the user redo it.
+      if (isLowLight(photo.exif as Record<string, unknown> | undefined)) {
+        showToast(LOW_LIGHT_HINT, 4000);
+      }
     } catch (e) {
       if (__DEV__) console.warn('Capture error:', e);
       HapticFeedback.error();

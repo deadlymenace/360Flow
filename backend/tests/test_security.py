@@ -365,6 +365,8 @@ def test_failed_world_deletes_are_retried(client, monkeypatch):
 
     asyncio.run(delete_worlds(["world-stuck"]))
     assert "world-stuck" in pending_world_delete_ids(force=True)
+    # The retry pass skips worlds a project still references, so drop the reference.
+    update_project(created["id"], world_id=None)
     cleared = asyncio.run(retry_pending_world_deletes(force=True))
     assert cleared == 1
     assert pending_world_delete_ids(force=True) == []
