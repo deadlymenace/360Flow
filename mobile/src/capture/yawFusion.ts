@@ -69,12 +69,9 @@ export function fuseHeading(
   const dt = Math.min(Math.max(dtSec, 0), 0.1);
   let yaw = state.yaw + gyroRateDegPerSec * dt;
   const error = wrapSignedDeg(attHeadingDeg - yaw);
-  // A large disagreement is a real reset (app resumed, frame re-zeroed): snap.
-  if (Math.abs(error) > 25) {
-    yaw += error;
-  } else {
-    yaw += error * Math.min(1, dt / Math.max(tauSec, 1e-3));
-  }
+  // Complementary filter: always a slow blend toward the compass, never a snap,
+  // so a compass correction can't make the dots jump.
+  yaw += error * Math.min(1, dt / Math.max(tauSec, 1e-3));
   state.yaw = yaw;
   return yaw;
 }
@@ -97,4 +94,43 @@ export function basisWithHeading(axes: { right: Vec3; up: Vec3; forward: Vec3 },
     up: rotateHeading(axes.up, delta),
     look: rotateHeading(axes.forward, delta),
   };
+}
+
+/** Loop-closure drift above this many degrees is flagged. */
+export const LOOP_CLOSURE_MAX_DEG = 3;
+
+/**
+ * Tracks the gyro-only heading from the first shot. When the user faces
+ * the first shot again after going all the way round, the gyro should read
+ * the compass turn plus 0 (mod 360). The difference is the loop-closure drift.
+ */
+export class LoopClosure {
+  private gyro = 0;
+  private att0: number | null = null;
+  private attPrev: number | null = null;
+  private attTotal = 0;
+  start(attHeadingDeg: number): void {
+    this.gyro = 0;
+    this.att0 = attHeadingDeg;
+    this.attPrev = attHeadingDeg;
+    this.attTotal = 0;
+  }
+  get started(): boolean {
+    return this.att0 != null;
+  }
+  update(attHeadingDeg: number, gyroRateDegPerSec: number, dtSec: number): void {
+    if (this.attPrev == null) return;
+    this.gyro += gyroRateDegPerSec * Math.min(Math.max(dtSec, 0), 0.1);
+    this.attTotal += wrapSignedDeg(attHeadingDeg - this.attPrev);
+    this.attPrev = attHeadingDeg;
+  }
+  /** Degrees turned so far according to the gyro. */
+  get turnedDeg(): number {
+    return this.gyro;
+  }
+  /** Gyro drift against the compass over the turn so far, plus the pass/fail result. */
+  result(): { errorDeg: number; pass: boolean } {
+    const errorDeg = wrapSignedDeg(this.gyro - this.attTotal);
+    return { errorDeg, pass: Math.abs(errorDeg) <= LOOP_CLOSURE_MAX_DEG };
+  }
 }

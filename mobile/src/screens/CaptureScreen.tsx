@@ -53,7 +53,14 @@ import {
   wrap360,
 } from '../capture/orientation';
 import { CAPTURE_TUNING as T } from '../capture/tuning';
-import { FusionState, basisWithHeading, fuseHeading, headingOf, headingRateDegPerSec } from '../capture/yawFusion';
+import {
+  FusionState,
+  LoopClosure,
+  basisWithHeading,
+  fuseHeading,
+  headingOf,
+  headingRateDegPerSec,
+} from '../capture/yawFusion';
 import { hfovFromExif } from '../capture/lensFov';
 import {
   AimTracker,
@@ -358,6 +365,10 @@ export default function CaptureScreen({ navigation, route }: Props) {
   /** When and where the last photo was taken: gates the next dot (cooldown + 10° turn). */
   const lastShotAtRef = useRef<number | null>(null);
   const lastShotLookRef = useRef<Vec3 | null>(null);
+  /** Gyro-only heading from the first shot, for the loop-closure drift check. */
+  const loopRef = useRef(new LoopClosure());
+  const loopReportedRef = useRef(false);
+  const lastAttRef = useRef<number | null>(null);
   /** EXIF-calibrated FOV already applied for this session. */
   const exifFovRef = useRef(false);
   const reduceRef = useRef(reduceMotion);
@@ -540,6 +551,14 @@ export default function CaptureScreen({ navigation, route }: Props) {
         if (originRef.current == null) {
           originRef.current = headingAtShutter;
           originSV.value = headingAtShutter;
+          if (lastAttRef.current != null) loopRef.current.start(lastAttRef.current);
+          loopReportedRef.current = false;
+        }
+        // Back at the first shot after a full turn: log the loop-closure drift (flag > 3°).
+        if (!loopReportedRef.current && loopRef.current.started && Math.abs(loopRef.current.turnedDeg) > 330) {
+          loopReportedRef.current = true;
+          const { errorDeg, pass } = loopRef.current.result();
+          console.log(`[capture] loop closure drift ${errorDeg.toFixed(2)}° ${pass ? 'PASS' : 'FAIL (>3°)'}`);
         }
         actualYaw = wrap360(headingAtShutter - originRef.current);
       }
@@ -623,6 +642,8 @@ export default function CaptureScreen({ navigation, route }: Props) {
       const attHeading = headingOf(axes.forward);
       const gyroRate = data.rotationRate ? headingRateDegPerSec(data.rotationRate, axes) : 0;
       const heading = fuseHeading(fusion, attHeading, gyroRate, dtSec, T.headingDriftTauSec);
+      lastAttRef.current = attHeading;
+      loopRef.current.update(attHeading, gyroRate, dtSec);
       const raw = basisWithHeading(axes, heading);
       // Light, continuous smoothing (no dead zone): follows the camera tightly.
       const shown = basisFromForwardUp(forwardFilter.filter(raw.look, t), upFilter.filter(raw.up, t));

@@ -8,6 +8,7 @@ import {
   headingOf,
   headingRateDegPerSec,
   wrapSignedDeg,
+  LoopClosure,
 } from './yawFusion';
 import { CAPTURE_TUNING } from './tuning';
 
@@ -114,4 +115,27 @@ test('basisWithHeading keeps pitch and sets heading', () => {
   const b = basisWithHeading(a, 77);
   assert.ok(Math.abs(wrapSignedDeg(headingOf(b.look) - 77)) < 1e-6);
   assert.ok(Math.abs(b.look.z - a.forward.z) < 1e-9);
+});
+
+test('compass correction is a slow blend, never a snap', () => {
+  const state: FusionState = { yaw: null };
+  fuseHeading(state, 0, 0, 0, 6);
+  const next = fuseHeading(state, 40, 0, 1 / 60, 6); // compass leaps 40°
+  assert.ok(Math.abs(next) < 0.5, `${next}`);
+});
+
+test('loop closure flags drift above 3°', () => {
+  const dt = 1 / 60;
+  const good = new LoopClosure();
+  good.start(10);
+  const bad = new LoopClosure();
+  bad.start(10);
+  for (let i = 1; i <= 720; i += 1) {
+    const att = 10 + (360 * i) / 720; // a full turn in 12 s
+    good.update(att, 30 + 0.1, dt); // gyro bias 0.1°/s -> 1.2° drift
+    bad.update(att, 30 + 0.5, dt); // gyro bias 0.5°/s -> 6° drift
+  }
+  assert.ok(good.result().pass, String(good.result().errorDeg));
+  assert.equal(bad.result().pass, false);
+  assert.ok(Math.abs(bad.result().errorDeg - 6) < 0.5, String(bad.result().errorDeg));
 });
