@@ -538,7 +538,7 @@ def test_reupload_queues_old_world_deletes_before_clearing_ids(client):
     assert "world-old" in queued
     assert "draft-old" in queued
     body = client.get(f"/api/v1/projects/{project_id}").json()
-    assert body["world_marble_url"] is None
+    assert body["world_ready"] is False
 
 
 def test_staging_failure_without_a_provider_message_is_failed(client, monkeypatch):

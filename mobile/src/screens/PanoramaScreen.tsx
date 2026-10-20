@@ -79,11 +79,8 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     project?.active_job === 'staged_world' ||
     project?.status === 'generating_3d' ||
     project?.status === 'delayed';
-  const originalDraftReady = Boolean(project?.world_preview_url) && !project?.world_marble_url && buildingWorld;
-  const stagedDraftReady =
-    Boolean(project?.staged_world_preview_url) &&
-    !project?.staged_world_marble_url &&
-    project?.active_job === 'staged_world';
+  const originalDraftReady = Boolean(project?.world_draft_ready) && buildingWorld;
+  const stagedDraftReady = Boolean(project?.staged_world_draft_ready) && project?.active_job === 'staged_world';
   // Elapsed time is measured from when this screen first saw the build. The
   // backend does not expose a start time, so it is a lower bound.
   useEffect(() => {
@@ -226,9 +223,9 @@ export default function PanoramaScreen({ navigation, route }: Props) {
     if (project?.has_staged) {
       items.push({
         label:
-          project.staged_world_preview_url && !project.staged_world_marble_url
+          project.staged_world_draft_ready
             ? 'View staged 3D preview'
-            : project.staged_world_marble_url || project.staged_world_viewer_url
+            : project.staged_world_ready || project.staged_world_viewer_url
               ? 'View staged 3D'
               : 'Create staged 3D',
         onPress: () => {
@@ -410,9 +407,9 @@ export default function PanoramaScreen({ navigation, route }: Props) {
             accessibilityState={{ disabled: !project?.has_original }}
           >
             <Text style={styles.primaryText}>
-              {project?.world_marble_url
+              {project?.world_ready
                 ? 'View 3D tour'
-                : project?.world_preview_url
+                : project?.world_draft_ready
                   ? '3D preview ready'
                   : 'View 3D tour'}
             </Text>

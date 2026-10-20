@@ -390,21 +390,15 @@ async def get_generate_3d_status(project_id: str, request: Request):
     if project.panorama_key and (project.world_provider or project.world_marble_url or project.world_preview_url):
         assets = {
             "viewer_url": f"{share}/world",
-            "marble_url": project.world_marble_url,
-            "preview_url": project.world_preview_url,
-            "splat_url": project.world_splat_url,
-            "mesh_url": project.world_mesh_url,
-            "thumbnail_url": project.world_thumbnail_url,
+            "ready": bool(project.world_marble_url),
+            "draft_ready": bool(project.world_preview_url) and not project.world_marble_url,
         }
     staged_assets = None
     if project.staged_key and (project.staged_world_provider or project.staged_world_marble_url):
         staged_assets = {
             "viewer_url": f"{private}/world?source=staged",
-            "marble_url": project.staged_world_marble_url,
-            "preview_url": project.staged_world_preview_url,
-            "splat_url": project.staged_world_splat_url,
-            "mesh_url": project.staged_world_mesh_url,
-            "thumbnail_url": project.staged_world_thumbnail_url,
+            "ready": bool(project.staged_world_marble_url),
+            "draft_ready": bool(project.staged_world_preview_url) and not project.staged_world_marble_url,
         }
     return {
         "status": project.status,

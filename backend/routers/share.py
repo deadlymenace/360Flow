@@ -86,13 +86,15 @@ def _world_page(project: ProjectRecord, asset_base: str, source: str, *, private
     staged_source = source == "staged"
     if staged_source and not show_staged:
         raise HTTPException(status_code=404, detail="Staged panorama not ready yet")
+    # The Marble page is private to our API account and the CDN asset URLs are
+    # unsigned capability links, so neither is ever put in this HTML.
     if staged_source:
-        marble = valid_marble_url(project.staged_world_marble_url) or valid_marble_url(project.staged_world_preview_url)
-        preview = bool(marble and project.staged_world_preview_url and not project.staged_world_marble_url)
+        ready = bool(valid_marble_url(project.staged_world_marble_url) or valid_marble_url(project.staged_world_preview_url))
+        preview = bool(ready and project.staged_world_preview_url and not project.staged_world_marble_url)
         generating = project.active_job == "staged_world"
     else:
-        marble = valid_marble_url(project.world_marble_url) or valid_marble_url(project.world_preview_url)
-        preview = bool(marble and valid_marble_url(project.world_preview_url) and not project.world_marble_url)
+        ready = bool(valid_marble_url(project.world_marble_url) or valid_marble_url(project.world_preview_url))
+        preview = bool(ready and valid_marble_url(project.world_preview_url) and not project.world_marble_url)
         generating = project.active_job == "world" or (
             project.status == "generating_3d" and project.active_job != "staged_world"
         )
@@ -102,7 +104,7 @@ def _world_page(project: ProjectRecord, asset_base: str, source: str, *, private
     html = render_world_page(
         title=project.name,
         asset_base=asset_base,
-        marble_url=marble,
+        world_ready=ready,
         has_staged=show_staged,
         staged_source=staged_source,
         preview=preview,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import asyncio
 import threading
 import time
@@ -115,7 +117,8 @@ def test_resume_repolls_world_operation_without_generating(client, monkeypatch):
     assert asyncio.run(pipeline.resume_durable_jobs()) == 1
     body = client.get(f"/api/v1/projects/{project_id}").json()
     assert body["status"] == "complete"
-    assert body["world_marble_url"].endswith("/world-resumed")
+    assert body["world_ready"] is True
+    assert "world_marble_url" not in body
     assert calls["poll"] == ["op-full"]
     assert calls["generate"] == 0
     assert body["provider_error"] is None
@@ -156,8 +159,9 @@ def test_resumed_draft_continues_to_the_full_model(client, monkeypatch):
     body = client.get(f"/api/v1/projects/{project_id}").json()
     assert calls == {"generate": 0, "full": 1}
     assert body["status"] == "complete"
-    assert body["world_marble_url"].endswith("/world-full")
-    assert body["world_preview_url"].endswith("/world-draft")
+    assert body["world_ready"] is True
+    assert body["world_draft_ready"] is False
+    assert "marble.worldlabs.ai" not in json.dumps(body) and "cdn." not in json.dumps(body)
 
 
 def test_resume_does_not_recharge_without_an_operation_id(client, monkeypatch):
@@ -257,7 +261,7 @@ def test_out_of_credits_delays_the_tour_until_credits_return(client, monkeypatch
     assert asyncio.run(pipeline.retry_delayed_worlds()) == 1
     finished = client.get(f"/api/v1/projects/{project_id}").json()
     assert finished["status"] == "complete"
-    assert finished["world_marble_url"].endswith("/world-later")
+    assert finished["world_ready"] is True
     assert finished["error"] is None
     assert calls["n"] == 2
 

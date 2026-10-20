@@ -371,7 +371,7 @@ def render_world_page(
     *,
     title: str,
     asset_base: str,
-    marble_url: str | None,
+    world_ready: bool,
     has_staged: bool,
     staged_source: bool = False,
     preview: bool = False,
@@ -380,28 +380,22 @@ def render_world_page(
 ) -> str:
     safe_title = escape(title)
     base = escape(asset_base, quote=True)
-    if marble_url:
-        safe_url = escape(marble_url, quote=True)
-        canvas = (
-            f'<iframe class="world" src="{safe_url}" allow="fullscreen; xr-spatial-tracking" '
-            f'allowfullscreen title="3D world"></iframe>'
-        )
+    canvas = '<canvas id="c"></canvas>'
+    marble_js = "null"
+    if world_ready:
         if waiting:
             lead = waiting
         elif staged_source:
-            lead = "Navigable 3D world of the virtually staged room."
+            lead = "The 3D world of the virtually staged room is ready."
         elif preview:
-            lead = "Fast 3D preview. The full walkthrough is still generating."
+            lead = "A fast 3D preview is ready. The full walkthrough is still generating."
         else:
-            lead = "Navigable 3D walkthrough."
+            lead = "The 3D walkthrough is ready."
         note = (
             f'<div class="note">{lead} '
-            f'<a class="btn" href="{safe_url}">Open in Marble</a> '
             f'<a class="btn" href="{base}/?view=compare">Compare panorama</a></div>'
         )
-        marble_js = "true"
     else:
-        canvas = '<canvas id="c"></canvas>'
         if waiting:
             message = waiting
         elif staged_source:
@@ -414,7 +408,6 @@ def render_world_page(
             f'<div class="note">{message} '
             f'<a class="btn" href="{base}/?view=compare">Compare with the original panorama</a></div>'
         )
-        marble_js = "null"
     chip_class = "" if staged_source else "hide"
     controls = f'<a class="btn" href="{base}/">Back to panorama</a>'
     if has_staged:
@@ -423,8 +416,6 @@ def render_world_page(
         else:
             controls = f'<a class="btn" href="{base}/world?source=staged">Staged 3D</a> ' + controls
         controls = f'<a class="btn" href="{base}/?view=compare">Compare</a> ' + controls
-    if marble_url:
-        controls = f'<a class="btn" href="{escape(marble_url, quote=True)}">Open in Marble</a> ' + controls
     return _fill(
         {
             "__TITLE__": safe_title,

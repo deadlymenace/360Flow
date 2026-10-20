@@ -43,10 +43,10 @@ export default function WorldScreen({ navigation, route }: Props) {
     };
   }, [projectId]);
 
-  const fullUrl = staged ? project?.staged_world_marble_url : project?.world_marble_url;
-  const previewUrl = staged ? project?.staged_world_preview_url : project?.world_preview_url;
-  const viewerUrl = fullUrl || previewUrl || (staged ? project?.staged_world_viewer_url : project?.world_viewer_url) || null;
-  const showingDraft = Boolean(previewUrl && !fullUrl);
+  // Always our own viewer page: the Marble page is private to our API account
+  // ("You don't have permission to view this world") and provider URLs never reach the app.
+  const viewerUrl = (staged ? project?.staged_world_viewer_url : project?.world_viewer_url) || null;
+  const showingDraft = Boolean(staged ? project?.staged_world_draft_ready : project?.world_draft_ready);
   const delayed = project?.status === 'delayed';
   const stillGenerating =
     project?.status === 'generating_3d' ||
@@ -113,7 +113,7 @@ export default function WorldScreen({ navigation, route }: Props) {
             </Text>
           </View>
         )}
-        {waitedLong && stillGenerating && !fullUrl && !showingDraft && (
+        {waitedLong && stillGenerating && !(staged ? project?.staged_world_ready : project?.world_ready) && !showingDraft && (
           <View style={styles.draft} pointerEvents="none">
             <Text style={styles.draftText}>Taking longer than usual. Still building the full walkthrough.</Text>
           </View>
