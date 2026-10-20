@@ -13,21 +13,29 @@ from fastapi.responses import FileResponse
 
 router = APIRouter()
 
-_VENDOR = Path(__file__).resolve().parent.parent / "static" / "vendor"
+_STATIC = Path(__file__).resolve().parent.parent / "static"
+_VENDOR = _STATIC / "vendor"
 _FILES = {
     "three.module.min.js",
     "three.core.min.js",
     "spark-2.3.1.module.min.js",
     "three-addons-Pass.js",
 }
+# Our own page scripts (moved out of inline <script> so the CSP needs no
+# 'unsafe-inline'). Pages link them with ?v=<content hash>.
+_APP_FILES = {"pano-viewer.js", "splat-viewer.js"}
 
 
 @router.get("/viewer-assets/{name}")
 async def viewer_asset(name: str):
-    if name not in _FILES:
+    if name in _FILES:
+        path, cache = _VENDOR / name, "public, max-age=31536000, immutable"
+    elif name in _APP_FILES:
+        path, cache = _STATIC / "viewer" / name, "public, max-age=300"
+    else:
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(
-        _VENDOR / name,
+        path,
         media_type="text/javascript",
-        headers={"Cache-Control": "public, max-age=31536000, immutable", "X-Content-Type-Options": "nosniff"},
+        headers={"Cache-Control": cache, "X-Content-Type-Options": "nosniff"},
     )

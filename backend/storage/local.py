@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -27,7 +30,30 @@ class LocalStorage:
         path.write_bytes(data)
 
     def put_file(self, key: str, path: Path, content_type: str) -> None:
-        self.put_bytes(key, path.read_bytes(), content_type)
+        """Copy a file in chunks (large world files never sit in memory)."""
+        del content_type
+        dest = self._path(key)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".part")
+        shutil.copyfile(path, tmp)
+        os.replace(tmp, dest)
+
+    def open_stream(self, key: str, chunk_size: int = 1024 * 1024) -> tuple[Iterator[bytes], int]:
+        """(chunk iterator, size) for streaming a stored object to a client."""
+        path = self._path(key)
+        if not path.is_file():
+            raise FileNotFoundError(key)
+        size = path.stat().st_size
+
+        def chunks() -> Iterator[bytes]:
+            with path.open("rb") as handle:
+                while True:
+                    block = handle.read(chunk_size)
+                    if not block:
+                        return
+                    yield block
+
+        return chunks(), size
 
     def get_bytes(self, key: str) -> bytes:
         path = self._path(key)

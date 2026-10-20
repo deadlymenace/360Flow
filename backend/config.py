@@ -84,6 +84,7 @@ class Settings:
     global_daily_worlds_cap: int
     global_daily_credits_cap: int
     share_rate_per_minute: int
+    share_asset_rate_per_minute: int
     world_delay_max_hours: int
     world_delay_max_attempts: int
     job_claim_stale_seconds: int
@@ -198,6 +199,7 @@ def get_settings() -> Settings:
         global_daily_worlds_cap=max(0, _int("GLOBAL_DAILY_WORLDS_CAP", 100)),
         global_daily_credits_cap=max(0, _int("GLOBAL_DAILY_CREDITS_CAP", 30000)),
         share_rate_per_minute=max(1, _int("SHARE_RATE_PER_MINUTE", 60)),
+        share_asset_rate_per_minute=max(1, _int("SHARE_ASSET_RATE_PER_MINUTE", 300)),
         world_delay_max_hours=max(1, _int("WORLD_DELAY_MAX_HOURS", 24)),
         world_delay_max_attempts=max(1, _int("WORLD_DELAY_MAX_ATTEMPTS", 48)),
         job_claim_stale_seconds=max(30, _int("JOB_CLAIM_STALE_SECONDS", 120)),

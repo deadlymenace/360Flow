@@ -11,6 +11,7 @@ from auth import _admin_key_matches
 from config import get_settings
 from db import allow_shared_rate, device_id_for_token
 from ratelimit import limiter
+from viewer import IMPORTMAP_CSP_HASH
 
 _UPLOAD_OVERHEAD = 256 * 1024
 
@@ -91,9 +92,11 @@ def share_security_headers(query_string: bytes, ancestors: list[str]) -> list[tu
         "default-src 'none'; "
         "img-src 'self' data: blob:; "
         "style-src 'unsafe-inline'; "
-        # 'self' serves the vendored three.js + Spark modules (/viewer-assets);
-        # Spark compiles WASM and starts its sort worker from a blob/data URL.
-        "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: data:; "
+        # 'self' serves our viewer scripts and the vendored three.js + Spark
+        # modules (/viewer-assets). No inline scripts: the one static import
+        # map is allowed by hash. Spark compiles WASM ('wasm-unsafe-eval') and
+        # starts its sort worker from a blob/data URL (worker-src).
+        f"script-src 'self' '{IMPORTMAP_CSP_HASH}' 'wasm-unsafe-eval' blob:; "
         "worker-src blob: data:; "
         "connect-src 'self' blob: data:; "
         "base-uri 'none'; "
@@ -187,11 +190,14 @@ class GuardMiddleware:
             if not allow_shared_rate(_bucket(headers, ip), settings.rate_limit_per_minute, 60):
                 await _send_json(send, 429, {"detail": "Too many requests"})
                 return
-        if (path.startswith("/v/") or path.startswith("/p/")) and not limiter.allow(
-            f"share:{ip}", settings.share_rate_per_minute, 60
-        ):
-            await _send_json(send, 429, {"detail": "Too many requests"})
-            return
+        share_bucket = share_rate_bucket(path)
+        if share_bucket is not None:
+            limit = (
+                settings.share_rate_per_minute if share_bucket == "share-page" else settings.share_asset_rate_per_minute
+            )
+            if not limiter.allow(f"{share_bucket}:{ip}", limit, 60):
+                await _send_json(send, 429, {"detail": "Too many requests"})
+                return
 
         if method == "OPTIONS" and origin:
             if not allowed:
@@ -234,6 +240,24 @@ class GuardMiddleware:
             if not limiter.allow(f"register:{ip}", settings.device_registrations_per_hour, 3600):
                 return False
         return limiter.allow(_bucket(headers, ip), settings.rate_limit_per_minute, 60)
+
+
+_SHARE_FILE_SUFFIXES = (".spz", ".glb", ".jpg", ".jpeg", ".png", ".webp", ".js")
+
+
+def share_rate_bucket(path: str) -> str | None:
+    """Rate-limit bucket for public share traffic, separate from the API buckets.
+
+    HTML pages (/v/, /p/ and their /world routes) count against ``share-page``;
+    the files those pages load (splat, panorama, viewer scripts) against
+    ``share-asset``, so one 3D page view never eats the page budget. Neither
+    touches the per-device/IP API bucket.
+    """
+    if path.startswith("/viewer-assets/"):
+        return "share-asset"
+    if not (path.startswith("/v/") or path.startswith("/p/")):
+        return None
+    return "share-asset" if path.lower().endswith(_SHARE_FILE_SUFFIXES) else "share-page"
 
 
 def _has_nul(path: str, raw_path: bytes, query: bytes) -> bool:

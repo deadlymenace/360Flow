@@ -17,7 +17,7 @@ from services.world_urls import valid_marble_url
 from routers.responses import jpeg_response, labeled_jpeg
 from storage import get_storage
 from routers.projects import world_asset_response
-from services.world_assets import world_asset_bytes
+from services.world_assets import world_asset_stream
 from viewer import render_pano_page, render_splat_page, render_world_page
 
 router = APIRouter()
@@ -219,10 +219,10 @@ async def _world_splat(project: ProjectRecord, source: str, *, private: bool):
             raise HTTPException(status_code=404, detail="3D world not ready yet")
     elif not project.world_marble_url:
         raise HTTPException(status_code=404, detail="3D world not ready yet")
-    data = await world_asset_bytes(project, source, "spz")
-    if data is None:
+    found = await world_asset_stream(project, source, "spz")
+    if found is None:
         raise HTTPException(status_code=404, detail="3D world file not available")
-    return world_asset_response(data, "spz")
+    return world_asset_response(found, "spz")
 
 
 @router.get("/v/{token}/world.spz")

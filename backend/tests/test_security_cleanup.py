@@ -120,7 +120,7 @@ def test_share_pages_are_rate_limited_per_ip(client, monkeypatch):
     from ratelimit import limiter
 
     monkeypatch.setenv("SHARE_RATE_PER_MINUTE", "2")
-    limiter._hits.pop("share:testclient", None)
+    limiter._hits.pop("share-page:testclient", None)
     first = client.raw.get("/v/not-a-real-token")
     second = client.raw.get("/p/not-a-real-token")
     third = client.raw.get("/v/not-a-real-token")
@@ -128,7 +128,7 @@ def test_share_pages_are_rate_limited_per_ip(client, monkeypatch):
     assert second.status_code == 404
     assert third.status_code == 429
     assert third.json()["detail"] == "Too many requests"
-    limiter._hits.pop("share:testclient", None)
+    limiter._hits.pop("share-page:testclient", None)
 
 
 def test_json_responses_send_security_headers_and_share_pages_do_not_deny_frames(client):

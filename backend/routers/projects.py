@@ -7,7 +7,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from auth import Caller, require_caller
 from db import TRANSIENT_STATUSES, cancel_delayed_project, delete_project, get_project, rotate_share_token, update_project
@@ -19,7 +19,7 @@ from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
 from services.pipeline import enqueue_job, retry_delayed_project, start_job
 from services.uploads import normalize_upload
-from services.world_assets import world_asset_bytes
+from services.world_assets import world_asset_stream
 from services.world_gen import queue_unshared_world_deletes
 from storage import delete_project_assets, get_storage, panorama_key, staged_key, upload_key, world_asset_prefix
 from config import get_settings
@@ -420,17 +420,21 @@ async def get_generate_3d_status(project_id: str, request: Request):
     }
 
 
-def world_asset_response(data: bytes, kind: str) -> Response:
+WORLD_ASSET_HEADERS = {
+    # Private 3D files: never stored by browsers, proxies or shared caches.
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
+}
+
+
+def world_asset_response(found, kind: str) -> StreamingResponse:
+    """Stream a cached world file in chunks (never read whole into memory)."""
+    chunks, size = found
     media = "application/octet-stream" if kind == "spz" else "model/gltf-binary"
-    return Response(
-        content=data,
-        media_type=media,
-        headers={
-            # Private: no shared caches, never a public bucket URL.
-            "Cache-Control": "private, max-age=3600",
-            "Content-Disposition": f'inline; filename="world.{kind}"',
-        },
-    )
+    headers = {**WORLD_ASSET_HEADERS, "Content-Disposition": f'inline; filename="world.{kind}"'}
+    if size is not None:
+        headers["Content-Length"] = str(size)
+    return StreamingResponse(chunks, media_type=media, headers=headers)
 
 
 async def _project_world_asset(project_id: str, request: Request, source: str, kind: str) -> Response:
@@ -440,10 +444,10 @@ async def _project_world_asset(project_id: str, request: Request, source: str, k
     ready = project.staged_world_marble_url if source == "staged" else project.world_marble_url
     if not ready:
         raise HTTPException(status_code=404, detail="3D world not ready yet")
-    data = await world_asset_bytes(project, source, kind)
-    if data is None:
+    found = await world_asset_stream(project, source, kind)
+    if found is None:
         raise HTTPException(status_code=404, detail="3D world file not available")
-    return world_asset_response(data, kind)
+    return world_asset_response(found, kind)
 
 
 @router.get("/projects/{project_id}/world.spz")
