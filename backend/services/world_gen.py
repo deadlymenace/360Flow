@@ -326,6 +326,31 @@ def build_world_request(display_name: str, media_asset_id: str, model: str, publ
     }
 
 
+def _splat_size_rank(name: str) -> float:
+    """Approximate splat count of an ``spz_urls`` key ("100k", "500k", "2m", "full_res")."""
+    key = name.strip().lower()
+    if key in {"full", "full_res", "fullres"}:
+        return float("inf")
+    multiplier = {"k": 1e3, "m": 1e6}.get(key[-1:], 1.0)
+    digits = key[:-1] if key[-1:] in {"k", "m"} else key
+    try:
+        return float(digits) * multiplier
+    except ValueError:
+        return float("inf") - 1  # unknown labels sort just before full_res
+
+
+def smallest_splat_url(spz_urls: dict) -> str | None:
+    """Lowest-resolution splat: the one phones (iPhone WKWebView) can load.
+
+    The full-resolution file is ~30 MB and too heavy for the in-app viewer,
+    so only the smallest entry is cached and served.
+    """
+    candidates = [(name, url) for name, url in (spz_urls or {}).items() if isinstance(url, str) and url]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: _splat_size_rank(str(item[0])))[1]
+
+
 def parse_world(operation: dict) -> dict:
     world = operation.get("response") or {}
     metadata = operation.get("metadata") or {}
@@ -335,7 +360,7 @@ def parse_world(operation: dict) -> dict:
         marble = f"https://marble.worldlabs.ai/world/{world_id}"
     assets = world.get("assets") or {}
     splats = (assets.get("splats") or {}).get("spz_urls") or {}
-    splat = splats.get("full_res") or splats.get("500k") or splats.get("100k")
+    splat = smallest_splat_url(splats)
     mesh = (assets.get("mesh") or {}).get("collider_mesh_url")
     imagery = (assets.get("imagery") or {}).get("pano_url")
     return {

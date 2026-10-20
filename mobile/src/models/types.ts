@@ -18,13 +18,12 @@ export interface Project {
   staging_provider: string | null;
   world_provider: string | null;
   world_viewer_url: string | null;
-  world_marble_url: string | null;
-  world_thumbnail_url: string | null;
-  world_splat_url: string | null;
-  world_mesh_url: string | null;
-  world_preview_url: string | null;
-  staged_world_marble_url: string | null;
-  staged_world_preview_url: string | null;
+  /** Full 3D world finished. Provider URLs are never sent to the app. */
+  world_ready: boolean;
+  /** Fast draft world ready while the full one generates. */
+  world_draft_ready: boolean;
+  staged_world_ready: boolean;
+  staged_world_draft_ready: boolean;
   staged_world_viewer_url: string | null;
   staging_notes: string | null;
   staging_status: 'staging' | 'staged' | 'failed' | null;
@@ -56,7 +55,8 @@ export interface StatusResponse {
   staging_status?: 'staging' | 'staged' | 'failed' | null;
   staging_error?: string | null;
   world_provider?: string | null;
-  world_preview_url?: string | null;
+  world_ready?: boolean;
+  world_draft_ready?: boolean;
   active_job?: string | null;
   disclosure?: string | null;
 }
@@ -73,11 +73,8 @@ export interface StageStatus {
 
 export interface WorldAssets {
   viewer_url: string;
-  marble_url: string | null;
-  preview_url: string | null;
-  splat_url: string | null;
-  mesh_url: string | null;
-  thumbnail_url: string | null;
+  ready: boolean;
+  draft_ready: boolean;
 }
 
 export interface WorldStatus {
@@ -206,7 +203,7 @@ export function liveStatusLabel(project: Project): string {
   if (project.status === 'created') return 'Not captured yet · Tap to capture';
   if (project.status === 'delayed') return '3D delayed, finishing shortly';
   if (buildingWorld) {
-    if (project.world_preview_url && !project.world_marble_url) return '3D preview ready';
+    if (project.world_draft_ready) return '3D preview ready';
     return `Full tour in ~${FULL_ETA_MIN} min`;
   }
   if (project.staging_status === 'staging') return 'Staging…';

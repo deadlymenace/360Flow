@@ -69,6 +69,7 @@ from services.world_gen import (
     world_credits_balance,
     world_display_name,
 )
+from services.world_assets import cache_world_assets, clear_world_assets
 from storage import delete_project_assets, get_storage, panorama_key, staged_key
 
 logger = logging.getLogger(__name__)
@@ -904,6 +905,9 @@ async def _store_world(project_id: str, result: dict, staged_source: bool, creat
     _guard_write(project_id)
     operation_id = result.get("operation_id")
     stored_operation = operation_id[:64] if isinstance(operation_id, str) else None
+    source = "staged" if staged_source else "original"
+    # A regenerated world replaces the cached splat/mesh of the old one.
+    clear_world_assets(project_id, source)
     if staged_source:
         saved = update_project(
             project_id,
@@ -938,7 +942,9 @@ async def _store_world(project_id: str, result: dict, staged_source: bool, creat
         await delete_worlds(created_ids)
         delete_project_assets(project_id)
         return
-    logger.info("Project %s %s world ready via %s", project_id, "staged" if staged_source else "original", result.get("provider"))
+    logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
+    # Pull the splat and mesh into private storage now, so viewers never touch the CDN.
+    await cache_world_assets(project_id, source, result.get("splat_url"), result.get("mesh_url"))
 
 
 def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: bool) -> str | None:

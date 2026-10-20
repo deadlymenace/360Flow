@@ -101,7 +101,8 @@ def test_full_pipeline_with_mocks(client):
     assert world_status["status"] == "complete", world_status
     assert world_status["provider"] == "worldlabs_mock"
     assert world_status["assets"]["viewer_url"].endswith("/world")
-    assert world_status["assets"]["marble_url"] is None
+    assert "marble_url" not in world_status["assets"]
+    assert world_status["assets"]["ready"] is False
     assert world_status["disclosure"] is None
     assert world_status["staged_assets"] is None
 
@@ -135,7 +136,7 @@ def test_full_pipeline_with_mocks(client):
     assert staged_status["disclosure"] == DISCLOSURE_TEXT
     assert staged_status["assets"]["viewer_url"].endswith("/world")
     assert staged_status["staged_assets"]["viewer_url"].endswith("/world?source=staged")
-    assert staged_status["staged_assets"]["marble_url"] is None
+    assert "marble_url" not in staged_status["staged_assets"]
 
     project = client.get(f"/api/v1/projects/{project_id}").json()
     assert project["staged_published"] is False
@@ -623,8 +624,10 @@ def test_share_page_shows_draft_world_while_full_world_generates(client):
     )
     page = client.get(f"/v/{created['share_token']}/world")
     assert page.status_code == 200
-    assert "https://marble.worldlabs.ai/world/draft-1" in page.text
-    assert "Fast 3D preview" in page.text
+    # Private Marble pages and CDN links never appear in share HTML.
+    assert "marble.worldlabs.ai" not in page.text
+    assert "worldlabs" not in page.text
+    assert "fast 3D preview" in page.text
     assert "still generating" in page.text
 
 

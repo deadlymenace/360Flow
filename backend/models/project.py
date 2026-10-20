@@ -37,13 +37,13 @@ class Project(BaseModel):
     staging_provider: Optional[str] = None
     world_provider: Optional[str] = None
     world_viewer_url: Optional[str] = None
-    world_marble_url: Optional[str] = None
-    world_thumbnail_url: Optional[str] = None
-    world_splat_url: Optional[str] = None
-    world_mesh_url: Optional[str] = None
-    world_preview_url: Optional[str] = None
-    staged_world_marble_url: Optional[str] = None
-    staged_world_preview_url: Optional[str] = None
+    # Provider (World Labs / CDN) URLs are never returned: the CDN links are
+    # unsigned, non-expiring capability URLs. Clients only get state flags and
+    # our own viewer URLs.
+    world_ready: bool = False
+    world_draft_ready: bool = False
+    staged_world_ready: bool = False
+    staged_world_draft_ready: bool = False
     staged_world_viewer_url: Optional[str] = None
     staging_notes: Optional[str] = None
     staging_status: Optional[str] = None

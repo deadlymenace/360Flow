@@ -16,7 +16,9 @@ from db import ProjectRecord, get_by_preview_token, get_by_share_token
 from services.world_urls import valid_marble_url
 from routers.responses import jpeg_response, labeled_jpeg
 from storage import get_storage
-from viewer import render_pano_page, render_world_page
+from routers.projects import world_asset_response
+from services.world_assets import world_asset_bytes
+from viewer import render_pano_page, render_splat_page, render_world_page
 
 router = APIRouter()
 
@@ -86,15 +88,28 @@ def _world_page(project: ProjectRecord, asset_base: str, source: str, *, private
     staged_source = source == "staged"
     if staged_source and not show_staged:
         raise HTTPException(status_code=404, detail="Staged panorama not ready yet")
+    # The Marble page is private to our API account and the CDN asset URLs are
+    # unsigned capability links, so neither is ever put in this HTML.
     if staged_source:
-        marble = valid_marble_url(project.staged_world_marble_url) or valid_marble_url(project.staged_world_preview_url)
-        preview = bool(marble and project.staged_world_preview_url and not project.staged_world_marble_url)
+        ready = bool(valid_marble_url(project.staged_world_marble_url) or valid_marble_url(project.staged_world_preview_url))
+        preview = bool(ready and project.staged_world_preview_url and not project.staged_world_marble_url)
         generating = project.active_job == "staged_world"
     else:
-        marble = valid_marble_url(project.world_marble_url) or valid_marble_url(project.world_preview_url)
-        preview = bool(marble and valid_marble_url(project.world_preview_url) and not project.world_marble_url)
+        ready = bool(valid_marble_url(project.world_marble_url) or valid_marble_url(project.world_preview_url))
+        preview = bool(ready and valid_marble_url(project.world_preview_url) and not project.world_marble_url)
         generating = project.active_job == "world" or (
             project.status == "generating_3d" and project.active_job != "staged_world"
+        )
+    full_world = bool(project.staged_world_marble_url if staged_source else project.world_marble_url)
+    if full_world:
+        # Self-hosted Spark viewer; the splat streams from our private cache.
+        return HTMLResponse(
+            render_splat_page(
+                title=project.name,
+                asset_base=asset_base,
+                staged_source=staged_source,
+                has_staged=show_staged and bool(project.staged_world_marble_url),
+            )
         )
     waiting = ""
     if project.status == "delayed":
@@ -102,7 +117,7 @@ def _world_page(project: ProjectRecord, asset_base: str, source: str, *, private
     html = render_world_page(
         title=project.name,
         asset_base=asset_base,
-        marble_url=marble,
+        world_ready=ready,
         has_staged=show_staged,
         staged_source=staged_source,
         preview=preview,
@@ -194,3 +209,28 @@ async def staged_texture(token: str):
 @router.get("/p/{token}/texture.jpg")
 async def preview_staged_texture(token: str):
     return _texture_jpeg(_preview_project(token), private=True)
+
+
+async def _world_splat(project: ProjectRecord, source: str, *, private: bool):
+    if source not in {"original", "staged"}:
+        raise HTTPException(status_code=400, detail="source must be original or staged")
+    if source == "staged":
+        if not _show_staged(project, private=private) or not project.staged_world_marble_url:
+            raise HTTPException(status_code=404, detail="3D world not ready yet")
+    elif not project.world_marble_url:
+        raise HTTPException(status_code=404, detail="3D world not ready yet")
+    data = await world_asset_bytes(project, source, "spz")
+    if data is None:
+        raise HTTPException(status_code=404, detail="3D world file not available")
+    return world_asset_response(data, "spz")
+
+
+@router.get("/v/{token}/world.spz")
+async def world_splat(token: str, source: str = Query(default="original")):
+    """The share link's splat, served from our private cache (never the CDN URL)."""
+    return await _world_splat(_public_project(token), source, private=False)
+
+
+@router.get("/p/{token}/world.spz")
+async def preview_world_splat(token: str, source: str = Query(default="original")):
+    return await _world_splat(_preview_project(token), source, private=True)

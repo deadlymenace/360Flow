@@ -218,8 +218,12 @@ def test_rate_limit_after_a_charged_draft_resumes_by_polling(client, monkeypatch
     finished = client.get(f"/api/v1/projects/{project_id}").json()
     assert calls == {"generate": 1, "poll": 1, "full": 1}
     assert finished["status"] == "complete"
-    assert finished["world_marble_url"].endswith("/world-full")
-    assert finished["world_preview_url"].endswith("/world-draft")
+    assert finished["world_ready"] is True
+    from db import get_project
+
+    record = get_project(project_id)
+    assert record.world_marble_url.endswith("/world-full")
+    assert record.world_preview_url.endswith("/world-draft")
     assert get_job(job.id) is None
 
 
@@ -292,7 +296,10 @@ def test_regenerate_deletes_the_old_full_and_draft_worlds(client, monkeypatch, c
     assert "world-old" not in pending_world_delete_ids(force=True)
     assert "draft-old" not in pending_world_delete_ids(force=True)
     body = client.get(f"/api/v1/projects/{project_id}").json()
-    assert body["world_marble_url"].endswith("/world-new")
+    from db import get_project
+
+    assert body["world_ready"] is True
+    assert get_project(project_id).world_marble_url.endswith("/world-new")
 
 
 async def _async_none() -> None:

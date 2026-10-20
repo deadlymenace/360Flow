@@ -89,11 +89,13 @@ def share_security_headers(query_string: bytes, ancestors: list[str]) -> list[tu
         frame = "frame-ancestors 'none'"
     policy = (
         "default-src 'none'; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
         "style-src 'unsafe-inline'; "
-        "script-src 'unsafe-inline'; "
-        "frame-src https://marble.worldlabs.ai https://*.worldlabs.ai; "
-        "connect-src 'self'; "
+        # 'self' serves the vendored three.js + Spark modules (/viewer-assets);
+        # Spark compiles WASM and starts its sort worker from a blob/data URL.
+        "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' blob: data:; "
+        "worker-src blob: data:; "
+        "connect-src 'self' blob: data:; "
         "base-uri 'none'; "
         "form-action 'none'; "
         f"{frame}"

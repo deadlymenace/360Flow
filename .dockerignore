@@ -11,3 +11,4 @@ backend/storage/panoramas
 backend/storage/staged
 backend/storage/*.db
 **/.pytest_cache
+backend/storage/worlds
