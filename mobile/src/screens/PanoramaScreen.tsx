@@ -19,6 +19,7 @@ import WebViewFrame from '../components/WebViewFrame';
 import * as Sharing from 'expo-sharing';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList, ViewerMode } from '../navigation';
+import { DeleteProjectError, markDeleted } from '../services/deletePolicy';
 import { api } from '../services/api';
 import { DISCLOSURE_TEXT, DRAFT_ETA_S, FULL_ETA_MIN, Project, STAGING_PRESETS } from '../models/types';
 
@@ -198,10 +199,11 @@ export default function PanoramaScreen({ navigation, route }: Props) {
           style: 'destructive',
           onPress: async () => {
             try {
-              await api.deleteProject(projectId);
+              await api.deleteProject(projectId); // a 404 means already gone: fine
+              markDeleted(projectId);
               navigation.popToTop();
             } catch (err) {
-              Alert.alert('Could not delete', __DEV__ && err instanceof Error ? err.message : 'Try again');
+              Alert.alert('Could not delete', err instanceof DeleteProjectError ? err.message : 'Try again');
             }
           },
         },
