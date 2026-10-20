@@ -120,22 +120,6 @@ export class OneEuroVec3 {
   }
 }
 
-/**
- * Soft dead zone: the shown vector stays still until the filtered one is more
- * than `deadZoneDeg` away, then follows it, trailing by the dead-zone angle.
- */
-export function applyDeadZone(shown: Vec3 | null, target: Vec3, deadZoneDeg: number = CAPTURE_TUNING.deadZoneDeg): Vec3 {
-  if (!shown) return vnorm(target);
-  const angle = angleDeg(shown, target);
-  if (angle <= deadZoneDeg) return shown;
-  const t = (angle - deadZoneDeg) / angle;
-  return vnorm({
-    x: shown.x + (target.x - shown.x) * t,
-    y: shown.y + (target.y - shown.y) * t,
-    z: shown.z + (target.z - shown.z) * t,
-  });
-}
-
 /** Re-orthogonalise a smoothed up vector against a smoothed forward vector. */
 export function basisFromForwardUp(forward: Vec3, upHint: Vec3): { right: Vec3; up: Vec3; look: Vec3 } {
   const look = vnorm(forward);
@@ -149,28 +133,10 @@ export function basisFromForwardUp(forward: Vec3, upHint: Vec3): { right: Vec3; 
   return { right, up, look };
 }
 
-/** First-order low-pass on the gyro speed so one spiky sample does not reset a hold. */
-export class RateFilter {
-  private value: number | null = null;
-  constructor(private timeConstantMs: number = CAPTURE_TUNING.rateSmoothingMs) {}
-  update(rate: number, dtMs: number): number {
-    if (this.value == null) {
-      this.value = rate;
-      return rate;
-    }
-    const a = dtMs / (this.timeConstantMs + dtMs);
-    this.value += a * (rate - this.value);
-    return this.value;
-  }
-  reset(): void {
-    this.value = null;
-  }
-}
-
 export type AimInput = {
   /** Angle from the raw (unfiltered) forward vector to the target dot. */
   angleDeg: number;
-  /** Low-passed gyro speed. */
+  /** Raw (unsmoothed) gyro magnitude, deg/s. NaN/missing counts as not steady. */
   rateDegPerSec: number;
   dtMs: number;
   /** A capture is blocked right now (tilted, already capturing, no open dot). */
@@ -198,7 +164,7 @@ export class AimTracker {
 
   update(input: AimInput): AimState {
     const t = this.tuning;
-    const steady = input.rateDegPerSec <= t.steadyMaxDegPerSec;
+    const steady = Number.isFinite(input.rateDegPerSec) && input.rateDegPerSec <= t.steadyMaxDegPerSec;
     if (input.targetChanged || input.blocked) {
       this.locked = false;
       this.heldMs = 0;
@@ -210,12 +176,12 @@ export class AimTracker {
     } else if (input.angleDeg <= t.aimEnterDeg) {
       this.locked = true;
     }
-    if (!this.locked) {
+    // The hold must be one continuous steady second inside the cone:
+    // leaving the cone or any sample above the threshold resets it to 0.
+    if (!this.locked || !steady) {
       this.heldMs = 0;
-    } else if (steady) {
-      this.heldMs += input.dtMs;
     } else {
-      this.heldMs = Math.max(0, this.heldMs - input.dtMs * t.holdDrainRate);
+      this.heldMs += input.dtMs;
     }
     let fire = false;
     if (this.locked && this.heldMs >= t.holdMs) {
@@ -253,4 +219,20 @@ export class Cooldown {
     this.last = nowMs;
     return true;
   }
+}
+
+/**
+ * After a shot: no next-dot highlight and no auto-capture until the cooldown
+ * (which covers the shutter feedback) has passed AND the camera has turned
+ * away from the last shot by nextDotMinMoveDeg. Shots fire only from intent.
+ */
+export function nextDotReady(
+  nowMs: number,
+  lastShotAtMs: number | null,
+  degFromLastShot: number | null,
+  tuning = CAPTURE_TUNING,
+): boolean {
+  if (lastShotAtMs == null) return true;
+  if (nowMs - lastShotAtMs < tuning.shotCooldownMs) return false;
+  return degFromLastShot == null || degFromLastShot > tuning.nextDotMinMoveDeg;
 }

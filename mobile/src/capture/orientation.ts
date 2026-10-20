@@ -1,12 +1,6 @@
 import { SEGMENT_ANGLE, SEGMENT_COUNT } from '../models/types';
 
-/** Angular distance from the reticle at which a dot counts as aimed. */
-export const AIM_TOLERANCE_DEG = 4;
-/** Manual shutter still accepts the nearest dot inside half a step. */
-export const MANUAL_TOLERANCE_DEG = SEGMENT_ANGLE / 2;
-/** Rotation slower than this, held for AIM_HOLD_MS, starts a capture. */
-export const STEADY_MAX_DEG_PER_SEC = 14;
-export const AIM_HOLD_MS = 420;
+// Aim, hold and steady thresholds live in tuning.ts only.
 
 export type Vec3 = { x: number; y: number; z: number };
 export type Quat = { w: number; x: number; y: number; z: number };
@@ -36,15 +30,18 @@ export type ScreenPoint = {
 const DEG = 180 / Math.PI;
 
 export function wrap360(deg: number): number {
+  'worklet';
   return ((deg % 360) + 360) % 360;
 }
 
 export function wrapSigned(deg: number): number {
+  'worklet';
   const wrapped = wrap360(deg);
   return wrapped > 180 ? wrapped - 360 : wrapped;
 }
 
 export function targetYawDeg(index: number): number {
+  'worklet';
   return index * SEGMENT_ANGLE;
 }
 
@@ -70,6 +67,7 @@ export function previewFocalPx(
   hfovDeg: number,
   photoAspect = PORTRAIT_PHOTO_ASPECT,
 ): number {
+  'worklet';
   const halfTan = Math.tan(((hfovDeg * Math.PI) / 180) / 2);
   const viewAspect = viewWidth / Math.max(viewHeight, 1);
   const displayedPhotoWidth = viewAspect < photoAspect ? viewHeight * photoAspect : viewWidth;
@@ -78,6 +76,7 @@ export function previewFocalPx(
 
 /** Horizon direction at `headingFromLook`. Pitch above the horizon is degrees. */
 export function directionFromYawPitch(yawDeg: number, pitchDeg = 0): Vec3 {
+  'worklet';
   const yaw = (yawDeg * Math.PI) / 180;
   const pitch = (pitchDeg * Math.PI) / 180;
   const cosP = Math.cos(pitch);
@@ -119,10 +118,12 @@ export function cameraBasis(yawRad: number, pitchRad: number, rollRad: number): 
 }
 
 export function dot(a: Vec3, b: Vec3): number {
+  'worklet';
   return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
 export function angleBetweenDeg(a: Vec3, b: Vec3): number {
+  'worklet';
   const c = Math.min(1, Math.max(-1, dot(a, b)));
   return Math.acos(c) * DEG;
 }
@@ -134,6 +135,7 @@ export function projectToScreen(
   height: number,
   hfovDeg: number,
 ): ScreenPoint {
+  'worklet';
   const x = dot(target, basis.right);
   const y = dot(target, basis.up);
   const z = dot(target, basis.look);
@@ -310,7 +312,8 @@ export function basisFromQuat(q: Quat): CameraBasis {
 }
 
 export function rotationRateDegPerSec(rate: { alpha: number; beta: number; gamma: number } | null): number {
-  if (!rate) return 0;
+  // Missing gyro data is NaN (not 0) so the steady check never treats it as still.
+  if (!rate) return NaN;
   return Math.hypot(rate.alpha, rate.beta, rate.gamma);
 }
 

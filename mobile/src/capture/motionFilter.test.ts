@@ -4,10 +4,9 @@ import {
   AimTracker,
   Cooldown,
   OneEuroVec3,
-  RateFilter,
   YawUnwrapper,
+  nextDotReady,
   angleDeg,
-  applyDeadZone,
   basisFromForwardUp,
   deviceAxes,
   manualShotAllowed,
@@ -67,15 +66,6 @@ test('one-euro filter follows a real turn', () => {
   assert.ok(lag >= 0 && lag < 10, `lag ${lag.toFixed(1)}°`);
 });
 
-test('dead zone ignores small moves and follows big ones', () => {
-  const shown = { x: 0, y: 1, z: 0 };
-  const small = { x: Math.sin(1 * RAD), y: Math.cos(1 * RAD), z: 0 };
-  assert.deepEqual(applyDeadZone(shown, small, 1.5), shown);
-  const big = { x: Math.sin(10 * RAD), y: Math.cos(10 * RAD), z: 0 };
-  const moved = applyDeadZone(shown, big, 1.5);
-  assert.ok(Math.abs(angleDeg(moved, big) - 1.5) < 0.05);
-});
-
 test('yaw unwrapping has no jump at 360 → 0', () => {
   const u = new YawUnwrapper();
   const out = [358, 359, 0.5, 2, 1, 359.5].map((y) => u.update(y));
@@ -95,36 +85,11 @@ test('aim hysteresis: enter inside enterDeg, stay locked until beyond exitDeg', 
   assert.equal(step(CAPTURE_TUNING.aimExitDeg + 0.5).locked, false);
 });
 
-test('auto-capture needs a steady hold; shaking drains instead of resetting', () => {
-  const aim = new AimTracker();
-  let fired = 0;
-  let t = 0;
-  while (t < CAPTURE_TUNING.holdMs - 50) {
-    if (aim.update({ angleDeg: 2, rateDegPerSec: 3, dtMs: 16, blocked: false }).fire) fired += 1;
-    t += 16;
-  }
-  assert.equal(fired, 0);
-  const shaky = aim.update({ angleDeg: 2, rateDegPerSec: 40, dtMs: 16, blocked: false });
-  assert.equal(shaky.steady, false);
-  assert.ok(shaky.progress > 0.5, 'one shaky sample does not wipe the hold');
-  let state = shaky;
-  for (let i = 0; i < 20 && !state.fire; i += 1) {
-    state = aim.update({ angleDeg: 2, rateDegPerSec: 3, dtMs: 16, blocked: false });
-  }
-  assert.equal(state.fire, true);
-});
-
 test('blocked (tilted) never fires', () => {
   const aim = new AimTracker();
   for (let i = 0; i < 100; i += 1) {
     assert.equal(aim.update({ angleDeg: 0, rateDegPerSec: 0, dtMs: 16, blocked: true }).fire, false);
   }
-});
-
-test('rate filter smooths a single spike', () => {
-  const f = new RateFilter(120);
-  f.update(2, 16);
-  assert.ok(f.update(80, 16) < 15);
 });
 
 test('manual shutter: wider ring allowed, tilt over the limit blocked', () => {
@@ -148,9 +113,74 @@ test('haptic cooldown: at most one buzz per cooldown window', () => {
   assert.equal(c.tryFire(1600), true);
 });
 
-test('tuning: exit 9°, hold 300 ms, cooldown 600 ms', () => {
-  assert.equal(CAPTURE_TUNING.aimExitDeg, 9);
-  assert.equal(CAPTURE_TUNING.holdMs, 300);
+test('tuning: enter 3°/exit 7°, hold 1 s, steady 3°/s raw, shot cooldown 800 ms', () => {
+  assert.equal(CAPTURE_TUNING.aimEnterDeg, 3);
+  assert.equal(CAPTURE_TUNING.aimExitDeg, 7);
+  assert.equal(CAPTURE_TUNING.holdMs, 1000);
+  assert.equal(CAPTURE_TUNING.steadyMaxDegPerSec, 3);
+  assert.equal('holdDrainRate' in CAPTURE_TUNING, false);
+  assert.equal('rateSmoothingMs' in CAPTURE_TUNING, false);
+  assert.equal(CAPTURE_TUNING.shotCooldownMs, 800);
+  assert.equal(CAPTURE_TUNING.nextDotMinMoveDeg, 10);
+  assert.equal(CAPTURE_TUNING.debugAimLog, false);
   assert.equal(CAPTURE_TUNING.hapticCooldownMs, 600);
   assert.ok(CAPTURE_TUNING.aimExitDeg > CAPTURE_TUNING.aimEnterDeg);
+});
+
+test('next dot waits for the cooldown and a 10° turn', () => {
+  assert.equal(nextDotReady(1000, null, null), true);
+  assert.equal(nextDotReady(1500, 1000, 30), false); // cooling down
+  assert.equal(nextDotReady(1900, 1000, 4), false); // has not turned yet
+  assert.equal(nextDotReady(1900, 1000, 12), true);
+});
+
+const still = (rate: number, angle = 1) => ({ angleDeg: angle, rateDegPerSec: rate, dtMs: 16, blocked: false, targetChanged: false });
+
+test('steady hold: fires only after 1 s of continuous raw rate <= 3°/s', () => {
+  const tracker = new AimTracker();
+  let t = 0;
+  let state = tracker.update(still(2.9));
+  while (!state.fire) {
+    t += 16;
+    assert.ok(t < 1100, 'never fired');
+    state = tracker.update(still(2.9));
+  }
+  assert.ok(t >= CAPTURE_TUNING.holdMs - 16, `fired early at ${t} ms`);
+});
+
+test('slow turn at 4–5°/s never fires', () => {
+  const tracker = new AimTracker();
+  for (let i = 0; i < 600; i += 1) {
+    const rate = 4 + (i % 10) / 10; // 4.0–4.9 deg/s
+    const s = tracker.update(still(rate));
+    assert.equal(s.fire, false, `fired at sample ${i}`);
+    assert.equal(s.progress, 0);
+  }
+});
+
+test('one spike resets the hold to 0 (no draining)', () => {
+  const tracker = new AimTracker();
+  for (let i = 0; i < 50; i += 1) assert.equal(tracker.update(still(1)).fire, false); // 800 ms
+  const spike = tracker.update(still(3.5));
+  assert.equal(spike.steady, false);
+  assert.equal(spike.progress, 0);
+  // A full second is needed again from here.
+  let t = 0;
+  while (!tracker.update(still(1)).fire) t += 16;
+  assert.ok(t >= CAPTURE_TUNING.holdMs - 32, `refilled in ${t} ms`);
+});
+
+test('missing / NaN gyro rate is never steady', () => {
+  const tracker = new AimTracker();
+  for (let i = 0; i < 100; i += 1) {
+    const s = tracker.update(still(NaN));
+    assert.equal(s.steady, false);
+    assert.equal(s.fire, false);
+  }
+});
+
+test('leaving the aim cone resets the hold', () => {
+  const tracker = new AimTracker();
+  for (let i = 0; i < 50; i += 1) tracker.update(still(1));
+  assert.equal(tracker.update(still(1, CAPTURE_TUNING.aimExitDeg + 1)).progress, 0);
 });

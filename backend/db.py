@@ -59,6 +59,7 @@ class ProjectRow(Base):
     owner_device_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     hfov_deg: Mapped[float | None] = mapped_column(Float, nullable=True)
     yaws_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pitches_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     lens: Mapped[str | None] = mapped_column(String(64), nullable=True)
     panorama_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     staged_key: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -167,6 +168,7 @@ class PendingDraftCleanupRow(Base):
 # Types in this map are sent as raw DDL to both SQLite and Postgres.
 # TIMESTAMP and TIMESTAMP WITH TIME ZONE are valid in both. DATETIME is not a Postgres type and crashes startup.
 _EXTRA_COLUMNS = {
+    "pitches_json": "TEXT",
     "world_preview_url": "TEXT",
     "world_preview_id": "VARCHAR(64)",
     "staged_world_provider": "VARCHAR(32)",
@@ -218,6 +220,7 @@ class ProjectRecord:
     owner_device_id: str | None
     hfov_deg: float | None
     yaws_json: str | None
+    pitches_json: str | None
     lens: str | None
     panorama_key: str | None
     staged_key: str | None
@@ -424,6 +427,7 @@ def _record(row: ProjectRow) -> ProjectRecord:
         owner_device_id=row.owner_device_id,
         hfov_deg=row.hfov_deg,
         yaws_json=row.yaws_json,
+        pitches_json=row.pitches_json,
         lens=row.lens,
         panorama_key=row.panorama_key,
         staged_key=row.staged_key,

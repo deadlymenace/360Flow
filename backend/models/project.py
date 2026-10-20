@@ -51,6 +51,8 @@ class Project(BaseModel):
     active_job: Optional[str] = None
     disclosure: Optional[str] = None
     provider_error: Optional[str] = None
+    # Operator-only capture debug (None for device callers).
+    debug: Optional[dict] = None
 
 
 class CreateProjectRequest(BaseModel):
@@ -64,4 +66,5 @@ class StageRequest(BaseModel):
 class UploadMetadata(BaseModel):
     hfov_deg: Optional[float] = None
     yaws_deg: Optional[list[float]] = None
+    pitches_deg: Optional[list[float]] = None
     lens: Optional[str] = Field(default=None, max_length=64)

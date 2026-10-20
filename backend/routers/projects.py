@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import json
 import logging
 
@@ -69,6 +70,12 @@ def _parse_metadata(raw: str | None, count: int) -> UploadMetadata:
         raise HTTPException(status_code=400, detail="hfov_deg must be between 30 and 150")
     if meta.yaws_deg is not None and len(meta.yaws_deg) != count:
         raise HTTPException(status_code=400, detail="yaws_deg must have one value per image")
+    if meta.pitches_deg is not None and len(meta.pitches_deg) != count:
+        raise HTTPException(status_code=400, detail="pitches_deg must have one value per image")
+    # Omitted pitch (build 7 clients) is fine: it means "not sent". A sent
+    # pitch must be a real number within ±90°; NaN/inf is rejected, not coerced.
+    if meta.pitches_deg is not None and any(not math.isfinite(p) or abs(p) > 90 for p in meta.pitches_deg):
+        raise HTTPException(status_code=400, detail="pitches_deg must be finite and within ±90")
     return meta
 
 
@@ -197,6 +204,7 @@ async def upload_images(
             "provider_error": None,
             "hfov_deg": meta.hfov_deg,
             "yaws_json": json.dumps(meta.yaws_deg) if meta.yaws_deg is not None else None,
+            "pitches_json": json.dumps(meta.pitches_deg) if meta.pitches_deg is not None else None,
             "lens": meta.lens,
             "panorama_key": None,
             "staged_key": None,

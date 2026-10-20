@@ -189,3 +189,81 @@ def test_refinement_still_closes_the_loop(tmp_path: Path):
     x, y = _marker_centroid(panorama, (0, 0, 255))
     assert abs(x - width / 2) < width * 0.03
     assert abs(y - height / 2) < height * 0.04
+
+
+def _views_at(equirect, directory: Path, yaws, pitches, view_w=360, view_h=480):
+    directory.mkdir(parents=True, exist_ok=True)
+    for index, (yaw, pitch) in enumerate(zip(yaws, pitches)):
+        view = render_perspective(equirect, yaw, HFOV, view_w, view_h, pitch_deg=pitch)
+        assert cv2.imwrite(str(directory / f"{index:02d}.png"), view)
+
+
+def _band_error(output: Path, equirect: np.ndarray) -> float:
+    pano = cv2.imread(str(output)).astype(np.float32)
+    truth = cv2.resize(equirect, (pano.shape[1], pano.shape[0]), interpolation=cv2.INTER_AREA).astype(np.float32)
+    h = pano.shape[0]
+    band = slice(int(h * 0.4), int(h * 0.6))
+    return float(np.abs(pano[band] - truth[band]).mean())
+
+
+def test_reversed_yaws_scramble_the_panorama(tmp_path: Path):
+    """Yaw must increase clockwise (turning right). Counter-clockwise yaws, as the
+    app sent before the deviceAxes fix, place every photo mirrored around the loop."""
+    equirect = _make_equirect()
+    yaws = [index * (360.0 / SEGMENT_COUNT) for index in range(SEGMENT_COUNT)]
+    _views_at(equirect, tmp_path / "views", yaws, [0.0] * SEGMENT_COUNT)
+    paths = sorted((tmp_path / "views").glob("*.png"))
+    good = tmp_path / "good.jpg"
+    bad = tmp_path / "bad.jpg"
+    assert stitch_images(paths, good, yaws_deg=yaws, hfov_deg=HFOV, refine=False)
+    reversed_yaws = [(-yaw) % 360.0 for yaw in yaws]
+    assert stitch_images(paths, bad, yaws_deg=reversed_yaws, hfov_deg=HFOV, refine=False)
+    good_err, bad_err = _band_error(good, equirect), _band_error(bad, equirect)
+    assert good_err < 20, good_err
+    assert bad_err > good_err * 2, (good_err, bad_err)
+
+
+def test_captured_pitch_is_used(tmp_path: Path):
+    equirect = _make_equirect(seed=5)
+    yaws = [index * (360.0 / SEGMENT_COUNT) for index in range(SEGMENT_COUNT)]
+    pitches = [10.0 if index % 2 else -10.0 for index in range(SEGMENT_COUNT)]
+    _views_at(equirect, tmp_path / "views", yaws, pitches)
+    paths = sorted((tmp_path / "views").glob("*.png"))
+    with_pitch = tmp_path / "with.jpg"
+    without = tmp_path / "without.jpg"
+    assert stitch_images(paths, with_pitch, yaws_deg=yaws, pitches_deg=pitches, hfov_deg=HFOV, refine=False)
+    assert stitch_images(paths, without, yaws_deg=yaws, hfov_deg=HFOV, refine=False)
+    assert _band_error(with_pitch, equirect) < _band_error(without, equirect) * 0.8
+
+
+def test_hfov_prefers_exif_on_clear_mismatch():
+    from services.stitcher import _resolve_hfov
+
+    assert _resolve_hfov(92.0, 90.0) == 92.0
+    assert _resolve_hfov(92.0, 53.0) == 53.0
+    assert _resolve_hfov(None, 70.0) == 70.0
+    assert _resolve_hfov(None, None) > 0
+
+
+def test_handheld_jitter_keeps_exposure_flat(tmp_path: Path):
+    """Uneven yaw steps and tilt must not create bright/dark bands (gain bug)."""
+    equirect = _make_equirect(seed=9)
+    rng = np.random.default_rng(4)
+    yaws = [index * (360.0 / SEGMENT_COUNT) + rng.uniform(-3, 3) for index in range(SEGMENT_COUNT)]
+    pitches = [rng.uniform(-6, 6) for _ in range(SEGMENT_COUNT)]
+    _views_at(equirect, tmp_path / "views", yaws, pitches)
+    paths = sorted((tmp_path / "views").glob("*.png"))
+    output = tmp_path / "pano.jpg"
+    assert stitch_images(paths, output, yaws_deg=yaws, pitches_deg=pitches, hfov_deg=HFOV, refine=False)
+    assert _band_error(output, equirect) < 15
+
+
+def test_resolve_pitches_never_coerces_nan():
+    import math
+
+    from services.stitcher import _resolve_pitches
+
+    assert _resolve_pitches([math.nan, 0.0], 2) is None
+    assert _resolve_pitches([math.inf, 0.0], 2) is None
+    assert _resolve_pitches(None, 2) is None
+    assert _resolve_pitches([60.0, -3.0], 2) == [45.0, -3.0]

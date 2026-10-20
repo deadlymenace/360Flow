@@ -21,7 +21,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 export default function ProcessingScreen({ navigation, route }: Props) {
-  const { projectId, projectName, imageUris, yaws, hfov, lens, retry } = route.params;
+  const { projectId, projectName, imageUris, yaws, pitches, hfov, lens, retry } = route.params;
   const insets = useSafeAreaInsets();
   const [phase, setPhase] = useState<Phase>('preparing');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -100,6 +100,7 @@ export default function ProcessingScreen({ navigation, route }: Props) {
         upload: () =>
           api.uploadImages(projectId, imageUris, {
             yaws,
+            pitches,
             hfov,
             lens,
             onStage: (stage) => mountedRef.current && setPhase(stage),
@@ -114,7 +115,7 @@ export default function ProcessingScreen({ navigation, route }: Props) {
     } finally {
       busyRef.current = false;
     }
-  }, [projectId, imageUris, yaws, hfov, lens, startPolling]);
+  }, [projectId, imageUris, yaws, pitches, hfov, lens, startPolling]);
 
   const startRetry = useCallback(async () => {
     try {

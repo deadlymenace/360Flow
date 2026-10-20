@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
+import { validPitch } from '../capture/pitch';
 import {
   View,
   Text,
@@ -16,6 +17,14 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { DeviceMotion, DeviceMotionMeasurement } from 'expo-sensors';
 import Svg, { Circle } from 'react-native-svg';
+import Reanimated, {
+  SharedValue,
+  useAnimatedProps,
+  useAnimatedStyle,
+  useSharedValue,
+  withSequence,
+  withTiming,
+} from 'react-native-reanimated';
 import { useIsFocused } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
@@ -35,24 +44,36 @@ import { LOW_LIGHT_HINT, isLowLight } from '../capture/lowLight';
 import {
   CameraBasis,
   TargetProjection,
+  directionFromYawPitch,
   edgePoint,
   nearestTarget,
+  projectToScreen,
+  targetYawDeg,
   projectTargets,
   rotationRateDegPerSec,
   wrap360,
 } from '../capture/orientation';
 import { CAPTURE_TUNING as T } from '../capture/tuning';
 import {
+  FusionState,
+  LoopClosure,
+  basisWithHeading,
+  fuseHeading,
+  headingOf,
+  headingRateDegPerSec,
+} from '../capture/yawFusion';
+import { hfovFromExif } from '../capture/lensFov';
+import {
   AimTracker,
   Cooldown,
   OneEuroVec3,
   YawUnwrapper,
-  RateFilter,
   Vec3,
-  applyDeadZone,
+  angleDeg,
   basisFromForwardUp,
   deviceAxes,
   manualShotAllowed,
+  nextDotReady,
   yawPitchFromForward,
 } from '../capture/motionFilter';
 
@@ -72,14 +93,13 @@ type Pose = {
 /**
  * Discrete overlay state. Only this goes through React state, and only when a
  * field changes, so sensor ticks never re-render the screen or CameraView.
- * Dot, ring, horizon and edge-chip positions move through Animated values.
+ * Dot, ring and horizon positions are computed on the UI thread (Reanimated
+ * worklets reading shared values); only the off-screen edge chip uses Animated.
  */
 type Ui = {
   ready: boolean;
   captured: boolean[];
   suggested: number;
-  /** Dots that are in front of the camera and on screen. */
-  visible: boolean[];
   locked: boolean;
   holding: boolean;
   tilted: boolean;
@@ -94,7 +114,6 @@ const EMPTY_UI: Ui = {
   ready: false,
   captured: new Array(SEGMENT_COUNT).fill(false),
   suggested: 0,
-  visible: new Array(SEGMENT_COUNT).fill(false),
   locked: false,
   holding: false,
   tilted: false,
@@ -119,12 +138,129 @@ function sameUi(a: Ui, b: Ui): boolean {
     return false;
   }
   for (let i = 0; i < SEGMENT_COUNT; i += 1) {
-    if (a.captured[i] !== b.captured[i] || a.visible[i] !== b.visible[i]) return false;
+    if (a.captured[i] !== b.captured[i]) return false;
   }
   return true;
 }
 
-const AnimatedCircle = Animated.createAnimatedComponent(Circle);
+const AnimatedCircle = Reanimated.createAnimatedComponent(Circle);
+
+type OverlayShared = {
+  shown: SharedValue<CameraBasis | null>;
+  origin: SharedValue<number | null>;
+  hfov: SharedValue<number>;
+  size: SharedValue<{ width: number; height: number }>;
+};
+
+/**
+ * One target dot, positioned on the UI thread at display rate from the latest
+ * camera basis. No React render per frame: props change only when the dot's
+ * state (open/next/done) does.
+ */
+const OverlayDot = memo(function OverlayDot({
+  index,
+  shared,
+  done,
+  active,
+}: {
+  index: number;
+  shared: OverlayShared;
+  done: boolean;
+  active: boolean;
+}) {
+  const style = useAnimatedStyle(() => {
+    const basis = shared.shown.value;
+    const origin = shared.origin.value;
+    const { width: w, height: h } = shared.size.value;
+    const scale = active ? 1 : 16 / DOT_SIZE;
+    if (!basis || w < 2) return { opacity: 0, transform: [{ translateX: -100 }, { translateY: -100 }, { scale }] };
+    if (origin == null) {
+      // Before the first shot: dot 0 sits on the reticle.
+      return {
+        opacity: index === 0 ? 1 : 0,
+        transform: [{ translateX: w / 2 - DOT_SIZE / 2 }, { translateY: h / 2 - DOT_SIZE / 2 }, { scale }],
+      };
+    }
+    const yaw = origin + targetYawDeg(index);
+    const p = projectToScreen(directionFromYawPitch(yaw, 0), basis, w, h, shared.hfov.value);
+    return {
+      opacity: p.inView ? 1 : 0,
+      transform: [{ translateX: p.x - DOT_SIZE / 2 }, { translateY: p.y - DOT_SIZE / 2 }, { scale }],
+    };
+  }, [index, active]);
+  return (
+    <Reanimated.View style={[styles.dot, done ? styles.dotDone : active ? styles.dotNext : styles.dotOpen, style]}>
+      {done ? <Text style={styles.dotCheck}>✓</Text> : null}
+    </Reanimated.View>
+  );
+});
+
+/** Level line, centered on screen, tilted and shifted on the UI thread. */
+function HorizonLine({ shared, color, cx, cy }: { shared: OverlayShared; color: string; cx: number; cy: number }) {
+  const style = useAnimatedStyle(() => {
+    const b = shared.shown.value;
+    if (!b) return { opacity: 0 };
+    const pitch = (Math.asin(Math.max(-1, Math.min(1, b.look.z))) * 180) / Math.PI;
+    const roll = (Math.asin(Math.max(-1, Math.min(1, b.right.z))) * 180) / Math.PI;
+    return {
+      opacity: 1,
+      transform: [{ translateY: Math.max(-26, Math.min(26, -pitch * 1.4)) }, { rotate: `${-roll}deg` }],
+    };
+  });
+  return (
+    <Reanimated.View
+      pointerEvents="none"
+      style={[styles.horizon, { position: 'absolute', left: cx - 30, top: cy - 1, backgroundColor: color }, style]}
+    />
+  );
+}
+
+/** Fixed aim ring at the exact screen center; only its hold arc animates. */
+const Reticle = memo(function Reticle({
+  cx,
+  cy,
+  ring,
+  locked,
+  color,
+  complete,
+}: {
+  cx: number;
+  cy: number;
+  ring: SharedValue<number>;
+  locked: boolean;
+  color: string;
+  complete: boolean;
+}) {
+  const arcProps = useAnimatedProps(() => ({ strokeDashoffset: RING * (1 - ring.value) }));
+  return (
+    <View pointerEvents="none" style={[styles.reticle, { left: cx - RETICLE / 2, top: cy - RETICLE / 2 }]}>
+      <Svg width={RETICLE} height={RETICLE}>
+        <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={8} stroke="#fff" strokeWidth={2} fill="none" />
+        <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={2} fill="#fff" />
+        {complete ? (
+          <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={RING_R} stroke={color} strokeWidth={5} fill="none" />
+        ) : (
+          <>
+            {/* Faint track always visible; the bright arc fills over holdMs while aimed and steady. */}
+            <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={RING_R} stroke="#fff" strokeOpacity={locked ? 0.35 : 0.18} strokeWidth={4} fill="none" />
+            <AnimatedCircle
+              cx={RETICLE / 2}
+              cy={RETICLE / 2}
+              r={RING_R}
+              stroke={color}
+              strokeWidth={4}
+              fill="none"
+              strokeDasharray={`${RING} ${RING}`}
+              animatedProps={arcProps}
+              strokeLinecap="round"
+              transform={`rotate(-90 ${RETICLE / 2} ${RETICLE / 2})`}
+            />
+          </>
+        )}
+      </Svg>
+    </View>
+  );
+});
 
 /** Never re-renders on sensor ticks: props only change when the lens does. */
 const StableCamera = memo(
@@ -139,6 +275,8 @@ const StableCamera = memo(
           ref={ref}
           style={StyleSheet.absoluteFill}
           facing="back"
+          // The native white blink read as a harsh flash; a subtle overlay pulse replaces it.
+          animateShutter={false}
           selectedLens={selectedLens}
           onAvailableLensesChanged={onAvailableLensesChanged}
           onCameraReady={onCameraReady}
@@ -197,6 +335,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
   const cameraRef = useRef<CameraView>(null);
   const segmentsRef = useRef(segments);
   const originRef = useRef<number | null>(null);
+  const peakRateRef = useRef(-1);
   const poseRef = useRef<Pose | null>(null);
   const aimRef = useRef(new AimTracker());
   const captureLock = useRef(false);
@@ -215,6 +354,24 @@ export default function CaptureScreen({ navigation, route }: Props) {
     heading: new Animated.Value(0),
   }).current;
   const hfovRef = useRef(hfov);
+  // UI-thread overlay inputs. Written from the sensor listener / effects; read in worklets.
+  const shownSV = useSharedValue<CameraBasis | null>(null);
+  const originSV = useSharedValue<number | null>(null);
+  const hfovSV = useSharedValue(hfov);
+  const sizeSV = useSharedValue({ width, height });
+  const ringSV = useSharedValue(0);
+  const flashSV = useSharedValue(0);
+  const overlayShared = useRef<OverlayShared>({ shown: shownSV, origin: originSV, hfov: hfovSV, size: sizeSV }).current;
+  const flashStyle = useAnimatedStyle(() => ({ opacity: flashSV.value }));
+  /** When and where the last photo was taken: gates the next dot (cooldown + 10° turn). */
+  const lastShotAtRef = useRef<number | null>(null);
+  const lastShotLookRef = useRef<Vec3 | null>(null);
+  /** Gyro-only heading from the first shot, for the loop-closure drift check. */
+  const loopRef = useRef(new LoopClosure());
+  const loopReportedRef = useRef(false);
+  const lastAttRef = useRef<number | null>(null);
+  /** EXIF-calibrated FOV already applied for this session. */
+  const exifFovRef = useRef(false);
   const reduceRef = useRef(reduceMotion);
   const sizeRef = useRef({ width, height });
   const focusedRef = useRef(focused);
@@ -323,7 +480,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
     completedRef.current = false;
     setCompleteFlash(false);
     setSegments((prev) =>
-      prev.map((seg, i) => (clear.has(i) ? { ...seg, imageUri: null, actualYaw: null, capturedAt: null } : seg)),
+      prev.map((seg, i) => (clear.has(i) ? { ...seg, imageUri: null, actualYaw: null, actualPitch: null, capturedAt: null } : seg)),
     );
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clearNonce]);
@@ -335,20 +492,22 @@ export default function CaptureScreen({ navigation, route }: Props) {
     setCompleteFlash(false);
     const clear = new Set([retakeIndex, ...(clearIndices ?? [])]);
     setSegments((prev) =>
-      prev.map((seg, i) => (clear.has(i) ? { ...seg, imageUri: null, actualYaw: null, capturedAt: null } : seg)),
+      prev.map((seg, i) => (clear.has(i) ? { ...seg, imageUri: null, actualYaw: null, actualPitch: null, capturedAt: null } : seg)),
     );
     showToast(`Aim at dot ${retakeIndex + 1} to retake it`);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [retakeIndex, retakeNonce, showToast]);
   useEffect(() => {
     hfovRef.current = hfov;
-  }, [hfov]);
+    hfovSV.value = hfov;
+  }, [hfov, hfovSV]);
   useEffect(() => {
     reduceRef.current = reduceMotion;
   }, [reduceMotion]);
   useEffect(() => {
     sizeRef.current = { width, height };
-  }, [width, height]);
+    sizeSV.value = { width, height };
+  }, [width, height, sizeSV]);
   useEffect(() => {
     focusedRef.current = focused;
     if (!focused) aimRef.current.reset();
@@ -375,7 +534,10 @@ export default function CaptureScreen({ navigation, route }: Props) {
     captureLock.current = true;
     aimRef.current.reset();
     setCapturing(true);
+    if (lastShotAtRef.current != null && Date.now() - lastShotAtRef.current < T.shotCooldownMs) return;
     const headingAtShutter = pose ? yawPitchFromForward(pose.raw.look).yawDeg : null;
+    const pitchAtShutter = pose ? yawPitchFromForward(pose.raw.look).pitchDeg : null;
+    const lookAtShutter = pose ? pose.raw.look : null;
     try {
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.8,
@@ -387,8 +549,32 @@ export default function CaptureScreen({ navigation, route }: Props) {
       if (headingAtShutter == null) {
         actualYaw = index * SEGMENT_ANGLE;
       } else {
-        if (originRef.current == null) originRef.current = headingAtShutter;
+        if (originRef.current == null) {
+          originRef.current = headingAtShutter;
+          originSV.value = headingAtShutter;
+          if (lastAttRef.current != null) loopRef.current.start(lastAttRef.current);
+          loopReportedRef.current = false;
+        }
+        // Back at the first shot after a full turn: log the loop-closure drift (flag > 3°).
+        if (!loopReportedRef.current && loopRef.current.started && Math.abs(loopRef.current.turnedDeg) > 330) {
+          loopReportedRef.current = true;
+          const { errorDeg, pass } = loopRef.current.result();
+          console.log(`[capture] loop closure drift ${errorDeg.toFixed(2)}° ${pass ? 'PASS' : 'FAIL (>3°)'}`);
+        }
         actualYaw = wrap360(headingAtShutter - originRef.current);
+      }
+      lastShotAtRef.current = Date.now();
+      lastShotLookRef.current = lookAtShutter;
+      // Subtle shutter feedback instead of the native white blink.
+      flashSV.value = withSequence(withTiming(0.18, { duration: 60 }), withTiming(0, { duration: 260 }));
+      // Calibrate dots to the lens that really took the photo (preview crop is in previewFocalPx).
+      if (!exifFovRef.current) {
+        exifFovRef.current = true;
+        const exifFov = hfovFromExif(photo.exif as Record<string, unknown> | undefined);
+        if (exifFov && Math.abs(exifFov - hfovRef.current) > 3) {
+          if (__DEV__) console.log(`[capture] lens FOV ${hfovRef.current}° → EXIF ${exifFov}°`);
+          setHfov(exifFov);
+        }
       }
       const firstShot = !segmentsRef.current.some((seg) => seg.imageUri !== null);
       setLocked(true);
@@ -398,6 +584,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
           ...updated[index],
           imageUri: photo.uri,
           actualYaw,
+          actualPitch: validPitch(pitchAtShutter),
           capturedAt: new Date(),
         };
         return updated;
@@ -442,25 +629,46 @@ export default function CaptureScreen({ navigation, route }: Props) {
     // rotation matrix is well-defined even where alpha/gamma are not (upright phone).
     const forwardFilter = new OneEuroVec3();
     const upFilter = new OneEuroVec3();
-    let shownForward: Vec3 | null = null;
+    // Gyro-integrated heading; the magnetometer-corrected alpha only removes slow drift.
+    const fusion: FusionState = { yaw: null };
+    let lastSensorT: number | null = null;
     const sub = DeviceMotion.addListener((data: DeviceMotionMeasurement) => {
       if (!data.rotation) return;
       if (!poseRef.current) setMotion((m) => (m === 'stalled' ? 'ok' : m));
       const axes = deviceAxes(data.rotation.alpha, data.rotation.beta, data.rotation.gamma);
       // JS clock in seconds: sensor timestamp units differ between iOS and Android.
       const t = Date.now() / 1000;
-      const smoothForward = forwardFilter.filter(axes.forward, t);
-      const smoothUp = upFilter.filter(axes.up, t);
-      shownForward = applyDeadZone(shownForward, smoothForward, T.deadZoneDeg);
+      const dtSec = lastSensorT == null ? 0 : t - lastSensorT;
+      lastSensorT = t;
+      const attHeading = headingOf(axes.forward);
+      const gyroRate = data.rotationRate ? headingRateDegPerSec(data.rotationRate, axes) : 0;
+      const heading = fuseHeading(fusion, attHeading, gyroRate, dtSec, T.headingDriftTauSec);
+      lastAttRef.current = attHeading;
+      loopRef.current.update(attHeading, gyroRate, dtSec);
+      const raw = basisWithHeading(axes, heading);
+      // Light, continuous smoothing (no dead zone): follows the camera tightly.
+      const shown = basisFromForwardUp(forwardFilter.filter(raw.look, t), upFilter.filter(raw.up, t));
+      shownSV.value = shown;
+      // Raw, unsmoothed gyro speed; missing/NaN counts as not steady.
+      const rawRate = rotationRateDegPerSec(data.rotationRate);
+      peakRateRef.current = Math.max(peakRateRef.current, Number.isFinite(rawRate) ? rawRate : Infinity);
       poseRef.current = {
-        raw: { right: axes.right, up: axes.up, look: axes.forward },
-        shown: basisFromForwardUp(shownForward, smoothUp),
-        rate: rotationRateDegPerSec(data.rotationRate),
+        raw,
+        shown,
+        rate: rawRate,
         t,
       };
+      if (__DEV__ && T.debugAimLog) {
+        const live = liveRef.current;
+        const target = live?.dots.find((d) => d.index === live.suggested);
+        console.log(
+          `[aim] alpha=${((data.rotation.alpha * 180) / Math.PI).toFixed(2)} att=${attHeading.toFixed(2)} ` +
+            `fused=${heading.toFixed(2)} shown=${headingOf(shown.look).toFixed(2)} ` +
+            `target=${target ? target.angleDeg.toFixed(2) : '-'} locked=${uiRef.current.locked}`,
+        );
+      }
     });
 
-    const rateFilter = new RateFilter(T.rateSmoothingMs);
     let raf = 0;
     let last = 0;
     let lastSuggested = -1;
@@ -476,21 +684,25 @@ export default function CaptureScreen({ navigation, route }: Props) {
       if (viewW < 2 || viewH < 2) return;
       const captured = segmentsRef.current.map((segment) => segment.imageUri !== null);
       const origin = originRef.current;
-      const rate = rateFilter.update(pose.rate, dt);
+      // Peak raw gyro speed since the last frame, so a spike between frames still resets the hold.
+      const rate = peakRateRef.current >= 0 ? peakRateRef.current : pose.rate;
+      peakRateRef.current = -1;
       const { pitchDeg } = yawPitchFromForward(pose.raw.look);
       const tilted = Math.abs(pitchDeg) > T.tiltLimitDeg;
       const shownPitch = Math.asin(Math.max(-1, Math.min(1, pose.shown.look.z))) * DEG;
+      const ready = nextDotReady(
+        Date.now(),
+        lastShotAtRef.current,
+        lastShotLookRef.current ? angleDeg(pose.raw.look, lastShotLookRef.current) : null,
+      );
       const rollDeg = Math.asin(Math.max(-1, Math.min(1, pose.shown.right.z))) * DEG;
 
       let suggested = 0;
       let alignDeg = 0;
       let headingDeg = 0;
-      const visible = new Array(SEGMENT_COUNT).fill(false);
       let edgeOn = false;
       if (origin == null) {
-        // Before the first shot: one dot fixed on the reticle.
-        visible[0] = true;
-        anim.dots[0].setValue({ x: viewW / 2 - DOT_SIZE / 2, y: viewH / 2 - DOT_SIZE / 2 });
+        // Before the first shot: one dot fixed on the reticle (drawn by OverlayDot).
         liveRef.current = { dots: [], suggested: 0, pitchDeg };
       } else {
         // Draw with the smoothed basis; decide with the raw one.
@@ -501,10 +713,6 @@ export default function CaptureScreen({ navigation, route }: Props) {
         const next = nearestTarget(rawDots, captured);
         suggested = next ? next.index : -1;
         alignDeg = next ? next.angleDeg : 180;
-        for (const d of shownDots) {
-          visible[d.index] = d.inView;
-          if (d.inView) anim.dots[d.index].setValue({ x: d.x - DOT_SIZE / 2, y: d.y - DOT_SIZE / 2 });
-        }
         const shownNext = suggested >= 0 ? shownDots[suggested] : undefined;
         if (shownNext && !shownNext.inView) {
           const offX = shownNext.x - viewW / 2;
@@ -530,27 +738,26 @@ export default function CaptureScreen({ navigation, route }: Props) {
         rateDegPerSec: rate,
         dtMs: dt,
         // The first photo is always a manual tap: it sets where the tour starts.
-        blocked: origin == null || !open || tilted || captureLock.current,
+        // After a shot: wait out the cooldown and a real turn before aiming again.
+        blocked: origin == null || !open || tilted || captureLock.current || !ready,
         targetChanged: suggested !== lastSuggested,
       });
       lastSuggested = suggested;
       if (state.lockedOn && hapticGate.tryFire(now)) void HapticFeedback.light();
       if (state.fire && open) void captureRef.current(suggested);
-      anim.ring.setValue(reduceRef.current ? (state.progress > 0 ? 1 : 0) : state.progress);
-      anim.horizonY.setValue(Math.max(-26, Math.min(26, -shownPitch * 1.4)));
-      anim.horizonRot.setValue((-rollDeg * Math.PI) / 180);
+      ringSV.value = reduceRef.current ? (state.progress > 0 ? 1 : 0) : state.progress;
 
       const nextUi: Ui = {
         ready: true,
         captured,
-        suggested,
-        visible,
+        // The next dot is not highlighted until the cooldown and the 10° turn are done.
+        suggested: ready ? suggested : -1,
         locked: state.locked,
         holding: state.progress > 0,
         tilted,
         fast: state.locked && !state.steady,
         levelOk: Math.abs(rollDeg) <= T.levelOkDeg && Math.abs(shownPitch) <= T.levelOkDeg,
-        edge: edgeOn,
+        edge: edgeOn && ready,
         alignBucket: Math.round(alignDeg / 5) * 5,
       };
       if (!sameUi(uiRef.current, nextUi)) {
@@ -606,11 +813,13 @@ export default function CaptureScreen({ navigation, route }: Props) {
 
   const handleRetakeLast = useCallback(() => {
     if (lastShot == null) return;
+    lastShotAtRef.current = null;
+    lastShotLookRef.current = null;
     completedRef.current = false;
     setCompleteFlash(false);
     setSegments((prev) => {
       const updated = [...prev];
-      updated[lastShot] = { ...updated[lastShot], imageUri: null, actualYaw: null, capturedAt: null };
+      updated[lastShot] = { ...updated[lastShot], imageUri: null, actualYaw: null, actualPitch: null, capturedAt: null };
       return updated;
     });
     showToast(`Photo ${lastShot + 1} removed. Aim at its dot again.`);
@@ -627,6 +836,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
         id: segment.id,
         imageUri: segment.imageUri,
         actualYaw: segment.actualYaw,
+        actualPitch: segment.actualPitch ?? null,
       })),
     });
   }, [navigation, projectId, projectName, selectedLens]);
@@ -745,6 +955,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
         onAvailableLensesChanged={handleLenses}
         onCameraReady={handleCameraReady}
       />
+      <Reanimated.View pointerEvents="none" style={[StyleSheet.absoluteFill, styles.shotFlash, flashStyle]} />
 
       <View style={styles.overlay} pointerEvents="box-none">
         <View>
@@ -809,62 +1020,30 @@ export default function CaptureScreen({ navigation, route }: Props) {
           accessibilityElementsHidden
           importantForAccessibility="no-hide-descendants"
         >
-          {anim.dots.map((position, index) => {
-            const show = ui.ready && ui.visible[index] && (originRef.current != null || index === 0);
+          {Array.from({ length: SEGMENT_COUNT }, (_, index) => {
             const done = capturedFlags[index];
             const active = index === ui.suggested && !done;
             return (
-              <Animated.View
+              <OverlayDot
                 key={index}
-                style={[
-                  styles.dot,
-                  done ? styles.dotDone : active ? styles.dotNext : styles.dotOpen,
-                  {
-                    opacity: show ? 1 : 0,
-                    // Inactive dots draw smaller; scale is in the same transform so it isn't overridden.
-                    transform: [...position.getTranslateTransform(), { scale: active ? 1 : 16 / DOT_SIZE }],
-                  },
-                ]}
-              >
-                {done ? <Text style={styles.dotCheck}>✓</Text> : null}
-              </Animated.View>
+                index={index}
+                shared={overlayShared}
+                done={done}
+                active={active}
+              />
             );
           })}
-          <View style={[styles.reticle, { left: width / 2 - RETICLE / 2, top: height / 2 - RETICLE / 2 }]}>
-            <Svg width={RETICLE} height={RETICLE}>
-              <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={8} stroke="#fff" strokeWidth={2} fill="none" />
-              <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={2} fill="#fff" />
-              {completeFlash ? (
-                <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={RING_R} stroke={ringColor} strokeWidth={5} fill="none" />
-              ) : ui.locked ? (
-                <>
-                  {/* Faint full ring while locked on; the bright arc is the hold progress. */}
-                  <Circle cx={RETICLE / 2} cy={RETICLE / 2} r={RING_R} stroke={ringColor} strokeOpacity={0.3} strokeWidth={4} fill="none" />
-                  <AnimatedCircle
-                    cx={RETICLE / 2}
-                    cy={RETICLE / 2}
-                    r={RING_R}
-                    stroke={ringColor}
-                    strokeWidth={4}
-                    fill="none"
-                    strokeDasharray={`${RING} ${RING}`}
-                    strokeDashoffset={anim.ring.interpolate({ inputRange: [0, 1], outputRange: [RING, 0] })}
-                    strokeLinecap="round"
-                    transform={`rotate(-90 ${RETICLE / 2} ${RETICLE / 2})`}
-                  />
-                </>
-              ) : null}
-            </Svg>
-            {ui.ready && !sensorless ? (
-              <Animated.View
-                style={[
-                  styles.horizon,
-                  { backgroundColor: horizonColor },
-                  { transform: [{ translateY: anim.horizonY }, { rotate: anim.horizonRot.interpolate({ inputRange: [-Math.PI, Math.PI], outputRange: ['-180deg', '180deg'] }) }] },
-                ]}
-              />
-            ) : null}
-          </View>
+          {ui.ready && !sensorless ? (
+            <HorizonLine shared={overlayShared} color={horizonColor} cx={width / 2} cy={height / 2} />
+          ) : null}
+          <Reticle
+            cx={width / 2}
+            cy={height / 2}
+            ring={ringSV}
+            locked={ui.locked}
+            color={ringColor}
+            complete={completeFlash}
+          />
           {ui.edge ? (
             <Animated.View style={[styles.edgeChip, { left: 0, top: 0, transform: anim.edge.getTranslateTransform() }]}>
               <Animated.Text
@@ -1166,6 +1345,9 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 10,
     fontWeight: '700',
+  },
+  shotFlash: {
+    backgroundColor: '#fff',
   },
   reticle: {
     position: 'absolute',

@@ -17,6 +17,7 @@ export type ReviewSegment = {
   id: number;
   imageUri: string | null;
   actualYaw: number | null;
+  actualPitch?: number | null;
 };
 
 export type RootStackParamList = {
@@ -47,6 +48,7 @@ export type RootStackParamList = {
     projectName: string;
     imageUris?: string[];
     yaws?: number[];
+    pitches?: number[];
     hfov?: number;
     lens?: string;
     retry?: boolean;
@@ -56,6 +58,7 @@ export type RootStackParamList = {
     projectName: string;
     imageUris: string[];
     yaws: number[];
+    pitches?: number[];
     hfov?: number;
     lens?: string;
   };
