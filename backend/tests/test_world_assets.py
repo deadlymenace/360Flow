@@ -173,3 +173,30 @@ def test_finished_world_is_cached_by_the_pipeline(client, fake_cdn):
         pipeline._guard_write = monkey_guard
     keys = get_storage().list_keys(world_asset_prefix(project_id))
     assert sorted(k.rsplit("/", 1)[-1] for k in keys) == ["original.glb", "original.spz"]
+
+
+def test_smallest_splat_is_cached_for_phones():
+    from services.world_gen import parse_world, smallest_splat_url
+
+    urls = {
+        "full_res": "https://cdn.marble.worldlabs.ai/w/full.spz",
+        "500k": "https://cdn.marble.worldlabs.ai/w/500k.spz",
+        "100k": "https://cdn.marble.worldlabs.ai/w/100k.spz",
+    }
+    assert smallest_splat_url(urls).endswith("/100k.spz")
+    assert smallest_splat_url({"full_res": urls["full_res"]}).endswith("/full.spz")
+    assert smallest_splat_url({}) is None
+    parsed = parse_world({"response": {"world_id": "w1", "assets": {"splats": {"spz_urls": urls}}}})
+    assert parsed["splat_url"].endswith("/100k.spz")
+
+
+def test_viewer_page_has_fallbacks_and_no_public_urls(client):
+    from viewer import render_splat_page
+
+    html = render_splat_page(title="Room", asset_base="/v/tok", staged_source=False, has_staged=False)
+    assert "Can't show 3D on this device" in html
+    assert "webgl2" in html and "LOAD_TIMEOUT_MS = 30000" in html
+    assert "Try again" in html
+    assert "antialias: false" in html and "Math.min(window.devicePixelRatio || 1, 2)" in html
+    assert "http://" not in html and "https://" not in html
+    assert "worldlabs" not in html

@@ -499,18 +499,61 @@ const text = document.getElementById("loadText");
 function post(msg) {
   try { window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(msg)); } catch (e) {}
 }
-function fail() {
-  text.innerHTML = 'The 3D tour could not load on this device. <a class="btn" href="' + PANO + '">Open the 360° panorama</a>';
+const LOAD_TIMEOUT_MS = 30000;
+let finished = false;
+function fail(reason) {
+  if (finished) return;
+  finished = true;
+  // Built with DOM nodes (no innerHTML); only our own relative links.
+  text.textContent = "";
+  const title = document.createElement("div");
+  title.style.fontWeight = "600";
+  title.textContent = "Can't show 3D on this device";
+  const body = document.createElement("div");
+  body.style.cssText = "opacity:.8;font-size:13px;margin:6px 0 12px;max-width:260px;text-align:center";
+  body.textContent = reason === "webgl"
+    ? "This browser doesn't support the 3D graphics the tour needs. You can still look around the 360° panorama."
+    : "The 3D tour took too long to load. Check your connection and try again, or look around the 360° panorama.";
+  const retry = document.createElement("a");
+  retry.className = "btn";
+  retry.href = "#";
+  retry.textContent = "Try again";
+  retry.addEventListener("click", (e) => { e.preventDefault(); location.reload(); });
+  const pano = document.createElement("a");
+  pano.className = "btn";
+  pano.href = PANO;
+  pano.textContent = "Open the 360° panorama";
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;gap:8px;justify-content:center";
+  row.append(retry, pano);
+  text.append(title, body, row);
   fill.parentElement.classList.add("hide");
   loading.querySelector(".spinner").classList.add("hide");
-  post({ type: "world-error" });
+  loading.classList.remove("done");
+  post({ type: "world-error", reason });
 }
+
+function hasWebGL2() {
+  try {
+    const probe = document.createElement("canvas");
+    return Boolean(window.WebGL2RenderingContext && probe.getContext("webgl2"));
+  } catch (e) {
+    return false;
+  }
+}
+if (!hasWebGL2()) {
+  fail("webgl");
+  throw new Error("WebGL2 unavailable");
+}
+const timer = setTimeout(() => fail("timeout"), LOAD_TIMEOUT_MS);
 
 let renderer;
 try {
-  renderer = new THREE.WebGLRenderer({ antialias: false });
+  // iPhone: no MSAA (splats don't need it) and at most 2x pixels.
+  renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
 } catch (e) {
-  fail();
+  clearTimeout(timer);
+  fail("webgl");
   throw e;
 }
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -539,10 +582,13 @@ const world = new SplatMesh({
 world.quaternion.set(1, 0, 0, 0);
 scene.add(world);
 world.initialized.then(() => {
+  if (finished) return;
+  finished = true;
+  clearTimeout(timer);
   loading.classList.add("done");
   post({ type: "world-loaded" });
   setTimeout(() => document.getElementById("hint").classList.add("hide"), 5000);
-}).catch(fail);
+}).catch(() => { clearTimeout(timer); fail("timeout"); });
 
 const controls = new SparkControls({ canvas: renderer.domElement });
 window.addEventListener("resize", () => {
