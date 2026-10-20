@@ -65,12 +65,16 @@ export function previewFocalPx(
   viewWidth: number,
   viewHeight: number,
   hfovDeg: number,
-  photoAspect = PORTRAIT_PHOTO_ASPECT,
+  photoAspect?: number,
 ): number {
   'worklet';
+  // No default parameter here: in a worklet, defaults are evaluated before the
+  // captured closure is unpacked, so `= PORTRAIT_PHOTO_ASPECT` threw a
+  // ReferenceError on the UI thread (build 8 first-shot crash).
+  const aspect = photoAspect ?? PORTRAIT_PHOTO_ASPECT;
   const halfTan = Math.tan(((hfovDeg * Math.PI) / 180) / 2);
   const viewAspect = viewWidth / Math.max(viewHeight, 1);
-  const displayedPhotoWidth = viewAspect < photoAspect ? viewHeight * photoAspect : viewWidth;
+  const displayedPhotoWidth = viewAspect < aspect ? viewHeight * aspect : viewWidth;
   return displayedPhotoWidth / 2 / halfTan;
 }
 

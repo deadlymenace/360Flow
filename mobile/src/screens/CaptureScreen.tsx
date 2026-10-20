@@ -181,12 +181,17 @@ const OverlayDot = memo(function OverlayDot({
         transform: [{ translateX: w / 2 - DOT_SIZE / 2 }, { translateY: h / 2 - DOT_SIZE / 2 }, { scale }],
       };
     }
-    const yaw = origin + targetYawDeg(index);
-    const p = projectToScreen(directionFromYawPitch(yaw, 0), basis, w, h, shared.hfov.value);
-    return {
-      opacity: p.inView ? 1 : 0,
-      transform: [{ translateX: p.x - DOT_SIZE / 2 }, { translateY: p.y - DOT_SIZE / 2 }, { scale }],
-    };
+    try {
+      const yaw = origin + targetYawDeg(index);
+      const p = projectToScreen(directionFromYawPitch(yaw, 0), basis, w, h, shared.hfov.value);
+      return {
+        opacity: p.inView ? 1 : 0,
+        transform: [{ translateX: p.x - DOT_SIZE / 2 }, { translateY: p.y - DOT_SIZE / 2 }, { scale }],
+      };
+    } catch {
+      // An uncaught error on the UI thread aborts a release build: hide the dot instead.
+      return { opacity: 0, transform: [{ translateX: -100 }, { translateY: -100 }, { scale }] };
+    }
   }, [index, active]);
   return (
     <Reanimated.View style={[styles.dot, done ? styles.dotDone : active ? styles.dotNext : styles.dotOpen, style]}>
@@ -531,14 +536,16 @@ export default function CaptureScreen({ navigation, route }: Props) {
     const pose = poseRef.current;
     // Without motion data only the manual fallback may shoot, using fixed yaws.
     if (!pose && !manualOnlyRef.current) return;
-    captureLock.current = true;
-    aimRef.current.reset();
-    setCapturing(true);
+    // Cooldown check before taking the lock: returning after it left the
+    // shutter locked (and the spinner on) for the rest of the session.
     if (lastShotAtRef.current != null && Date.now() - lastShotAtRef.current < T.shotCooldownMs) return;
-    const headingAtShutter = pose ? yawPitchFromForward(pose.raw.look).yawDeg : null;
-    const pitchAtShutter = pose ? yawPitchFromForward(pose.raw.look).pitchDeg : null;
-    const lookAtShutter = pose ? pose.raw.look : null;
+    captureLock.current = true;
     try {
+      aimRef.current.reset();
+      setCapturing(true);
+      const headingAtShutter = pose ? yawPitchFromForward(pose.raw.look).yawDeg : null;
+      const pitchAtShutter = pose ? yawPitchFromForward(pose.raw.look).pitchDeg : null;
+      const lookAtShutter = pose ? pose.raw.look : null;
       const photo = await cameraRef.current.takePictureAsync({
         quality: 0.8,
         skipProcessing: false,
@@ -601,8 +608,13 @@ export default function CaptureScreen({ navigation, route }: Props) {
         showToast(LOW_LIGHT_HINT, 4000);
       }
     } catch (e) {
-      if (__DEV__) console.warn('Capture error:', e);
-      HapticFeedback.error();
+      // Any JS error in the capture path is caught and shown, never fatal.
+      console.warn('Capture error:', e instanceof Error ? e.message : String(e));
+      try {
+        HapticFeedback.error();
+      } catch {
+        // haptics are best effort
+      }
       failuresRef.current += 1;
       if (failuresRef.current >= FAILURES_BEFORE_RESTART_HINT) {
         showToast("Photos keep failing. Go back and open the capture again to restart the camera.", 4000);
