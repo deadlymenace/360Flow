@@ -27,12 +27,11 @@ export const CAPTURE_TUNING = {
   /** Hold this long while locked and steady before auto-capture fires (the ring fills over this time). */
   holdMs: 1000,
 
-  /** Gyro speed (deg/s, low-passed) below which the phone counts as steady. */
-  steadyMaxDegPerSec: 7,
-  /** Low-pass time constant for the gyro speed, ms. */
-  rateSmoothingMs: 120,
-  /** While locked but shaking, the hold ring drains at this multiple of real time instead of resetting. */
-  holdDrainRate: 3,
+  /**
+   * Raw (unsmoothed) gyro magnitude, deg/s, at or below which the phone counts
+   * as steady. Any sample above it resets the hold to 0 (no draining).
+   */
+  steadyMaxDegPerSec: 3,
 
   /** Manual shutter accepts the current dot inside this wider ring (degrees). */
   manualRingDeg: 12,

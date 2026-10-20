@@ -24,6 +24,8 @@
     "src/capture/yawFusion.ts",
     "src/capture/yawFusion.test.ts",
     "src/capture/lensFov.ts",
-    "src/capture/lensFov.test.ts"
+    "src/capture/lensFov.test.ts",
+    "src/capture/pitch.ts",
+    "src/capture/pitch.test.ts"
   ]
 }

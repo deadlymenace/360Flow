@@ -1,4 +1,5 @@
 import { Directory, File, Paths } from 'expo-file-system';
+import { pitchesForUpload } from '../capture/pitch';
 import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
 import {
@@ -163,7 +164,7 @@ class APIService {
       JSON.stringify({
         hfov_deg: options.hfov,
         yaws_deg: options.yaws,
-        pitches_deg: options.pitches,
+        pitches_deg: pitchesForUpload(options.pitches),
         lens: options.lens,
       })
     );

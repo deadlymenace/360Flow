@@ -16,6 +16,7 @@ The JPEG is exactly 2:1, which World Labs expects for ``is_pano``.
 
 from __future__ import annotations
 
+import math
 import logging
 from pathlib import Path
 
@@ -254,7 +255,12 @@ def _resolve_pitches(pitches_deg: list[float] | None, count: int) -> list[float]
     if len(pitches_deg) != count:
         logger.warning("Ignoring %d pitch values for %d images", len(pitches_deg), count)
         return None
-    return [max(-45.0, min(45.0, float(p))) for p in pitches_deg]
+    values = [float(p) if p is not None else math.nan for p in pitches_deg]
+    if not all(math.isfinite(p) for p in values):
+        # Never coerce an invalid pitch to the ±45° clamp: drop pitch entirely.
+        logger.warning("Ignoring pitches with a non-finite value: %s", pitches_deg)
+        return None
+    return [max(-45.0, min(45.0, p)) for p in values]
 
 
 def _resolve_yaws(yaws_deg: list[float] | None, count: int) -> list[float]:

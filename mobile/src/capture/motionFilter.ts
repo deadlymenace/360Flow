@@ -133,28 +133,10 @@ export function basisFromForwardUp(forward: Vec3, upHint: Vec3): { right: Vec3; 
   return { right, up, look };
 }
 
-/** First-order low-pass on the gyro speed so one spiky sample does not reset a hold. */
-export class RateFilter {
-  private value: number | null = null;
-  constructor(private timeConstantMs: number = CAPTURE_TUNING.rateSmoothingMs) {}
-  update(rate: number, dtMs: number): number {
-    if (this.value == null) {
-      this.value = rate;
-      return rate;
-    }
-    const a = dtMs / (this.timeConstantMs + dtMs);
-    this.value += a * (rate - this.value);
-    return this.value;
-  }
-  reset(): void {
-    this.value = null;
-  }
-}
-
 export type AimInput = {
   /** Angle from the raw (unfiltered) forward vector to the target dot. */
   angleDeg: number;
-  /** Low-passed gyro speed. */
+  /** Raw (unsmoothed) gyro magnitude, deg/s. NaN/missing counts as not steady. */
   rateDegPerSec: number;
   dtMs: number;
   /** A capture is blocked right now (tilted, already capturing, no open dot). */
@@ -182,7 +164,7 @@ export class AimTracker {
 
   update(input: AimInput): AimState {
     const t = this.tuning;
-    const steady = input.rateDegPerSec <= t.steadyMaxDegPerSec;
+    const steady = Number.isFinite(input.rateDegPerSec) && input.rateDegPerSec <= t.steadyMaxDegPerSec;
     if (input.targetChanged || input.blocked) {
       this.locked = false;
       this.heldMs = 0;
@@ -194,12 +176,12 @@ export class AimTracker {
     } else if (input.angleDeg <= t.aimEnterDeg) {
       this.locked = true;
     }
-    if (!this.locked) {
+    // The hold must be one continuous steady second inside the cone:
+    // leaving the cone or any sample above the threshold resets it to 0.
+    if (!this.locked || !steady) {
       this.heldMs = 0;
-    } else if (steady) {
-      this.heldMs += input.dtMs;
     } else {
-      this.heldMs = Math.max(0, this.heldMs - input.dtMs * t.holdDrainRate);
+      this.heldMs += input.dtMs;
     }
     let fire = false;
     if (this.locked && this.heldMs >= t.holdMs) {

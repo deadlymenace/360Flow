@@ -256,3 +256,14 @@ def test_handheld_jitter_keeps_exposure_flat(tmp_path: Path):
     output = tmp_path / "pano.jpg"
     assert stitch_images(paths, output, yaws_deg=yaws, pitches_deg=pitches, hfov_deg=HFOV, refine=False)
     assert _band_error(output, equirect) < 15
+
+
+def test_resolve_pitches_never_coerces_nan():
+    import math
+
+    from services.stitcher import _resolve_pitches
+
+    assert _resolve_pitches([math.nan, 0.0], 2) is None
+    assert _resolve_pitches([math.inf, 0.0], 2) is None
+    assert _resolve_pitches(None, 2) is None
+    assert _resolve_pitches([60.0, -3.0], 2) == [45.0, -3.0]

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, memo } from 'react';
+import { validPitch } from '../capture/pitch';
 import {
   View,
   Text,
@@ -67,7 +68,6 @@ import {
   Cooldown,
   OneEuroVec3,
   YawUnwrapper,
-  RateFilter,
   Vec3,
   angleDeg,
   basisFromForwardUp,
@@ -335,6 +335,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
   const cameraRef = useRef<CameraView>(null);
   const segmentsRef = useRef(segments);
   const originRef = useRef<number | null>(null);
+  const peakRateRef = useRef(-1);
   const poseRef = useRef<Pose | null>(null);
   const aimRef = useRef(new AimTracker());
   const captureLock = useRef(false);
@@ -583,7 +584,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
           ...updated[index],
           imageUri: photo.uri,
           actualYaw,
-          actualPitch: pitchAtShutter ?? 0,
+          actualPitch: validPitch(pitchAtShutter),
           capturedAt: new Date(),
         };
         return updated;
@@ -648,10 +649,13 @@ export default function CaptureScreen({ navigation, route }: Props) {
       // Light, continuous smoothing (no dead zone): follows the camera tightly.
       const shown = basisFromForwardUp(forwardFilter.filter(raw.look, t), upFilter.filter(raw.up, t));
       shownSV.value = shown;
+      // Raw, unsmoothed gyro speed; missing/NaN counts as not steady.
+      const rawRate = rotationRateDegPerSec(data.rotationRate);
+      peakRateRef.current = Math.max(peakRateRef.current, Number.isFinite(rawRate) ? rawRate : Infinity);
       poseRef.current = {
         raw,
         shown,
-        rate: rotationRateDegPerSec(data.rotationRate),
+        rate: rawRate,
         t,
       };
       if (__DEV__ && T.debugAimLog) {
@@ -665,7 +669,6 @@ export default function CaptureScreen({ navigation, route }: Props) {
       }
     });
 
-    const rateFilter = new RateFilter(T.rateSmoothingMs);
     let raf = 0;
     let last = 0;
     let lastSuggested = -1;
@@ -681,7 +684,9 @@ export default function CaptureScreen({ navigation, route }: Props) {
       if (viewW < 2 || viewH < 2) return;
       const captured = segmentsRef.current.map((segment) => segment.imageUri !== null);
       const origin = originRef.current;
-      const rate = rateFilter.update(pose.rate, dt);
+      // Peak raw gyro speed since the last frame, so a spike between frames still resets the hold.
+      const rate = peakRateRef.current >= 0 ? peakRateRef.current : pose.rate;
+      peakRateRef.current = -1;
       const { pitchDeg } = yawPitchFromForward(pose.raw.look);
       const tilted = Math.abs(pitchDeg) > T.tiltLimitDeg;
       const shownPitch = Math.asin(Math.max(-1, Math.min(1, pose.shown.look.z))) * DEG;

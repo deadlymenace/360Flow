@@ -658,3 +658,18 @@ def test_upload_stores_pitches_and_operator_debug(client, monkeypatch):
     assert json.loads(debug["yaws_json"]) == [0, 180]
     assert debug["pitches_deg"] == [2.5, -3]
     assert debug["hfov_deg"] == 90
+
+
+def test_upload_rejects_invalid_pitch_but_accepts_missing(client):
+    def upload(metadata: str):
+        created = client.post("/api/v1/projects", json={"name": "Pitch check"}).json()
+        files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+        return client.post(f"/api/v1/projects/{created['id']}/upload", files=files, data={"metadata": metadata})
+
+    for bad in ('[NaN, 0]', '[Infinity, 0]', '[-Infinity, 0]', '[95, 0]', '[0, null]'):
+        res = upload('{"hfov_deg": 90, "yaws_deg": [0, 180], "pitches_deg": %s}' % bad)
+        assert res.status_code == 400, (bad, res.text)
+    # Build 7 clients send no pitch at all: still accepted, treated as not sent.
+    assert upload(json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180]})).status_code == 200
+    assert upload(json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180], "pitches_deg": None})).status_code == 200
+    assert upload(json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180], "pitches_deg": [89.5, -90]})).status_code == 200

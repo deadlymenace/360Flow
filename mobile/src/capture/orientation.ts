@@ -312,7 +312,8 @@ export function basisFromQuat(q: Quat): CameraBasis {
 }
 
 export function rotationRateDegPerSec(rate: { alpha: number; beta: number; gamma: number } | null): number {
-  if (!rate) return 0;
+  // Missing gyro data is NaN (not 0) so the steady check never treats it as still.
+  if (!rate) return NaN;
   return Math.hypot(rate.alpha, rate.beta, rate.gamma);
 }
 

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { pitchesForUpload } from '../capture/pitch';
 import {
   Alert,
   View,
@@ -79,7 +80,7 @@ export default function ReviewScreen({ navigation, route }: Props) {
       projectName,
       imageUris: ordered.map((s) => s.imageUri as string),
       yaws: ordered.map((s) => s.actualYaw ?? s.id * SEGMENT_ANGLE),
-      pitches: ordered.map((s) => s.actualPitch ?? 0),
+      pitches: pitchesForUpload(ordered.map((s) => s.actualPitch)),
       hfov,
       lens,
     };
