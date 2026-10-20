@@ -268,12 +268,16 @@ export default function CaptureScreen({ navigation, route }: Props) {
             // P0-11: don't leave a ghost "0 photos" room behind.
             text: 'Discard and delete room',
             style: 'destructive',
-            onPress: () => {
+            onPress: async () => {
               leavingRef.current = true;
-              markDeleted(projectId);
-              api.deleteProject(projectId).catch(() => {
-                // The row stays as "Not captured yet" and can be deleted from Home.
-              });
+              // Wait for the server before going back, so the list Home fetches
+              // on return no longer has this room (that race caused the 404).
+              try {
+                await api.deleteProject(projectId); // a 404 already counts as gone
+                markDeleted(projectId);
+              } catch {
+                // Offline or 5xx: the row stays on Home ("Not captured yet") and can be deleted there.
+              }
               navigation.dispatch(e.data.action);
             },
           },
