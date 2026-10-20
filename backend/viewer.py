@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import re
+from pathlib import Path
 from html import escape
 
 from services.disclosure import DISCLOSURE_TEXT
 
 _PLACEHOLDER = re.compile(r"__[A-Z0-9_]+__")
+
+_STATIC_VIEWER = Path(__file__).resolve().parent / "static" / "viewer"
+
+
+def _file_version(name: str) -> str:
+    """Content hash for cache-busting our own viewer scripts."""
+    return hashlib.sha256((_STATIC_VIEWER / name).read_bytes()).hexdigest()[:12]
+
+
+PANO_JS_VERSION = _file_version("pano-viewer.js")
+SPLAT_JS_VERSION = _file_version("splat-viewer.js")
+
+
+def _config_json(values: dict) -> str:
+    """Per-page viewer settings as a JSON data block (not executed, so CSP-safe).
+
+    ``<``, ``>`` and ``&`` are escaped so a project name can never close the tag.
+    """
+    raw = json.dumps(values, separators=(",", ":"))
+    return raw.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 _PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -55,237 +79,8 @@ __NOTE__
 <div class="bar __BAR_CLASS__">
   __CONTROLS__
 </div>
-<script>
-const HAS_STAGED = __HAS_STAGED__;
-const INITIAL = __INITIAL__;
-const KIND = __KIND__;
-const MARBLE = __MARBLE__;
-const STAGED_WORLD = __STAGED_WORLD__;
-const BASE = __BASE__;
-const statusEl = document.getElementById("status");
-const chip = document.getElementById("chip");
-
-function setChip(show) {
-  if (!chip) return;
-  chip.classList.toggle("hide", !show);
-}
-
-if (MARBLE) {
-  setChip(STAGED_WORLD);
-  if (statusEl) statusEl.classList.add("hide");
-} else {
-  const canvas = document.getElementById("c");
-  const gl =
-    canvas.getContext("webgl2", { antialias: true, alpha: false }) ||
-    canvas.getContext("webgl", { antialias: true, alpha: false });
-  if (!gl) {
-    statusEl.textContent = "This browser cannot show the 360° viewer.";
-  } else {
-    boot(gl, canvas).catch((err) => {
-      statusEl.textContent = "Could not load the panorama.";
-      console.error(err);
-    });
-  }
-}
-
-function loadImage(url) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(url));
-    img.src = url;
-  });
-}
-
-function isPowerOfTwo(value) {
-  return value > 0 && (value & (value - 1)) === 0;
-}
-
-function textureSource(gl, image) {
-  const webgl2 = typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext;
-  if (webgl2 || (isPowerOfTwo(image.width) && isPowerOfTwo(image.height))) return image;
-  // WebGL 1 samples a non-power-of-two texture as black when wrap is REPEAT.
-  const canvas2d = document.createElement("canvas");
-  canvas2d.width = 1 << Math.ceil(Math.log2(image.width));
-  canvas2d.height = 1 << Math.ceil(Math.log2(image.height));
-  const ctx = canvas2d.getContext("2d");
-  ctx.drawImage(image, 0, 0, canvas2d.width, canvas2d.height);
-  return canvas2d;
-}
-
-function makeTexture(gl, image) {
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textureSource(gl, image));
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  return tex;
-}
-
-function mul(a, b) {
-  const o = new Float32Array(16);
-  for (let c = 0; c < 4; c++) {
-    for (let r = 0; r < 4; r++) {
-      o[c * 4 + r] =
-        a[r] * b[c * 4] +
-        a[4 + r] * b[c * 4 + 1] +
-        a[8 + r] * b[c * 4 + 2] +
-        a[12 + r] * b[c * 4 + 3];
-    }
-  }
-  return o;
-}
-
-function perspective(fovDeg, aspect) {
-  const near = 0.05, far = 50;
-  const f = 1 / Math.tan((fovDeg * Math.PI) / 360);
-  const nf = 1 / (near - far);
-  return new Float32Array([
-    f / aspect, 0, 0, 0,
-    0, f, 0, 0,
-    0, 0, (far + near) * nf, -1,
-    0, 0, 2 * far * near * nf, 0,
-  ]);
-}
-
-function rotX(a) {
-  const c = Math.cos(a), s = Math.sin(a);
-  return new Float32Array([1,0,0,0, 0,c,s,0, 0,-s,c,0, 0,0,0,1]);
-}
-function rotY(a) {
-  const c = Math.cos(a), s = Math.sin(a);
-  return new Float32Array([c,0,-s,0, 0,1,0,0, s,0,c,0, 0,0,0,1]);
-}
-
-function sphere() {
-  const latBands = 48, lonBands = 72;
-  const positions = [], uvs = [], indices = [];
-  for (let y = 0; y <= latBands; y++) {
-    const v = y / latBands;
-    const theta = v * Math.PI;
-    for (let x = 0; x <= lonBands; x++) {
-      const u = x / lonBands;
-      const phi = u * Math.PI * 2;
-      positions.push(Math.sin(theta) * Math.sin(phi), Math.cos(theta), Math.sin(theta) * Math.cos(phi));
-      uvs.push(u, v);
-    }
-  }
-  for (let y = 0; y < latBands; y++) {
-    for (let x = 0; x < lonBands; x++) {
-      const a = y * (lonBands + 1) + x;
-      const b = a + lonBands + 1;
-      indices.push(a, b, a + 1, b, b + 1, a + 1);
-    }
-  }
-  return { positions: new Float32Array(positions), uvs: new Float32Array(uvs), indices: new Uint16Array(indices) };
-}
-
-async function boot(gl, canvas) {
-  const original = await loadImage(BASE + "/panorama.jpg");
-  let staged = null;
-  if (HAS_STAGED) {
-    try { staged = await loadImage(BASE + "/texture.jpg"); } catch (err) { staged = null; }
-  }
-  statusEl.classList.add("hide");
-  const texA = makeTexture(gl, original);
-  const texB = makeTexture(gl, staged || original);
-  const mesh = sphere();
-  const vs = gl.createShader(gl.VERTEX_SHADER);
-  gl.shaderSource(vs, `
-    attribute vec3 aPos; attribute vec2 aUv; uniform mat4 uMvp; varying vec2 vUv;
-    void main() { vUv = aUv; gl_Position = uMvp * vec4(aPos, 1.0); }
-  `);
-  gl.compileShader(vs);
-  const fs = gl.createShader(gl.FRAGMENT_SHADER);
-  gl.shaderSource(fs, `
-    precision mediump float; varying vec2 vUv; uniform sampler2D uA; uniform sampler2D uB; uniform float uMix;
-    void main() { gl_FragColor = mix(texture2D(uA, vUv), texture2D(uB, vUv), uMix); }
-  `);
-  gl.compileShader(fs);
-  const prog = gl.createProgram();
-  gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog); gl.useProgram(prog);
-  const bufP = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, bufP);
-  gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
-  const locP = gl.getAttribLocation(prog, "aPos");
-  gl.enableVertexAttribArray(locP);
-  gl.vertexAttribPointer(locP, 3, gl.FLOAT, false, 0, 0);
-  const bufU = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, bufU);
-  gl.bufferData(gl.ARRAY_BUFFER, mesh.uvs, gl.STATIC_DRAW);
-  const locU = gl.getAttribLocation(prog, "aUv");
-  gl.enableVertexAttribArray(locU);
-  gl.vertexAttribPointer(locU, 2, gl.FLOAT, false, 0, 0);
-  const bufI = gl.createBuffer();
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufI);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
-  gl.enable(gl.DEPTH_TEST);
-  gl.clearColor(0.05, 0.05, 0.09, 1);
-
-  let yaw = 0, pitch = 0, fov = 75, mix = INITIAL === "staged" ? 1 : INITIAL === "compare" ? 0.5 : 0;
-  if (!HAS_STAGED) mix = 0;
-  const slider = document.getElementById("mix");
-  const buttons = Array.from(document.querySelectorAll("[data-mode]"));
-  function applyMode(mode) {
-    if (mode === "staged" && HAS_STAGED) mix = 1;
-    else if (mode === "compare" && HAS_STAGED) mix = 0.5;
-    else mix = 0;
-    if (slider) slider.value = String(Math.round(mix * 100));
-    buttons.forEach((btn) => btn.classList.toggle("active", btn.dataset.mode === mode));
-    const compareRow = document.getElementById("compare");
-    if (compareRow) compareRow.classList.toggle("hide", mode !== "compare");
-    setChip(HAS_STAGED && mix > 0.01);
-  }
-  buttons.forEach((btn) => btn.addEventListener("click", () => applyMode(btn.dataset.mode)));
-  if (slider) slider.addEventListener("input", () => { mix = Number(slider.value) / 100; setChip(mix > 0.01); });
-  applyMode(HAS_STAGED ? INITIAL : "original");
-
-  let dragging = false, lastX = 0, lastY = 0, pinch = 0;
-  function down(x, y) { dragging = true; lastX = x; lastY = y; }
-  function move(x, y) {
-    if (!dragging) return;
-    yaw -= (x - lastX) * 0.005;
-    pitch -= (y - lastY) * 0.005;
-    pitch = Math.max(-1.25, Math.min(1.25, pitch));
-    lastX = x; lastY = y;
-  }
-  canvas.addEventListener("pointerdown", (e) => { canvas.setPointerCapture(e.pointerId); down(e.clientX, e.clientY); });
-  canvas.addEventListener("pointermove", (e) => move(e.clientX, e.clientY));
-  canvas.addEventListener("pointerup", () => { dragging = false; });
-  canvas.addEventListener("wheel", (e) => { e.preventDefault(); fov = Math.max(35, Math.min(100, fov + Math.sign(e.deltaY) * 3)); }, { passive: false });
-  canvas.addEventListener("touchstart", (e) => {
-    if (e.touches.length === 2) pinch = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
-  }, { passive: true });
-  canvas.addEventListener("touchmove", (e) => {
-    if (e.touches.length === 2 && pinch) {
-      const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
-      fov = Math.max(35, Math.min(100, fov - (d - pinch) * 0.15));
-      pinch = d;
-    }
-  }, { passive: true });
-
-  function frame() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
-    const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
-    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    const mvp = mul(perspective(fov, w / h), mul(rotY(yaw), rotX(pitch)));
-    gl.uniformMatrix4fv(gl.getUniformLocation(prog, "uMvp"), false, mvp);
-    gl.uniform1f(gl.getUniformLocation(prog, "uMix"), mix);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texA);
-    gl.uniform1i(gl.getUniformLocation(prog, "uA"), 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texB);
-    gl.uniform1i(gl.getUniformLocation(prog, "uB"), 1);
-    gl.drawElements(gl.TRIANGLES, mesh.indices.length, gl.UNSIGNED_SHORT, 0);
-    requestAnimationFrame(frame);
-  }
-  requestAnimationFrame(frame);
-}
-</script>
+<script type="application/json" id="viewer-config">__CONFIG__</script>
+<script src="/viewer-assets/pano-viewer.js?v=__PANO_JS_VERSION__"></script>
 </body>
 </html>
 """
@@ -357,12 +152,17 @@ def render_pano_page(
             "__NOTE__": "",
             "__BAR_CLASS__": "hide" if embed and not has_staged else "",
             "__CONTROLS__": _controls(asset_base, has_staged, has_world, embed),
-            "__HAS_STAGED__": "true" if has_staged else "false",
-            "__INITIAL__": '"' + initial + '"',
-            "__KIND__": '"pano"',
-            "__MARBLE__": "null",
-            "__STAGED_WORLD__": "false",
-            "__BASE__": '"' + escape(asset_base, quote=True) + '"',
+            "__CONFIG__": _config_json(
+                {
+                    "hasStaged": has_staged,
+                    "initial": initial,
+                    "kind": "pano",
+                    "marble": None,
+                    "stagedWorld": False,
+                    "base": asset_base,
+                }
+            ),
+            "__PANO_JS_VERSION__": PANO_JS_VERSION,
         }
     )
 
@@ -381,7 +181,6 @@ def render_world_page(
     safe_title = escape(title)
     base = escape(asset_base, quote=True)
     canvas = '<canvas id="c"></canvas>'
-    marble_js = "null"
     if world_ready:
         if waiting:
             lead = waiting
@@ -426,12 +225,17 @@ def render_world_page(
             "__NOTE__": note,
             "__BAR_CLASS__": "",
             "__CONTROLS__": controls,
-            "__HAS_STAGED__": "true" if staged_source else "false",
-            "__INITIAL__": '"staged"' if staged_source else '"original"',
-            "__KIND__": '"world"',
-            "__MARBLE__": marble_js,
-            "__STAGED_WORLD__": "true" if staged_source else "false",
-            "__BASE__": '"' + escape(asset_base, quote=True) + '"',
+            "__CONFIG__": _config_json(
+                {
+                    "hasStaged": staged_source,
+                    "initial": "staged" if staged_source else "original",
+                    "kind": "world",
+                    "marble": None,
+                    "stagedWorld": staged_source,
+                    "base": asset_base,
+                }
+            ),
+            "__PANO_JS_VERSION__": PANO_JS_VERSION,
         }
     )
 
@@ -487,120 +291,8 @@ _SPLAT_PAGE = """<!DOCTYPE html>
   <div id="loadText">Loading 3D tour…</div>
   <div class="bar"><div class="fill" id="fill"></div></div>
 </div>
-<script type="module">
-import * as THREE from "three";
-import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
-
-const SPLAT = __SPLAT__;
-const PANO = __PANO__;
-const loading = document.getElementById("loading");
-const fill = document.getElementById("fill");
-const text = document.getElementById("loadText");
-function post(msg) {
-  try { window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(msg)); } catch (e) {}
-}
-const LOAD_TIMEOUT_MS = 30000;
-let finished = false;
-function fail(reason) {
-  if (finished) return;
-  finished = true;
-  // Built with DOM nodes (no innerHTML); only our own relative links.
-  text.textContent = "";
-  const title = document.createElement("div");
-  title.style.fontWeight = "600";
-  title.textContent = "Can't show 3D on this device";
-  const body = document.createElement("div");
-  body.style.cssText = "opacity:.8;font-size:13px;margin:6px 0 12px;max-width:260px;text-align:center";
-  body.textContent = reason === "webgl"
-    ? "This browser doesn't support the 3D graphics the tour needs. You can still look around the 360° panorama."
-    : "The 3D tour took too long to load. Check your connection and try again, or look around the 360° panorama.";
-  const retry = document.createElement("a");
-  retry.className = "btn";
-  retry.href = "#";
-  retry.textContent = "Try again";
-  retry.addEventListener("click", (e) => { e.preventDefault(); location.reload(); });
-  const pano = document.createElement("a");
-  pano.className = "btn";
-  pano.href = PANO;
-  pano.textContent = "Open the 360° panorama";
-  const row = document.createElement("div");
-  row.style.cssText = "display:flex;gap:8px;justify-content:center";
-  row.append(retry, pano);
-  text.append(title, body, row);
-  fill.parentElement.classList.add("hide");
-  loading.querySelector(".spinner").classList.add("hide");
-  loading.classList.remove("done");
-  post({ type: "world-error", reason });
-}
-
-function hasWebGL2() {
-  try {
-    const probe = document.createElement("canvas");
-    return Boolean(window.WebGL2RenderingContext && probe.getContext("webgl2"));
-  } catch (e) {
-    return false;
-  }
-}
-if (!hasWebGL2()) {
-  fail("webgl");
-  throw new Error("WebGL2 unavailable");
-}
-const timer = setTimeout(() => fail("timeout"), LOAD_TIMEOUT_MS);
-
-let renderer;
-try {
-  // iPhone: no MSAA (splats don't need it) and at most 2x pixels.
-  renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
-} catch (e) {
-  clearTimeout(timer);
-  fail("webgl");
-  throw e;
-}
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
-document.body.prepend(renderer.domElement);
-
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000);
-const spark = new SparkRenderer({ renderer });
-scene.add(spark);
-
-const world = new SplatMesh({
-  url: SPLAT,
-  fileName: "world.spz",
-  onProgress: (event) => {
-    if (event.lengthComputable && event.total > 0) {
-      const pct = Math.round((event.loaded / event.total) * 100);
-      fill.style.width = pct + "%";
-      text.textContent = "Loading 3D tour… " + pct + "%";
-    } else {
-      text.textContent = "Loading 3D tour… " + Math.round(event.loaded / 1048576) + " MB";
-    }
-  },
-});
-// World Labs splats are in OpenCV axes (y down, z forward): flip to three.js.
-world.quaternion.set(1, 0, 0, 0);
-scene.add(world);
-world.initialized.then(() => {
-  if (finished) return;
-  finished = true;
-  clearTimeout(timer);
-  loading.classList.add("done");
-  post({ type: "world-loaded" });
-  setTimeout(() => document.getElementById("hint").classList.add("hide"), 5000);
-}).catch(() => { clearTimeout(timer); fail("timeout"); });
-
-const controls = new SparkControls({ canvas: renderer.domElement });
-window.addEventListener("resize", () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
-renderer.setAnimationLoop(() => {
-  controls.update(camera);
-  renderer.render(scene, camera);
-});
-</script>
+<script type="application/json" id="viewer-config">__CONFIG__</script>
+<script type="module" src="/viewer-assets/splat-viewer.js?v=__SPLAT_JS_VERSION__"></script>
 </body>
 </html>
 """
@@ -618,8 +310,6 @@ def render_splat_page(
     The splat comes from ``{asset_base}/world.spz`` (our private cache behind
     the share or preview token). No World Labs or CDN URL is ever in this page.
     """
-    import json as _json
-
     safe_title = escape(title)
     base = escape(asset_base, quote=True)
     splat = f"{asset_base}/world.spz" + ("?source=staged" if staged_source else "")
@@ -633,10 +323,21 @@ def render_splat_page(
         "__CONTROLS__": controls,
         "__CHIP_CLASS__": "" if staged_source else "hide",
         "__DISCLOSURE__": escape(DISCLOSURE_TEXT),
-        "__SPLAT__": _json.dumps(splat).replace("</", "<\\/"),
-        "__PANO__": _json.dumps(pano).replace("</", "<\\/"),
+        "__CONFIG__": _config_json({"splat": splat, "pano": pano}),
+        "__SPLAT_JS_VERSION__": SPLAT_JS_VERSION,
     }
     html = _SPLAT_PAGE
     for key, value in replacements.items():
         html = html.replace(key, value)
     return html
+
+
+def _importmap_hash() -> str:
+    match = re.search(r'<script type="importmap">(.*?)</script>', _SPLAT_PAGE, re.S)
+    assert match, "splat page lost its importmap"
+    digest = hashlib.sha256(match.group(1).encode()).digest()
+    return "sha256-" + base64.b64encode(digest).decode()
+
+
+# The import map is static, so CSP allows it by hash (no 'unsafe-inline').
+IMPORTMAP_CSP_HASH = _importmap_hash()

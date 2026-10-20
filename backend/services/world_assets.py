@@ -9,7 +9,10 @@ They are deleted with the project, by "Delete all my data", and on re-upload.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import tempfile
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 _ALLOWED_HOST_SUFFIX = ".worldlabs.ai"
 MAX_SPLAT_BYTES = 300 * 1024 * 1024
 MAX_MESH_BYTES = 100 * 1024 * 1024
+DOWNLOAD_CHUNK = 1024 * 1024
 
 KINDS = {
     "spz": ("application/octet-stream", MAX_SPLAT_BYTES),
@@ -48,7 +52,8 @@ def allowed_asset_url(url: object) -> str | None:
     return url
 
 
-async def _download(url: str, limit: int) -> bytes | None:
+async def _download(url: str, limit: int, dest: Path) -> bool:
+    """Stream ``url`` to ``dest`` on disk with a size cap (never held in memory)."""
     settings = get_settings()
     headers = {}
     if settings.worldlabs_api_key:
@@ -59,20 +64,62 @@ async def _download(url: str, limit: int) -> bytes | None:
         async with client.stream("GET", url, headers=headers) as response:
             if response.status_code != 200:
                 logger.warning("World asset download failed: HTTP %d", response.status_code)
-                return None
+                return False
             declared = response.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > limit:
                 logger.warning("World asset too large (%s bytes)", declared)
-                return None
-            chunks: list[bytes] = []
+                return False
             total = 0
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > limit:
-                    logger.warning("World asset exceeded %d bytes", limit)
-                    return None
-                chunks.append(chunk)
-            return b"".join(chunks)
+            with dest.open("wb") as handle:
+                async for chunk in response.aiter_bytes(DOWNLOAD_CHUNK):
+                    total += len(chunk)
+                    if total > limit:
+                        logger.warning("World asset exceeded %d bytes", limit)
+                        return False
+                    handle.write(chunk)
+            return total > 0
+
+
+_fill_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def fill_lock(project_id: str) -> asyncio.Lock:
+    """Per-project lock so concurrent viewers trigger one cache fill, not N downloads.
+
+    Keyed by event loop too (an asyncio.Lock is bound to one loop). Per process:
+    across replicas the fill is idempotent (same key, same bytes).
+    """
+    key = (id(asyncio.get_running_loop()), project_id)
+    lock = _fill_locks.get(key)
+    if lock is None:
+        lock = _fill_locks[key] = asyncio.Lock()
+    return lock
+
+
+async def _store_download(project_id: str, key: str, kind: str, url: str) -> bool:
+    """Download to a temp file, then copy into storage in chunks."""
+    content_type, limit = KINDS[kind]
+    with tempfile.TemporaryDirectory(prefix="world-asset-") as tmp:
+        path = Path(tmp) / f"asset.{kind}"
+        try:
+            ok = await _download(url, limit, path)
+        except httpx.HTTPError as exc:
+            logger.warning("World asset download for %s %s failed: %s", project_id, key, type(exc).__name__)
+            return False
+        if not ok or not path.is_file() or path.stat().st_size == 0:
+            return False
+        from db import get_project
+
+        if get_project(project_id) is None:
+            # Deleted while downloading: write nothing.
+            return False
+        storage = get_storage()
+        await asyncio.to_thread(storage.put_file, key, path, content_type)
+        if get_project(project_id) is None:
+            storage.delete_prefix(world_asset_prefix(project_id))
+            return False
+        logger.info("Cached world %s for %s (%d bytes)", key.rsplit("/", 1)[-1], project_id, path.stat().st_size)
+        return True
 
 
 async def cache_world_asset(project_id: str, source: str, kind: str, url: object) -> bool:
@@ -84,25 +131,10 @@ async def cache_world_asset(project_id: str, source: str, kind: str, url: object
     storage = get_storage()
     if storage.exists(key):
         return True
-    content_type, limit = KINDS[kind]
-    try:
-        data = await _download(safe, limit)
-    except httpx.HTTPError as exc:
-        logger.warning("World asset download for %s %s/%s failed: %s", project_id, source, kind, type(exc).__name__)
-        return False
-    if not data:
-        return False
-    from db import get_project
-
-    if get_project(project_id) is None:
-        # Deleted while downloading: write nothing.
-        return False
-    storage.put_bytes(key, data, content_type)
-    if get_project(project_id) is None:
-        storage.delete_prefix(world_asset_prefix(project_id))
-        return False
-    logger.info("Cached world %s for %s (%s, %d bytes)", kind, project_id, source, len(data))
-    return True
+    async with fill_lock(project_id):
+        if storage.exists(key):  # another request filled it while we waited
+            return True
+        return await _store_download(project_id, key, kind, safe)
 
 
 async def cache_world_assets(project_id: str, source: str, splat_url: object, mesh_url: object) -> None:
@@ -122,8 +154,12 @@ def clear_world_assets(project_id: str, source: str | None = None) -> None:
         storage.delete_prefix(world_asset_key(project_id, source, kind))
 
 
-async def world_asset_bytes(project, source: str, kind: str) -> bytes | None:
-    """Cached bytes; fetches lazily for worlds finished before the cache existed."""
+async def world_asset_stream(project, source: str, kind: str):
+    """(chunk iterator, size) of the cached asset; fills the cache lazily.
+
+    Worlds finished before the cache existed are downloaded on first view
+    (one download per project at a time, see ``fill_lock``).
+    """
     key = world_asset_key(project.id, source, kind)
     storage = get_storage()
     if not storage.exists(key):
@@ -132,4 +168,76 @@ async def world_asset_bytes(project, source: str, kind: str) -> bytes | None:
         url = getattr(project, f"{'staged_' if staged else ''}world_{attr}", None)
         if not await cache_world_asset(project.id, source, kind, url):
             return None
-    return storage.get_bytes(key)
+    try:
+        return await asyncio.to_thread(storage.open_stream, key)
+    except FileNotFoundError:
+        return None
+
+
+async def world_asset_bytes(project, source: str, kind: str) -> bytes | None:
+    """Whole file in memory. Tests/tools only; routes use ``world_asset_stream``."""
+    found = await world_asset_stream(project, source, kind)
+    if found is None:
+        return None
+    chunks, _size = found
+    return b"".join(chunks)
+
+
+async def _fetch_world_record(world_id: str) -> dict | None:
+    """Read-only GET of an existing World Labs world (no generation, no credits)."""
+    from services.world_gen import WORLDLABS_BASE
+    from services.world_urls import valid_world_id
+
+    settings = get_settings()
+    if not settings.worldlabs_api_key or valid_world_id(world_id) is None:
+        return None
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=False) as client:
+        response = await client.get(
+            f"{WORLDLABS_BASE}/marble/v1/worlds/{world_id}",
+            headers={"WLT-Api-Key": settings.worldlabs_api_key},
+        )
+    if response.status_code != 200:
+        logger.warning("World Labs world lookup for %s returned HTTP %d", world_id, response.status_code)
+        return None
+    body = response.json()
+    if not isinstance(body, dict):
+        return None
+    world = body.get("world") if isinstance(body.get("world"), dict) else body
+    return world
+
+
+async def refetch_lowest_splat(project, source: str = "original", *, apply: bool = False) -> str:
+    """Re-cache a world's splat at its lowest resolution (one-off maintenance).
+
+    Looks the existing world up (GET only: never generates a world or spends
+    credits), picks the smallest ``spz_urls`` entry, downloads it, then replaces
+    ``worlds/{id}/{source}.spz`` and the stored URL. ``apply=False`` only
+    reports what would change. Returns a short status (never a URL).
+    """
+    from db import update_project
+    from services.world_gen import parse_world
+
+    staged = source == "staged"
+    world_id = project.staged_world_id if staged else project.world_id
+    if not world_id:
+        return "skip: no world"
+    world = await _fetch_world_record(world_id)
+    if world is None:
+        return "skip: world lookup failed"
+    smallest = allowed_asset_url(parse_world({"response": world}).get("splat_url"))
+    if smallest is None:
+        return "skip: no splat url"
+    current = project.staged_world_splat_url if staged else project.world_splat_url
+    key = world_asset_key(project.id, source, "spz")
+    if smallest == current and get_storage().exists(key):
+        return "ok: already lowest-res"
+    if not apply:
+        return "would refetch"
+    async with fill_lock(project.id):
+        # Clear the old cached file, then download the low-res one.
+        get_storage().delete_prefix(key)
+        if not await _store_download(project.id, key, "spz", smallest):
+            return "error: download failed (cache cleared; next view re-fills from the stored URL)"
+    field = "staged_world_splat_url" if staged else "world_splat_url"
+    update_project(project.id, **{field: smallest})
+    return "refetched"

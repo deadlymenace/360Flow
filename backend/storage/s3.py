@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -29,7 +30,21 @@ class S3Storage:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
 
     def put_file(self, key: str, path: Path, content_type: str) -> None:
-        self.put_bytes(key, path.read_bytes(), content_type)
+        """Multipart upload straight from disk (no full read into memory)."""
+        self.client.upload_file(str(path), self.bucket, key, ExtraArgs={"ContentType": content_type})
+
+    def open_stream(self, key: str, chunk_size: int = 1024 * 1024) -> tuple[Iterator[bytes], int | None]:
+        obj = self.client.get_object(Bucket=self.bucket, Key=key)
+        body = obj["Body"]
+        size = obj.get("ContentLength")
+
+        def chunks() -> Iterator[bytes]:
+            try:
+                yield from body.iter_chunks(chunk_size)
+            finally:
+                body.close()
+
+        return chunks(), size
 
     def get_bytes(self, key: str) -> bytes:
         obj = self.client.get_object(Bucket=self.bucket, Key=key)

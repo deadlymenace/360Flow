@@ -20,9 +20,10 @@ CDN_MESH = "https://cdn.marble.worldlabs.ai/w1/def.glb"
 def fake_cdn(monkeypatch):
     calls: list[str] = []
 
-    async def fake_download(url: str, limit: int):
+    async def fake_download(url: str, limit: int, dest):
         calls.append(url)
-        return SPLAT if url.endswith(".spz") else MESH
+        dest.write_bytes(SPLAT if url.endswith(".spz") else MESH)
+        return True
 
     monkeypatch.setattr(world_assets, "_download", fake_download)
     return calls
@@ -78,7 +79,7 @@ def test_device_auth_splat_route(client, fake_cdn):
     ok = client.raw.get(url, headers=auth)
     assert ok.status_code == 200
     assert ok.content == SPLAT
-    assert "private" in ok.headers["cache-control"]
+    assert ok.headers["cache-control"] == "no-store"
     # Second request is served from the private cache, not the CDN.
     assert client.raw.get(url, headers=auth).content == SPLAT
     assert fake_cdn == [CDN_SPLAT]
@@ -193,7 +194,10 @@ def test_smallest_splat_is_cached_for_phones():
 def test_viewer_page_has_fallbacks_and_no_public_urls(client):
     from viewer import render_splat_page
 
-    html = render_splat_page(title="Room", asset_base="/v/tok", staged_source=False, has_staged=False)
+    page = render_splat_page(title="Room", asset_base="/v/tok", staged_source=False, has_staged=False)
+    script = client.raw.get("/viewer-assets/splat-viewer.js").text
+    assert '<script type="module">' not in page  # no inline module script any more
+    html = page + script
     assert "Can't show 3D on this device" in html
     assert "webgl2" in html and "LOAD_TIMEOUT_MS = 30000" in html
     assert "Try again" in html
