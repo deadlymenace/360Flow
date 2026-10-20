@@ -626,3 +626,35 @@ def test_share_page_shows_draft_world_while_full_world_generates(client):
     assert "https://marble.worldlabs.ai/world/draft-1" in page.text
     assert "Fast 3D preview" in page.text
     assert "still generating" in page.text
+
+
+def test_upload_stores_pitches_and_operator_debug(client, monkeypatch):
+    import auth
+
+    created = client.post("/api/v1/projects", json={"name": "Pitch"}).json()
+    project_id = created["id"]
+    files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+    bad = client.post(
+        f"/api/v1/projects/{project_id}/upload",
+        files=files,
+        data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180], "pitches_deg": [1]})},
+    )
+    assert bad.status_code == 400
+    files = [("images", (f"{index:02d}.jpg", _jpeg(index), "image/jpeg")) for index in range(2)]
+    ok = client.post(
+        f"/api/v1/projects/{project_id}/upload",
+        files=files,
+        data={"metadata": json.dumps({"hfov_deg": 90, "yaws_deg": [0, 180], "pitches_deg": [2.5, -3]})},
+    )
+    assert ok.status_code == 200, ok.text
+    device_view = client.get(f"/api/v1/projects/{project_id}").json()
+    assert device_view["debug"] is None
+
+    monkeypatch.setattr(auth, "_admin_key_matches", lambda presented: presented == "operator-test-key")
+    admin_view = client.raw.get(f"/api/v1/projects/{project_id}", headers={"x-api-key": "operator-test-key"})
+    assert admin_view.status_code == 200, admin_view.text
+    debug = admin_view.json()["debug"]
+    assert debug["yaws_deg"] == [0, 180]
+    assert json.loads(debug["yaws_json"]) == [0, 180]
+    assert debug["pitches_deg"] == [2.5, -3]
+    assert debug["hfov_deg"] == 90

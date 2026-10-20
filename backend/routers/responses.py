@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from fastapi import Request
 from fastapi.responses import Response
 
@@ -83,7 +85,24 @@ def to_project(row: ProjectRecord, request: Request | None = None, *, admin: boo
         active_job=row.active_job,
         disclosure=DISCLOSURE_TEXT if staged else None,
         provider_error=row.provider_error if admin else None,
+        debug=_capture_debug(row) if admin else None,
     )
+
+
+def _capture_debug(row: ProjectRecord) -> dict:
+    def _load(raw):
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return None
+
+    return {
+        "hfov_deg": row.hfov_deg,
+        "lens": row.lens,
+        "yaws_json": row.yaws_json,
+        "yaws_deg": _load(row.yaws_json),
+        "pitches_deg": _load(getattr(row, "pitches_json", None)),
+    }
 
 
 def status_body(row: ProjectRecord, request: Request | None = None) -> dict:

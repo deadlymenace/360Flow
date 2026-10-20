@@ -6,8 +6,8 @@ import {
   OneEuroVec3,
   RateFilter,
   YawUnwrapper,
+  nextDotReady,
   angleDeg,
-  applyDeadZone,
   basisFromForwardUp,
   deviceAxes,
   manualShotAllowed,
@@ -65,15 +65,6 @@ test('one-euro filter follows a real turn', () => {
   }
   const lag = 90 - yawPitchFromForward(out).yawDeg;
   assert.ok(lag >= 0 && lag < 10, `lag ${lag.toFixed(1)}°`);
-});
-
-test('dead zone ignores small moves and follows big ones', () => {
-  const shown = { x: 0, y: 1, z: 0 };
-  const small = { x: Math.sin(1 * RAD), y: Math.cos(1 * RAD), z: 0 };
-  assert.deepEqual(applyDeadZone(shown, small, 1.5), shown);
-  const big = { x: Math.sin(10 * RAD), y: Math.cos(10 * RAD), z: 0 };
-  const moved = applyDeadZone(shown, big, 1.5);
-  assert.ok(Math.abs(angleDeg(moved, big) - 1.5) < 0.05);
 });
 
 test('yaw unwrapping has no jump at 360 → 0', () => {
@@ -148,9 +139,36 @@ test('haptic cooldown: at most one buzz per cooldown window', () => {
   assert.equal(c.tryFire(1600), true);
 });
 
-test('tuning: exit 9°, hold 300 ms, cooldown 600 ms', () => {
-  assert.equal(CAPTURE_TUNING.aimExitDeg, 9);
-  assert.equal(CAPTURE_TUNING.holdMs, 300);
+test('tuning: enter 3°/exit 7°, hold 1 s, steady 7°/s, drain 3, shot cooldown 800 ms', () => {
+  assert.equal(CAPTURE_TUNING.aimEnterDeg, 3);
+  assert.equal(CAPTURE_TUNING.aimExitDeg, 7);
+  assert.equal(CAPTURE_TUNING.holdMs, 1000);
+  assert.equal(CAPTURE_TUNING.steadyMaxDegPerSec, 7);
+  assert.equal(CAPTURE_TUNING.holdDrainRate, 3);
+  assert.equal(CAPTURE_TUNING.shotCooldownMs, 800);
+  assert.equal(CAPTURE_TUNING.nextDotMinMoveDeg, 10);
+  assert.equal(CAPTURE_TUNING.debugAimLog, false);
   assert.equal(CAPTURE_TUNING.hapticCooldownMs, 600);
   assert.ok(CAPTURE_TUNING.aimExitDeg > CAPTURE_TUNING.aimEnterDeg);
+});
+
+test('next dot waits for the cooldown and a 10° turn', () => {
+  assert.equal(nextDotReady(1000, null, null), true);
+  assert.equal(nextDotReady(1500, 1000, 30), false); // cooling down
+  assert.equal(nextDotReady(1900, 1000, 4), false); // has not turned yet
+  assert.equal(nextDotReady(1900, 1000, 12), true);
+});
+
+test('hold needs a full second of steady aim; motion over 7°/s drains it', () => {
+  const tracker = new AimTracker();
+  let fired = false;
+  for (let i = 0; i < 50; i += 1) {
+    const s = tracker.update({ angleDeg: 1, rateDegPerSec: 3, dtMs: 16, blocked: false, targetChanged: false });
+    fired = fired || s.fire;
+  }
+  assert.equal(fired, false, 'fired before 1 s');
+  for (let i = 0; i < 20; i += 1) tracker.update({ angleDeg: 1, rateDegPerSec: 20, dtMs: 16, blocked: false, targetChanged: false });
+  let t = 0;
+  while (!tracker.update({ angleDeg: 1, rateDegPerSec: 3, dtMs: 16, blocked: false, targetChanged: false }).fire) t += 16;
+  assert.ok(t > 300, `refilled too fast: ${t} ms`);
 });

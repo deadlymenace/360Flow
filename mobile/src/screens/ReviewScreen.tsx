@@ -71,12 +71,15 @@ export default function ReviewScreen({ navigation, route }: Props) {
   const allCaptured = capturedCount === SEGMENT_COUNT;
 
   const handleUpload = () => {
-    const ordered = segments.filter((s) => s.imageUri !== null);
+    // Order by segment id (not array position) so a skipped or deleted segment
+    // never shifts a photo onto its neighbor's yaw.
+    const ordered = segments.filter((s) => s.imageUri !== null).sort((a, b) => a.id - b.id);
     const params = {
       projectId,
       projectName,
       imageUris: ordered.map((s) => s.imageUri as string),
       yaws: ordered.map((s) => s.actualYaw ?? s.id * SEGMENT_ANGLE),
+      pitches: ordered.map((s) => s.actualPitch ?? 0),
       hfov,
       lens,
     };

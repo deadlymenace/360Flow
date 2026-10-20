@@ -94,6 +94,8 @@ export interface CaptureSegment {
   targetYaw: number;
   imageUri: string | null;
   actualYaw: number | null;
+  /** Camera pitch at the shutter, degrees, positive = up. */
+  actualPitch?: number | null;
   capturedAt: Date | null;
 }
 
@@ -160,6 +162,7 @@ export function makeSegments(): CaptureSegment[] {
     targetYaw: i * SEGMENT_ANGLE,
     imageUri: null,
     actualYaw: null,
+    actualPitch: null,
     capturedAt: null,
   }));
 }

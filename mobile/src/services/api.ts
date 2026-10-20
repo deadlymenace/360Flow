@@ -91,6 +91,8 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout 
 
 export interface UploadOptions {
   yaws?: number[];
+  /** Per-shot camera pitch, degrees, positive = up. */
+  pitches?: number[];
   hfov?: number;
   lens?: string;
   /** 'preparing' while copying photos locally, 'sending' once the POST starts. */
@@ -161,6 +163,7 @@ class APIService {
       JSON.stringify({
         hfov_deg: options.hfov,
         yaws_deg: options.yaws,
+        pitches_deg: options.pitches,
         lens: options.lens,
       })
     );

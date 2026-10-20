@@ -20,6 +20,10 @@
     "src/capture/motionFilter.ts",
     "src/capture/motionFilter.test.ts",
     "src/services/deletePolicy.ts",
-    "src/services/deletePolicy.test.ts"
+    "src/services/deletePolicy.test.ts",
+    "src/capture/yawFusion.ts",
+    "src/capture/yawFusion.test.ts",
+    "src/capture/lensFov.ts",
+    "src/capture/lensFov.test.ts"
   ]
 }

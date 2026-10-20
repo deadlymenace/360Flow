@@ -507,6 +507,12 @@ async def run_stitch(project_id: str) -> str | None:
         if len(keys) < 2:
             raise RuntimeError("Not enough images to stitch")
         yaws = json.loads(project.yaws_json) if project.yaws_json else None
+        pitches_raw = getattr(project, "pitches_json", None)
+        pitches = json.loads(pitches_raw) if pitches_raw else None
+        logger.info(
+            "Stitch %s: %d images, hfov_deg=%s lens=%s yaws=%s pitches=%s",
+            project_id, len(keys), project.hfov_deg, getattr(project, "lens", None), yaws, pitches,
+        )
         with tempfile.TemporaryDirectory(prefix="360flow-stitch-") as tmp:
             root = Path(tmp)
             paths: list[Path] = []
@@ -520,7 +526,7 @@ async def run_stitch(project_id: str) -> str | None:
             pool = stitch_executor()
             ok = await loop.run_in_executor(
                 pool,
-                lambda: stitch_images(paths, output, yaws_deg=yaws, hfov_deg=hfov, refine=True),
+                lambda: stitch_images(paths, output, yaws_deg=yaws, pitches_deg=pitches, hfov_deg=hfov, refine=True),
             )
             if not ok or not output.is_file():
                 raise RuntimeError("Stitching failed. Try recapturing with more overlap between photos.")

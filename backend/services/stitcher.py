@@ -48,6 +48,7 @@ def stitch_images(
     yaws_deg: list[float] | None = None,
     hfov_deg: float | None = None,
     refine: bool = True,
+    pitches_deg: list[float] | None = None,
 ) -> bool:
     """Stitch ordered photos into an equirectangular JPEG.
 
@@ -64,15 +65,28 @@ def stitch_images(
 
     images = _downscale_images(images)
     images = _match_sizes(images)
-    hfov = float(hfov_deg) if hfov_deg else _hfov_from_exif(paths[0]) or DEFAULT_HFOV_DEG
+    hfov = _resolve_hfov(hfov_deg, _hfov_from_exif(paths[0]))
     yaws = _resolve_yaws(yaws_deg, len(images))
-    pitches = [0.0] * len(images)
+    captured_pitches = _resolve_pitches(pitches_deg, len(images))
+    pitches = list(captured_pitches) if captured_pitches else [0.0] * len(images)
+    logger.info(
+        "Stitch input: %d images %dx%d, hfov=%.1f° (sent=%s), yaws=%s, pitches=%s",
+        len(images),
+        images[0].shape[1],
+        images[0].shape[0],
+        hfov,
+        hfov_deg,
+        [round(y, 1) for y in yaws],
+        [round(p, 1) for p in pitches],
+    )
 
     if refine:
         refined_yaws, refined_pitches = _refine_alignment(images, yaws, hfov)
         if refined_yaws is not None:
             yaws = refined_yaws
-            pitches = refined_pitches or pitches
+            # Measured pitch from the phone beats image-derived drift.
+            if not captured_pitches:
+                pitches = refined_pitches or pitches
 
     panorama = _project_equirect(images, yaws, pitches, hfov)
     if panorama is None:
@@ -208,6 +222,39 @@ def _hfov_from_exif(path: Path) -> float | None:
     diag = float(np.hypot(width, height))
     hfov = 2 * np.arctan((width / diag) * np.tan(diag_fov / 2))
     return float(np.degrees(hfov))
+
+
+# Sent and EXIF field of view may disagree by this much before EXIF wins.
+HFOV_EXIF_TOLERANCE_DEG = 8.0
+
+
+def _resolve_hfov(sent: float | None, exif: float | None) -> float:
+    """Prefer the app's lens FOV, but trust EXIF when they clearly disagree.
+
+    The app knows which lens it selected; EXIF knows which lens actually took
+    the photo. A mismatch (Expo Go falling back to the wide lens, say) wrecks
+    the projection, so the photo's own metadata wins and the mismatch is logged.
+    """
+    if sent and exif:
+        if abs(float(sent) - exif) > HFOV_EXIF_TOLERANCE_DEG:
+            logger.warning("hfov mismatch: app sent %.1f°, EXIF says %.1f°; using EXIF", float(sent), exif)
+            return float(exif)
+        return float(sent)
+    if sent:
+        return float(sent)
+    if exif:
+        return float(exif)
+    logger.warning("No hfov from app or EXIF; using default %.1f°", DEFAULT_HFOV_DEG)
+    return DEFAULT_HFOV_DEG
+
+
+def _resolve_pitches(pitches_deg: list[float] | None, count: int) -> list[float] | None:
+    if not pitches_deg:
+        return None
+    if len(pitches_deg) != count:
+        logger.warning("Ignoring %d pitch values for %d images", len(pitches_deg), count)
+        return None
+    return [max(-45.0, min(45.0, float(p))) for p in pitches_deg]
 
 
 def _resolve_yaws(yaws_deg: list[float] | None, count: int) -> list[float]:
@@ -357,14 +404,14 @@ def _project_equirect(
     # When the focal length wants a wider canvas than we allow, sample the
     # output on that coarser grid but keep the source focal — the pinhole
     # model is in source pixels, and the equirect maps longitude linearly.
-    scales = _overlap_gains(images, yaws, hfov_deg)
+    scales = _overlap_gains(images, yaws, hfov_deg, pitches)
     acc = np.zeros((out_h, out_w, 3), dtype=np.float32)
     weight_acc = np.zeros((out_h, out_w), dtype=np.float32)
     for image, yaw, pitch, scale in zip(images, yaws, pitches, scales):
         prepared = np.clip(image.astype(np.float32) * scale, 0, 255)
         _blend_image(prepared, acc, weight_acc, yaw, pitch, hfov_deg, focal)
 
-    valid = weight_acc > 1e-3
+    valid = weight_acc > 1e-9
     if int(valid.sum()) < 100:
         return None
     composed = np.zeros_like(acc)
@@ -378,33 +425,52 @@ def _overlap_gains(
     images: list[np.ndarray],
     yaws: list[float],
     hfov_deg: float,
+    pitches: list[float] | None = None,
 ) -> list[float]:
-    """Match exposure on the overlapping strip of each neighbor pair.
+    """Match exposure where neighboring photos overlap on the sphere.
 
-    Scales stay at 1 when the shots already agree, which is the synthetic
-    case and any locked-exposure capture.
+    Each photo is projected onto a small equirect canvas with its real yaw and
+    pitch, and neighbors are compared only on pixels both cover. The earlier
+    version compared fixed image-edge strips, which assumes exact 22.5° steps
+    and no tilt; with handheld yaw jitter it compared different content and
+    produced bright/dark bands. Scales stay at 1 when shots already agree.
     """
     count = len(images)
     ones = [1.0] * count
+    if count < 2:
+        return ones
+    pitches = pitches or [0.0] * count
+    small_w = 512
+    small_h = small_w // 2
     height, width = images[0].shape[:2]
+    scale = min(1.0, 320.0 / max(height, width))
+    thumbs = [
+        cv2.cvtColor(
+            cv2.resize(image, (max(2, int(width * scale)), max(2, int(height * scale))), interpolation=cv2.INTER_AREA),
+            cv2.COLOR_BGR2GRAY,
+        ).astype(np.float32)[..., None]
+        for image in images
+    ]
+    t_h, t_w = thumbs[0].shape[:2]
+    focal = (t_w / 2.0) / np.tan(np.radians(hfov_deg) / 2.0)
+    projected: list[tuple[np.ndarray, np.ndarray]] = []
+    for thumb, yaw, pitch in zip(thumbs, yaws, pitches):
+        acc = np.zeros((small_h, small_w, 1), dtype=np.float32)
+        weight = np.zeros((small_h, small_w), dtype=np.float32)
+        _blend_image(thumb, acc, weight, yaw, pitch, hfov_deg, focal, center_power=0.0)
+        mask = weight > 0.2
+        values = np.zeros((small_h, small_w), dtype=np.float32)
+        values[mask] = acc[..., 0][mask] / weight[mask]
+        projected.append((values, mask))
+
     ratios: list[float] = []
     for index in range(count):
-        step = (yaws[(index + 1) % count] - yaws[index]) % 360.0
-        if step <= 1 or step >= hfov_deg:
+        values_a, mask_a = projected[index]
+        values_b, mask_b = projected[(index + 1) % count]
+        shared = mask_a & mask_b
+        if int(shared.sum()) < 50:
             return ones
-        overlap = 1.0 - step / hfov_deg
-        cols = max(8, int(width * overlap * 0.45))
-        if cols >= width - 4:
-            return ones
-        left = images[index][:, -cols:]
-        right = images[(index + 1) % count][:, :cols]
-        shared_h = min(left.shape[0], right.shape[0])
-        shared_w = min(left.shape[1], right.shape[1])
-        gray_left = cv2.cvtColor(left[:shared_h, :shared_w], cv2.COLOR_BGR2GRAY).astype(np.float32)
-        gray_right = cv2.cvtColor(right[:shared_h, :shared_w], cv2.COLOR_BGR2GRAY).astype(np.float32)
-        median_left = float(np.median(gray_left)) + 1.0
-        median_right = float(np.median(gray_right)) + 1.0
-        ratios.append(median_left / median_right)
+        ratios.append((float(np.median(values_a[shared])) + 1.0) / (float(np.median(values_b[shared])) + 1.0))
 
     logs = np.log(np.clip(ratios, 0.5, 2.0))
     logs = logs - logs.mean()
@@ -426,6 +492,7 @@ def _blend_image(
     pitch_deg: float,
     hfov_deg: float,
     focal: float,
+    center_power: float | None = None,
 ) -> None:
     src_h, src_w = image.shape[:2]
     out_h, out_w = weight_acc.shape
@@ -492,8 +559,25 @@ def _blend_image(
         )
         inside = safe & (map_x >= 0) & (map_y >= 0) & (map_x <= src_w - 1) & (map_y <= src_h - 1)
         weight = _feather(map_x, map_y, src_w, src_h) * inside.astype(np.float32)
+        power = CENTER_WEIGHT_POWER if center_power is None else center_power
+        if power > 0:
+            weight = weight * _center_weight(map_x, src_w, power)
+        if patch.ndim == 2:
+            patch = patch[..., None]
         acc[y0:y1, x0:x1] += patch * weight[..., None]
         weight_acc[y0:y1, x0:x1] += weight
+
+
+# Exponent on the horizontal center weight. Large values give every output
+# pixel to the photo whose center is nearest, with a narrow cross-fade at the
+# seam, instead of averaging all ~4 overlapping photos (ghosting).
+CENTER_WEIGHT_POWER = 12.0
+
+
+def _center_weight(map_x: np.ndarray, width: int, power: float) -> np.ndarray:
+    half = max((width - 1) / 2.0, 1.0)
+    offset = np.clip(np.abs(map_x - half) / half, 0.0, 1.0)
+    return np.power(1.0 - offset, power).astype(np.float32) + 1e-6
 
 
 def _feather(map_x: np.ndarray, map_y: np.ndarray, width: int, height: int) -> np.ndarray:

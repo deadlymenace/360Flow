@@ -120,22 +120,6 @@ export class OneEuroVec3 {
   }
 }
 
-/**
- * Soft dead zone: the shown vector stays still until the filtered one is more
- * than `deadZoneDeg` away, then follows it, trailing by the dead-zone angle.
- */
-export function applyDeadZone(shown: Vec3 | null, target: Vec3, deadZoneDeg: number = CAPTURE_TUNING.deadZoneDeg): Vec3 {
-  if (!shown) return vnorm(target);
-  const angle = angleDeg(shown, target);
-  if (angle <= deadZoneDeg) return shown;
-  const t = (angle - deadZoneDeg) / angle;
-  return vnorm({
-    x: shown.x + (target.x - shown.x) * t,
-    y: shown.y + (target.y - shown.y) * t,
-    z: shown.z + (target.z - shown.z) * t,
-  });
-}
-
 /** Re-orthogonalise a smoothed up vector against a smoothed forward vector. */
 export function basisFromForwardUp(forward: Vec3, upHint: Vec3): { right: Vec3; up: Vec3; look: Vec3 } {
   const look = vnorm(forward);
@@ -253,4 +237,20 @@ export class Cooldown {
     this.last = nowMs;
     return true;
   }
+}
+
+/**
+ * After a shot: no next-dot highlight and no auto-capture until the cooldown
+ * (which covers the shutter feedback) has passed AND the camera has turned
+ * away from the last shot by nextDotMinMoveDeg. Shots fire only from intent.
+ */
+export function nextDotReady(
+  nowMs: number,
+  lastShotAtMs: number | null,
+  degFromLastShot: number | null,
+  tuning = CAPTURE_TUNING,
+): boolean {
+  if (lastShotAtMs == null) return true;
+  if (nowMs - lastShotAtMs < tuning.shotCooldownMs) return false;
+  return degFromLastShot == null || degFromLastShot > tuning.nextDotMinMoveDeg;
 }
