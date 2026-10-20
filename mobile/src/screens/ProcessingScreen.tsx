@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Animated, Easing } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, ActivityIndicator, Animated, Easing, AppState } from 'react-native';
+import { useKeepAwake } from 'expo-keep-awake';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
@@ -29,6 +30,10 @@ export default function ProcessingScreen({ navigation, route }: Props) {
   const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
   const busyRef = useRef(false);
+  const phaseRef = useRef<Phase>('preparing');
+  phaseRef.current = phase;
+  // Uploads and stitching can take a while; don't let the screen sleep.
+  useKeepAwake();
 
   const stopPolling = () => {
     if (pollingRef.current) clearInterval(pollingRef.current);
@@ -120,6 +125,16 @@ export default function ProcessingScreen({ navigation, route }: Props) {
       fail(__DEV__ ? e?.message : "Couldn't restart processing. Check your connection and try again.");
     }
   }, [projectId, startPolling]);
+
+  // Back from the background (timers may have been paused): check the project status right away.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next !== 'active' || !mountedRef.current || busyRef.current) return;
+      const p = phaseRef.current;
+      if (p === 'stitching' || p === 'slow') startPolling();
+    });
+    return () => sub.remove();
+  }, [startPolling]);
 
   useEffect(() => {
     mountedRef.current = true;

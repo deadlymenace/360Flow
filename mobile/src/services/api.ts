@@ -1,6 +1,13 @@
 import { Directory, File, Paths } from 'expo-file-system';
 import Constants from 'expo-constants';
 import * as SecureStore from 'expo-secure-store';
+import {
+  DeleteOutcome,
+  DeleteProjectError,
+  friendlyDeleteMessage,
+  isLocalDraft,
+  outcomeForDeleteStatus,
+} from './deletePolicy';
 import { Project, StageStatus, StatusResponse, WorldStatus } from '../models/types';
 import { TimeoutError, UPLOAD_TIMEOUT_MS, UploadStage, classifyError, errorForStatus } from './uploadPolicy';
 
@@ -125,9 +132,19 @@ class APIService {
     return res.json();
   }
 
-  async deleteProject(projectId: string): Promise<void> {
-    const res = await fetchWithTimeout(`${this.baseUrl}/projects/${projectId}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error(`Delete project failed: ${res.status}`);
+  /**
+   * Resolves 'deleted', or 'already-gone' for a 404 or a local-only draft.
+   * Throws DeleteProjectError with friendly copy for anything else.
+   */
+  async deleteProject(projectId: string): Promise<DeleteOutcome> {
+    if (isLocalDraft(projectId)) return 'already-gone';
+    let res: Response;
+    try {
+      res = await fetchWithTimeout(`${this.baseUrl}/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' });
+    } catch {
+      throw new DeleteProjectError(null, friendlyDeleteMessage(null));
+    }
+    return outcomeForDeleteStatus(res.status);
   }
 
   /**

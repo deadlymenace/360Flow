@@ -15,6 +15,7 @@ import { useFocusEffect } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { RootStackParamList } from '../navigation';
 import { api } from '../services/api';
+import { DeleteProjectError, markDeleted, withoutDeleted } from '../services/deletePolicy';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Project, getStatusColor, liveStatusLabel, relativeTime } from '../models/types';
 import { hasSeenCaptureCoach } from '../services/privacy';
@@ -38,7 +39,7 @@ export default function HomeScreen({ navigation }: Props) {
     try {
       setLoadError(null);
       const data = await api.listProjects();
-      setProjects(data);
+      setProjects(withoutDeleted(data));
     } catch (e: any) {
       setLoadError(e.message || 'Cannot connect to the backend');
     } finally {
@@ -145,10 +146,15 @@ export default function HomeScreen({ navigation }: Props) {
           style: 'destructive',
           onPress: async () => {
             try {
+              // 'deleted' or 'already-gone' (404, or a local-only draft): either way it's gone.
               await api.deleteProject(project.id);
+              markDeleted(project.id);
               setProjects((current) => current.filter((item) => item.id !== project.id));
-            } catch (e: any) {
-              Alert.alert('Could not delete', e.message || 'Try again');
+            } catch (e: unknown) {
+              Alert.alert(
+                'Could not delete',
+                e instanceof DeleteProjectError ? e.message : "Couldn't delete this room. Try again.",
+              );
             }
           },
         },
@@ -167,7 +173,10 @@ export default function HomeScreen({ navigation }: Props) {
       <TouchableOpacity
         style={styles.projectInfo}
         onPress={() => handleProjectPress(item)}
+        onLongPress={() => confirmDelete(item)}
+        delayLongPress={450}
         accessibilityRole="button"
+        accessibilityHint="Long-press to delete"
         accessibilityLabel={`${item.name}. ${label}. ${meta}`}
       >
         <Text style={styles.projectName} numberOfLines={1}>{item.name}</Text>

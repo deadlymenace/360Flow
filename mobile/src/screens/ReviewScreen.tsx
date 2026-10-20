@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  Alert,
   View,
   Text,
   Image,
@@ -11,6 +12,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { CommonActions } from '@react-navigation/native';
 import { RootStackParamList } from '../navigation';
 import { SEGMENT_ANGLE, SEGMENT_COUNT } from '../models/types';
 import { hasAiDisclosureConsent } from '../services/privacy';
@@ -23,14 +25,46 @@ const THUMB_SIZE = (SCREEN_WIDTH - GRID_PADDING * 2 - GRID_GAP * 3) / 4;
 type Props = NativeStackScreenProps<RootStackParamList, 'Review'>;
 
 export default function ReviewScreen({ navigation, route }: Props) {
-  const { projectId, projectName, hfov, lens, segments } = route.params;
+  const { projectId, projectName, hfov, lens } = route.params;
   const insets = useSafeAreaInsets();
   const [preview, setPreview] = useState<number | null>(null);
+  // Photos deleted here; Capture is told immediately (see deletePhoto).
+  const [deleted, setDeleted] = useState<number[]>([]);
+  const segments = route.params.segments.map((s) => (deleted.includes(s.id) ? { ...s, imageUri: null } : s));
   const previewSeg = preview != null ? segments.find((s) => s.id === preview) : null;
 
   const retake = (index: number) => {
     setPreview(null);
-    navigation.popTo('Capture', { projectId, projectName, retakeIndex: index, retakeNonce: Date.now() });
+    navigation.popTo('Capture', {
+      projectId,
+      projectName,
+      retakeIndex: index,
+      retakeNonce: Date.now(),
+      clearIndices: deleted,
+    });
+  };
+
+  const deletePhoto = (index: number) => {
+    Alert.alert(`Delete photo ${index + 1}?`, "You'll need to take it again before creating the tour.", [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete photo',
+        style: 'destructive',
+        onPress: () => {
+          setPreview(null);
+          const next = deleted.includes(index) ? deleted : [...deleted, index];
+          setDeleted(next);
+          // Tell Capture now, so the normal Back and the swipe back carry the deletion too.
+          const capture = navigation.getState().routes.find((r) => r.name === 'Capture');
+          if (capture) {
+            navigation.dispatch({
+              ...CommonActions.setParams({ clearIndices: next, clearNonce: Date.now() }),
+              source: capture.key,
+            });
+          }
+        },
+      },
+    ]);
   };
 
   const capturedCount = segments.filter((s) => s.imageUri !== null).length;
@@ -137,6 +171,16 @@ export default function ReviewScreen({ navigation, route }: Props) {
               <Text style={styles.uploadButtonText}>Retake #{previewSeg.id + 1}</Text>
             </TouchableOpacity>
           ) : null}
+          {previewSeg?.imageUri ? (
+            <TouchableOpacity
+              style={styles.deletePhotoButton}
+              onPress={() => deletePhoto(previewSeg.id)}
+              accessibilityRole="button"
+              accessibilityLabel={`Delete photo ${previewSeg.id + 1}`}
+            >
+              <Text style={styles.deletePhotoText}>Delete photo</Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
       </Modal>
     </View>
@@ -144,6 +188,8 @@ export default function ReviewScreen({ navigation, route }: Props) {
 }
 
 const styles = StyleSheet.create({
+  deletePhotoButton: { marginTop: 12, minHeight: 44, alignItems: 'center', justifyContent: 'center' },
+  deletePhotoText: { color: '#FF6B6B', fontWeight: '700', fontSize: 16 },
   container: {
     flex: 1,
     backgroundColor: '#1a1a2e',

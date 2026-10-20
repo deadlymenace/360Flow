@@ -28,6 +28,10 @@ export type RootStackParamList = {
     retakeIndex?: number;
     /** Changes on every retake request so the same index can be retaken twice. */
     retakeNonce?: number;
+    /** Photos deleted on Review; cleared here so they get re-shot. */
+    clearIndices?: number[];
+    /** Changes whenever Review deletes a photo, so Capture re-applies clearIndices. */
+    clearNonce?: number;
   };
   /** First-run coach. `next` opens Capture after; without it the coach just closes (Tips). */
   CaptureCoach: { next?: { projectId: string; projectName: string } } | undefined;
