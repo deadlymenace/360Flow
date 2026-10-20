@@ -15,6 +15,7 @@ from httpguard import GuardMiddleware
 from routers.devices import router as devices_router
 from routers.projects import router as projects_router
 from routers.share import router as share_router
+from routers.viewer_assets import router as viewer_assets_router
 from services.world_gen import retry_pending_world_deletes, world_credits_balance
 from storage import init_storage
 
@@ -121,6 +122,7 @@ def create_app() -> FastAPI:
     app.include_router(devices_router, prefix="/api/v1")
     app.include_router(projects_router, prefix="/api/v1")
     app.include_router(share_router)
+    app.include_router(viewer_assets_router)
 
     @app.get("/health")
     async def health(x_api_key: str | None = Header(default=None)):

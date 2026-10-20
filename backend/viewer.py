@@ -434,3 +434,163 @@ def render_world_page(
             "__BASE__": '"' + escape(asset_base, quote=True) + '"',
         }
     )
+
+
+_SPLAT_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="robots" content="noindex" />
+<title>__TITLE__ · 3D tour</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0e0e18; color: #fff; overflow: hidden;
+    font: 15px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; touch-action: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .top { position: fixed; top: env(safe-area-inset-top, 0); left: 0; right: 0; padding: 12px 14px;
+    display: flex; gap: 8px; align-items: center; pointer-events: none;
+    background: linear-gradient(rgba(0,0,0,.55), rgba(0,0,0,0)); }
+  .title { font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .btn { pointer-events: auto; color: #fff; text-decoration: none; background: rgba(255,255,255,.16);
+    padding: 7px 11px; border-radius: 999px; font-size: 13px; }
+  .chip { position: fixed; left: 14px; bottom: calc(env(safe-area-inset-bottom, 0) + 14px);
+    background: rgba(0,0,0,.6); padding: 6px 10px; border-radius: 8px; font-size: 12px; }
+  .hide { display: none; }
+  #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; background: #0e0e18; transition: opacity .4s; }
+  #loading.done { opacity: 0; pointer-events: none; }
+  .bar { width: 220px; height: 6px; border-radius: 3px; background: rgba(255,255,255,.15); overflow: hidden; }
+  .fill { height: 100%; width: 0; background: #7cffb2; transition: width .15s; }
+  .spinner { width: 34px; height: 34px; border-radius: 50%; border: 3px solid rgba(255,255,255,.2);
+    border-top-color: #7cffb2; animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hint { position: fixed; bottom: calc(env(safe-area-inset-bottom, 0) + 14px); right: 14px; font-size: 12px;
+    color: rgba(255,255,255,.75); background: rgba(0,0,0,.45); padding: 6px 10px; border-radius: 8px; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "/viewer-assets/three.module.min.js",
+    "three/addons/postprocessing/Pass.js": "/viewer-assets/three-addons-Pass.js",
+    "@sparkjsdev/spark": "/viewer-assets/spark-2.3.1.module.min.js"
+} }
+</script>
+</head>
+<body>
+<div class="top">
+  <div class="title">__TITLE__</div>
+  __CONTROLS__
+</div>
+<div class="chip __CHIP_CLASS__">__DISCLOSURE__</div>
+<div class="hint" id="hint">Drag to look · pinch or two fingers to move</div>
+<div id="loading" role="status" aria-live="polite">
+  <div class="spinner"></div>
+  <div id="loadText">Loading 3D tour…</div>
+  <div class="bar"><div class="fill" id="fill"></div></div>
+</div>
+<script type="module">
+import * as THREE from "three";
+import { SparkRenderer, SplatMesh, SparkControls } from "@sparkjsdev/spark";
+
+const SPLAT = __SPLAT__;
+const PANO = __PANO__;
+const loading = document.getElementById("loading");
+const fill = document.getElementById("fill");
+const text = document.getElementById("loadText");
+function post(msg) {
+  try { window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify(msg)); } catch (e) {}
+}
+function fail() {
+  text.innerHTML = 'The 3D tour could not load on this device. <a class="btn" href="' + PANO + '">Open the 360° panorama</a>';
+  fill.parentElement.classList.add("hide");
+  loading.querySelector(".spinner").classList.add("hide");
+  post({ type: "world-error" });
+}
+
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: false });
+} catch (e) {
+  fail();
+  throw e;
+}
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000);
+const spark = new SparkRenderer({ renderer });
+scene.add(spark);
+
+const world = new SplatMesh({
+  url: SPLAT,
+  fileName: "world.spz",
+  onProgress: (event) => {
+    if (event.lengthComputable && event.total > 0) {
+      const pct = Math.round((event.loaded / event.total) * 100);
+      fill.style.width = pct + "%";
+      text.textContent = "Loading 3D tour… " + pct + "%";
+    } else {
+      text.textContent = "Loading 3D tour… " + Math.round(event.loaded / 1048576) + " MB";
+    }
+  },
+});
+// World Labs splats are in OpenCV axes (y down, z forward): flip to three.js.
+world.quaternion.set(1, 0, 0, 0);
+scene.add(world);
+world.initialized.then(() => {
+  loading.classList.add("done");
+  post({ type: "world-loaded" });
+  setTimeout(() => document.getElementById("hint").classList.add("hide"), 5000);
+}).catch(fail);
+
+const controls = new SparkControls({ canvas: renderer.domElement });
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+renderer.setAnimationLoop(() => {
+  controls.update(camera);
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
+"""
+
+
+def render_splat_page(
+    *,
+    title: str,
+    asset_base: str,
+    staged_source: bool,
+    has_staged: bool,
+) -> str:
+    """Self-hosted Spark (three.js) Gaussian-splat viewer.
+
+    The splat comes from ``{asset_base}/world.spz`` (our private cache behind
+    the share or preview token). No World Labs or CDN URL is ever in this page.
+    """
+    import json as _json
+
+    safe_title = escape(title)
+    base = escape(asset_base, quote=True)
+    splat = f"{asset_base}/world.spz" + ("?source=staged" if staged_source else "")
+    pano = f"{asset_base}/" + ("?view=staged" if staged_source else "")
+    controls = f'<a class="btn" href="{base}/">Panorama</a>'
+    if has_staged:
+        other = f"{base}/world" if staged_source else f"{base}/world?source=staged"
+        controls = f'<a class="btn" href="{other}">{"Original 3D" if staged_source else "Staged 3D"}</a> ' + controls
+    replacements = {
+        "__TITLE__": safe_title,
+        "__CONTROLS__": controls,
+        "__CHIP_CLASS__": "" if staged_source else "hide",
+        "__DISCLOSURE__": escape(DISCLOSURE_TEXT),
+        "__SPLAT__": _json.dumps(splat).replace("</", "<\\/"),
+        "__PANO__": _json.dumps(pano).replace("</", "<\\/"),
+    }
+    html = _SPLAT_PAGE
+    for key, value in replacements.items():
+        html = html.replace(key, value)
+    return html

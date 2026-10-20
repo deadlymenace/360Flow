@@ -98,7 +98,10 @@ export default function WorldScreen({ navigation, route }: Props) {
             <Text style={styles.error}>{error}</Text>
           </View>
         )}
-        {viewerUrl && <WebViewFrame uri={viewerUrl} style={styles.web} label="the 3D tour" />}
+        {viewerUrl && (
+          // Our Spark splat viewer: touches drive the 3D camera, so the page must not scroll.
+          <WebViewFrame uri={viewerUrl} style={styles.web} label="the 3D tour" scrollEnabled={false} bounces={false} overScrollMode="never" />
+        )}
         {delayed && viewerUrl && (
           <View style={styles.draft} pointerEvents="none">
             <Text style={styles.draftText}>

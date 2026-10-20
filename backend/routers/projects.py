@@ -18,8 +18,9 @@ from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
 from services.pipeline import enqueue_job, retry_delayed_project, start_job
 from services.uploads import normalize_upload
+from services.world_assets import world_asset_bytes
 from services.world_gen import queue_unshared_world_deletes
-from storage import delete_project_assets, get_storage, panorama_key, staged_key, upload_key
+from storage import delete_project_assets, get_storage, panorama_key, staged_key, upload_key, world_asset_prefix
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,7 @@ async def upload_images(
     storage.delete_prefix(f"uploads/{project_id}/")
     storage.delete_prefix(panorama_key(project_id))
     storage.delete_prefix(staged_key(project_id))
+    storage.delete_prefix(world_asset_prefix(project_id))
     for index, payload in enumerate(payloads):
         storage.put_bytes(upload_key(project_id, index), payload, "image/jpeg")
     logger.info("Project %s: stored %d images", project_id, count)
@@ -408,3 +410,41 @@ async def get_generate_3d_status(project_id: str, request: Request):
         "error": project.error,
         "disclosure": DISCLOSURE_TEXT if project.staged_key else None,
     }
+
+
+def world_asset_response(data: bytes, kind: str) -> Response:
+    media = "application/octet-stream" if kind == "spz" else "model/gltf-binary"
+    return Response(
+        content=data,
+        media_type=media,
+        headers={
+            # Private: no shared caches, never a public bucket URL.
+            "Cache-Control": "private, max-age=3600",
+            "Content-Disposition": f'inline; filename="world.{kind}"',
+        },
+    )
+
+
+async def _project_world_asset(project_id: str, request: Request, source: str, kind: str) -> Response:
+    if source not in {"original", "staged"}:
+        raise HTTPException(status_code=400, detail="source must be original or staged")
+    project = _require(project_id, request)
+    ready = project.staged_world_marble_url if source == "staged" else project.world_marble_url
+    if not ready:
+        raise HTTPException(status_code=404, detail="3D world not ready yet")
+    data = await world_asset_bytes(project, source, kind)
+    if data is None:
+        raise HTTPException(status_code=404, detail="3D world file not available")
+    return world_asset_response(data, kind)
+
+
+@router.get("/projects/{project_id}/world.spz")
+async def get_world_splat(project_id: str, request: Request, source: str = Query(default="original")):
+    """Gaussian splat of the finished world, from our private cache (device auth)."""
+    return await _project_world_asset(project_id, request, source, "spz")
+
+
+@router.get("/projects/{project_id}/world.glb")
+async def get_world_mesh(project_id: str, request: Request, source: str = Query(default="original")):
+    """Collider mesh of the finished world, from our private cache (device auth)."""
+    return await _project_world_asset(project_id, request, source, "glb")
