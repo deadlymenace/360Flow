@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   AimTracker,
+  Cooldown,
   OneEuroVec3,
   RateFilter,
   YawUnwrapper,
@@ -137,4 +138,19 @@ test('basis from smoothed forward/up is orthonormal and matches the device axes'
   const b = basisFromForwardUp(axes.forward, axes.up);
   assert.ok(angleDeg(b.right, axes.right) < 1e-3);
   assert.ok(angleDeg(b.up, axes.up) < 1e-3);
+});
+
+test('haptic cooldown: at most one buzz per cooldown window', () => {
+  const c = new Cooldown(CAPTURE_TUNING.hapticCooldownMs);
+  assert.equal(c.tryFire(1000), true);
+  assert.equal(c.tryFire(1100), false);
+  assert.equal(c.tryFire(1599), false);
+  assert.equal(c.tryFire(1600), true);
+});
+
+test('tuning: exit 9°, hold 300 ms, cooldown 600 ms', () => {
+  assert.equal(CAPTURE_TUNING.aimExitDeg, 9);
+  assert.equal(CAPTURE_TUNING.holdMs, 300);
+  assert.equal(CAPTURE_TUNING.hapticCooldownMs, 600);
+  assert.ok(CAPTURE_TUNING.aimExitDeg > CAPTURE_TUNING.aimEnterDeg);
 });

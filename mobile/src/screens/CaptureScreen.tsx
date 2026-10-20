@@ -8,8 +8,10 @@ import {
   Alert,
   Linking,
   Animated,
+  ActivityIndicator,
   useWindowDimensions,
 } from 'react-native';
+import { useKeepAwake } from 'expo-keep-awake';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { DeviceMotion, DeviceMotionMeasurement } from 'expo-sensors';
@@ -27,7 +29,7 @@ import {
 } from '../models/types';
 import { HapticFeedback } from '../utils/haptics';
 import { api } from '../services/api';
-import { markDeleted } from '../services/deletePolicy';
+import { SingleFlight, deleteWithTimeout, hideRowAfter, markDeleted } from '../services/deletePolicy';
 import CaptureMiniMap from '../components/CaptureMiniMap';
 import { LOW_LIGHT_HINT, isLowLight } from '../capture/lowLight';
 import {
@@ -42,7 +44,9 @@ import {
 import { CAPTURE_TUNING as T } from '../capture/tuning';
 import {
   AimTracker,
+  Cooldown,
   OneEuroVec3,
+  YawUnwrapper,
   RateFilter,
   Vec3,
   applyDeadZone,
@@ -84,8 +88,6 @@ type Ui = {
   edge: boolean;
   /** Angle to the next dot, rounded to 5° for the hint text. */
   alignBucket: number;
-  /** Heading for the mini map, rounded to 3°. */
-  headingBucket: number;
 };
 
 const EMPTY_UI: Ui = {
@@ -100,7 +102,6 @@ const EMPTY_UI: Ui = {
   levelOk: false,
   edge: false,
   alignBucket: 0,
-  headingBucket: 0,
 };
 
 function sameUi(a: Ui, b: Ui): boolean {
@@ -113,8 +114,7 @@ function sameUi(a: Ui, b: Ui): boolean {
     a.fast !== b.fast ||
     a.levelOk !== b.levelOk ||
     a.edge !== b.edge ||
-    a.alignBucket !== b.alignBucket ||
-    a.headingBucket !== b.headingBucket
+    a.alignBucket !== b.alignBucket
   ) {
     return false;
   }
@@ -128,8 +128,12 @@ const AnimatedCircle = Animated.createAnimatedComponent(Circle);
 
 /** Never re-renders on sensor ticks: props only change when the lens does. */
 const StableCamera = memo(
-  React.forwardRef<CameraView, { selectedLens?: string; onAvailableLensesChanged: (e: { lenses: string[] }) => void }>(
-    function StableCamera({ selectedLens, onAvailableLensesChanged }, ref) {
+  React.forwardRef<CameraView, {
+    selectedLens?: string;
+    onAvailableLensesChanged: (e: { lenses: string[] }) => void;
+    onCameraReady: () => void;
+  }>(
+    function StableCamera({ selectedLens, onAvailableLensesChanged, onCameraReady }, ref) {
       return (
         <CameraView
           ref={ref}
@@ -137,6 +141,7 @@ const StableCamera = memo(
           facing="back"
           selectedLens={selectedLens}
           onAvailableLensesChanged={onAvailableLensesChanged}
+          onCameraReady={onCameraReady}
         />
       );
     },
@@ -155,7 +160,7 @@ const FAILURES_BEFORE_RESTART_HINT = 3;
 type MotionState = 'checking' | 'ok' | 'unavailable' | 'denied' | 'stalled';
 
 export default function CaptureScreen({ navigation, route }: Props) {
-  const { projectId, projectName, retakeIndex, retakeNonce, clearIndices } = route.params;
+  const { projectId, projectName, retakeIndex, retakeNonce, clearIndices, clearNonce } = route.params;
   const insets = useSafeAreaInsets();
   const focused = useIsFocused();
   const { width, height } = useWindowDimensions();
@@ -179,6 +184,16 @@ export default function CaptureScreen({ navigation, route }: Props) {
   const manualOnlyRef = useRef(false);
   const completedRef = useRef(false);
   const leavingRef = useRef(false);
+  // Every capture waits for CameraView's onCameraReady.
+  const cameraReadyRef = useRef(false);
+  const handleCameraReady = useCallback(() => {
+    cameraReadyRef.current = true;
+  }, []);
+  // "Discard and delete room": one delete at a time, with a spinner.
+  const deleteFlight = useRef(new SingleFlight()).current;
+  const [deletingRoom, setDeletingRoom] = useState(false);
+  const hapticGate = useRef(new Cooldown(T.hapticCooldownMs)).current;
+  useKeepAwake();
   const cameraRef = useRef<CameraView>(null);
   const segmentsRef = useRef(segments);
   const originRef = useRef<number | null>(null);
@@ -196,6 +211,8 @@ export default function CaptureScreen({ navigation, route }: Props) {
     horizonRot: new Animated.Value(0),
     edge: new Animated.ValueXY({ x: -100, y: -100 }),
     edgeRot: new Animated.Value(0),
+    /** Unwrapped mini-map heading (degrees), so the dial never spins at 359°→0°. */
+    heading: new Animated.Value(0),
   }).current;
   const hfovRef = useRef(hfov);
   const reduceRef = useRef(reduceMotion);
@@ -243,14 +260,37 @@ export default function CaptureScreen({ navigation, route }: Props) {
     };
   }, []);
 
+  // Delete this room on the server, wait at most ~8 s, then go back anyway.
+  // A 404 counts as gone; after a timeout the row is hidden too (the request may still land).
+  const deleteRoomThenLeave = useCallback(
+    (action: Parameters<typeof navigation.dispatch>[0]) => {
+      void deleteFlight.run(async () => {
+        leavingRef.current = true;
+        setDeletingRoom(true);
+        const outcome = await deleteWithTimeout(() => api.deleteProject(projectId));
+        if (hideRowAfter(outcome)) markDeleted(projectId);
+        // 'failed' (offline or 5xx): the row stays on Home and can be deleted there.
+        setDeletingRoom(false);
+        navigation.dispatch(action);
+      });
+    },
+    [deleteFlight, navigation, projectId],
+  );
+
   // P0-2: confirm before a back gesture or button throws photos away.
   useEffect(() => {
     const unsub = navigation.addListener('beforeRemove', (e) => {
       const count = segmentsRef.current.filter((seg) => seg.imageUri !== null).length;
       const type = e.data.action.type;
       const userBack = type === 'GO_BACK' || type === 'POP';
-      if (count === 0 || !userBack || leavingRef.current) return;
+      if (!userBack || leavingRef.current) return;
       e.preventDefault();
+      if (deleteFlight.inFlight) return; // a delete is already running; it navigates when done
+      if (count === 0) {
+        // Nothing captured: don't leave a ghost "0 photos" room behind.
+        deleteRoomThenLeave(e.data.action);
+        return;
+      }
       Alert.alert(
         `Discard ${count} photo${count === 1 ? '' : 's'}?`,
         'Your photos for this room are only on this screen. Leaving now throws them away.',
@@ -265,27 +305,28 @@ export default function CaptureScreen({ navigation, route }: Props) {
             },
           },
           {
-            // P0-11: don't leave a ghost "0 photos" room behind.
+            // P0-11: wait for the server so the list Home fetches on return no longer has this room.
             text: 'Discard and delete room',
             style: 'destructive',
-            onPress: async () => {
-              leavingRef.current = true;
-              // Wait for the server before going back, so the list Home fetches
-              // on return no longer has this room (that race caused the 404).
-              try {
-                await api.deleteProject(projectId); // a 404 already counts as gone
-                markDeleted(projectId);
-              } catch {
-                // Offline or 5xx: the row stays on Home ("Not captured yet") and can be deleted there.
-              }
-              navigation.dispatch(e.data.action);
-            },
+            onPress: () => deleteRoomThenLeave(e.data.action),
           },
         ],
       );
     });
     return unsub;
-  }, [navigation, projectId]);
+  }, [navigation, deleteFlight, deleteRoomThenLeave]);
+
+  // Photos deleted on Review reach Capture on every way back (Back, swipe, Retake).
+  useEffect(() => {
+    if (!clearIndices || clearIndices.length === 0) return;
+    const clear = new Set(clearIndices);
+    completedRef.current = false;
+    setCompleteFlash(false);
+    setSegments((prev) =>
+      prev.map((seg, i) => (clear.has(i) ? { ...seg, imageUri: null, actualYaw: null, capturedAt: null } : seg)),
+    );
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clearNonce]);
 
   // P0-3: Review asked to retake a photo. Clear it and point at its dot.
   useEffect(() => {
@@ -326,7 +367,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
   }, []);
 
   const captureAt = useCallback(async (index: number) => {
-    if (captureLock.current || !cameraRef.current) return;
+    if (captureLock.current || !cameraRef.current || !cameraReadyRef.current) return;
     if (index < 0 || index >= SEGMENT_COUNT) return;
     const pose = poseRef.current;
     // Without motion data only the manual fallback may shoot, using fixed yaws.
@@ -391,7 +432,8 @@ export default function CaptureScreen({ navigation, route }: Props) {
   captureRef.current = captureAt;
 
   useEffect(() => {
-    if (!permission?.granted || (motion !== 'ok' && motion !== 'stalled')) return;
+    // Stops while Review (or anything else) covers Capture; filters start fresh on return.
+    if (!focused || !permission?.granted || (motion !== 'ok' && motion !== 'stalled')) return;
     DeviceMotion.setUpdateInterval(T.sensorIntervalMs);
     const watchdog = setTimeout(() => {
       if (!poseRef.current) setMotion('stalled');
@@ -422,6 +464,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
     let raf = 0;
     let last = 0;
     let lastSuggested = -1;
+    const headingUnwrap = new YawUnwrapper();
     const DEG = 180 / Math.PI;
     const tick = (now: number) => {
       raf = requestAnimationFrame(tick);
@@ -454,6 +497,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
         const shownDots = projectTargets(pose.shown, origin, viewW, viewH, hfovRef.current);
         const rawDots = projectTargets(pose.raw, origin, viewW, viewH, hfovRef.current);
         headingDeg = wrap360(yawPitchFromForward(pose.shown.look).yawDeg - origin);
+        anim.heading.setValue(headingUnwrap.update(headingDeg));
         const next = nearestTarget(rawDots, captured);
         suggested = next ? next.index : -1;
         alignDeg = next ? next.angleDeg : 180;
@@ -485,11 +529,12 @@ export default function CaptureScreen({ navigation, route }: Props) {
         angleDeg: alignDeg,
         rateDegPerSec: rate,
         dtMs: dt,
-        blocked: !open || tilted || captureLock.current,
+        // The first photo is always a manual tap: it sets where the tour starts.
+        blocked: origin == null || !open || tilted || captureLock.current,
         targetChanged: suggested !== lastSuggested,
       });
       lastSuggested = suggested;
-      if (state.lockedOn) void HapticFeedback.light();
+      if (state.lockedOn && hapticGate.tryFire(now)) void HapticFeedback.light();
       if (state.fire && open) void captureRef.current(suggested);
       anim.ring.setValue(reduceRef.current ? (state.progress > 0 ? 1 : 0) : state.progress);
       anim.horizonY.setValue(Math.max(-26, Math.min(26, -shownPitch * 1.4)));
@@ -507,7 +552,6 @@ export default function CaptureScreen({ navigation, route }: Props) {
         levelOk: Math.abs(rollDeg) <= T.levelOkDeg && Math.abs(shownPitch) <= T.levelOkDeg,
         edge: edgeOn,
         alignBucket: Math.round(alignDeg / 5) * 5,
-        headingBucket: Math.round(headingDeg / 3) * 3,
       };
       if (!sameUi(uiRef.current, nextUi)) {
         uiRef.current = nextUi;
@@ -520,7 +564,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
       cancelAnimationFrame(raf);
       sub.remove();
     };
-  }, [permission?.granted, motion === 'ok' || motion === 'stalled']);
+  }, [focused, permission?.granted, motion === 'ok' || motion === 'stalled']);
 
   const handleManual = useCallback(() => {
     if (manualOnlyRef.current && !poseRef.current) {
@@ -695,7 +739,12 @@ export default function CaptureScreen({ navigation, route }: Props) {
 
   return (
     <View style={styles.container}>
-      <StableCamera ref={cameraRef} selectedLens={selectedLens} onAvailableLensesChanged={handleLenses} />
+      <StableCamera
+        ref={cameraRef}
+        selectedLens={selectedLens}
+        onAvailableLensesChanged={handleLenses}
+        onCameraReady={handleCameraReady}
+      />
 
       <View style={styles.overlay} pointerEvents="box-none">
         <View>
@@ -840,7 +889,7 @@ export default function CaptureScreen({ navigation, route }: Props) {
           <View accessible accessibilityLabel={`Map: ${capturedCount} of ${SEGMENT_COUNT} photos done`}>
             <CaptureMiniMap
               captured={capturedFlags}
-              headingDeg={ui.headingBucket}
+              heading={anim.heading}
               suggested={ui.suggested}
             />
           </View>
@@ -879,6 +928,12 @@ export default function CaptureScreen({ navigation, route }: Props) {
           <Text style={styles.hintText} maxFontSizeMultiplier={1.4} accessibilityLiveRegion="polite">
             {hint}
           </Text>
+        {deletingRoom ? (
+          <View style={styles.deletingOverlay} accessibilityLiveRegion="polite" accessibilityLabel="Deleting room">
+            <ActivityIndicator size="large" color="#fff" />
+            <Text style={styles.deletingText}>Deleting room…</Text>
+          </View>
+        ) : null}
         </View>
       </View>
     </View>
@@ -904,7 +959,7 @@ function hintText(
   if (capturing) return 'Capturing…';
   if (ui.tilted) return 'Level the phone, then aim at a dot';
   if (ui.fast) return 'Slow down, hold still';
-  if (!locked) return 'Face the most interesting wall, then hold still';
+  if (!locked) return 'Face your starting wall and tap';
   if (turnHint) return 'Turn right ➜';
   if (ui.locked) return ui.holding ? 'Hold steady' : 'Tap to capture, or hold steady';
   if (ui.edge) return `${ui.alignBucket}° to the next dot`;
@@ -912,6 +967,14 @@ function hintText(
 }
 
 const styles = StyleSheet.create({
+  deletingOverlay: {
+    ...StyleSheet.absoluteFill,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  deletingText: { color: '#fff', fontSize: 16, fontWeight: '600' },
   container: {
     flex: 1,
     backgroundColor: '#000',

@@ -93,7 +93,8 @@ export class OneEuroVec3 {
       this.lastT = tSec;
       return this.x;
     }
-    const dt = Math.max(1e-3, tSec - this.lastT);
+    // Floor at 8 ms: duplicate or bunched sensor events must not blow up the derivative.
+    const dt = Math.max(0.008, tSec - this.lastT);
     this.lastT = tSec;
     const raw = { x: (value.x - this.x.x) / dt, y: (value.y - this.x.y) / dt, z: (value.z - this.x.z) / dt };
     const ad = smoothingAlpha(this.dCutoffHz, dt);
@@ -240,4 +241,16 @@ export class AimTracker {
 export function manualShotAllowed(angleToCurrentDeg: number, pitchDeg: number, tuning = CAPTURE_TUNING): boolean {
   if (Math.abs(pitchDeg) > tuning.tiltLimitDeg) return false;
   return angleToCurrentDeg <= tuning.manualRingDeg;
+}
+
+/** Lets an event through at most once per cooldownMs (stops haptic buzzing at the hysteresis edge). */
+export class Cooldown {
+  private last = -Infinity;
+  constructor(private readonly cooldownMs: number) {}
+  /** True if the event may fire now; records it. */
+  tryFire(nowMs: number): boolean {
+    if (nowMs - this.last < this.cooldownMs) return false;
+    this.last = nowMs;
+    return true;
+  }
 }

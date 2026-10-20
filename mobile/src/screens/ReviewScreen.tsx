@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+import { CommonActions } from '@react-navigation/native';
 import { RootStackParamList } from '../navigation';
 import { SEGMENT_ANGLE, SEGMENT_COUNT } from '../models/types';
 import { hasAiDisclosureConsent } from '../services/privacy';
@@ -27,7 +28,7 @@ export default function ReviewScreen({ navigation, route }: Props) {
   const { projectId, projectName, hfov, lens } = route.params;
   const insets = useSafeAreaInsets();
   const [preview, setPreview] = useState<number | null>(null);
-  // Photos deleted here; Capture clears them too when we go back to re-shoot.
+  // Photos deleted here; Capture is told immediately (see deletePhoto).
   const [deleted, setDeleted] = useState<number[]>([]);
   const segments = route.params.segments.map((s) => (deleted.includes(s.id) ? { ...s, imageUri: null } : s));
   const previewSeg = preview != null ? segments.find((s) => s.id === preview) : null;
@@ -51,7 +52,16 @@ export default function ReviewScreen({ navigation, route }: Props) {
         style: 'destructive',
         onPress: () => {
           setPreview(null);
-          setDeleted((current) => (current.includes(index) ? current : [...current, index]));
+          const next = deleted.includes(index) ? deleted : [...deleted, index];
+          setDeleted(next);
+          // Tell Capture now, so the normal Back and the swipe back carry the deletion too.
+          const capture = navigation.getState().routes.find((r) => r.name === 'Capture');
+          if (capture) {
+            navigation.dispatch({
+              ...CommonActions.setParams({ clearIndices: next, clearNonce: Date.now() }),
+              source: capture.key,
+            });
+          }
         },
       },
     ]);

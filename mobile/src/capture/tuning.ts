@@ -2,8 +2,8 @@
 // real iPhone (TestFlight) and keep the comments in sync with what you change.
 
 export const CAPTURE_TUNING = {
-  /** DeviceMotion update interval. 16 ms ≈ 60 Hz; 33 ms ≈ 30 Hz saves battery. */
-  sensorIntervalMs: 16,
+  /** DeviceMotion update interval. 33 ms ≈ 30 Hz: smooth enough after the one-euro filter, and saves battery. */
+  sensorIntervalMs: 33,
 
   /**
    * One-euro filter on the camera forward (and up) vector, used only for
@@ -17,10 +17,10 @@ export const CAPTURE_TUNING = {
 
   /** Aim hysteresis: lock on inside enterDeg, lose lock only beyond exitDeg. */
   aimEnterDeg: 4,
-  aimExitDeg: 7,
+  aimExitDeg: 9,
 
   /** Hold this long while locked and steady before auto-capture fires. */
-  holdMs: 400,
+  holdMs: 300,
 
   /** Gyro speed (deg/s, low-passed) below which the phone counts as steady. */
   steadyMaxDegPerSec: 12,
@@ -36,6 +36,9 @@ export const CAPTURE_TUNING = {
   tiltLimitDeg: 18,
   /** Horizon cue turns green inside ± this many degrees of roll and pitch. */
   levelOkDeg: 8,
+
+  /** Lock-on haptic plays at most once per this many ms. */
+  hapticCooldownMs: 600,
 } as const;
 
 export type CaptureTuning = typeof CAPTURE_TUNING;
