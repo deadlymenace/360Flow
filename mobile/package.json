@@ -8,7 +8,7 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
-    "test": "tsc -p tsconfig.test.json && node --test .test-build/"
+    "test": "tsc -p tsconfig.test.json && node --test .test-build/ && node --test scripts/worklets.test.cjs"
   },
   "dependencies": {
     "@react-navigation/native": "^7.1.28",
