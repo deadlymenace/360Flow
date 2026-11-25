@@ -126,6 +126,9 @@ class Settings:
     max_image_bytes: int
     max_images: int
     min_images: int
+    max_projects_per_device: int
+    max_storage_bytes_per_device: int
+    atlas_max_submit_attempts_per_job: int
     log_level: str
 
     @property
@@ -251,5 +254,8 @@ def get_settings() -> Settings:
         max_image_bytes=_int("MAX_IMAGE_BYTES", 12 * 1024 * 1024),
         max_images=_int("MAX_IMAGES", 24),
         min_images=_int("MIN_IMAGES", 2),
+        max_projects_per_device=max(0, _int("MAX_PROJECTS_PER_DEVICE", 20)),
+        max_storage_bytes_per_device=max(0, _int("MAX_STORAGE_BYTES_PER_DEVICE", 200 * 1024 * 1024)),
+        atlas_max_submit_attempts_per_job=max(1, _int("ATLAS_MAX_SUBMIT_ATTEMPTS_PER_JOB", 2)),
         log_level=_blank("LOG_LEVEL") or "INFO",
     )

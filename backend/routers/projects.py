@@ -22,11 +22,19 @@ from db import (
     save_idempotency_record,
     update_project,
 )
+from db import count_device_projects, device_storage_bytes
 from db import create_project as create_project_row
 from db import list_projects as list_project_rows
 from models.project import CreateProjectRequest, Project, StageRequest, UploadMetadata
 from routers.responses import jpeg_response, labeled_jpeg, status_body, to_project
-from services.byok import clear_project_keys, set_project_auto_3d, set_project_stage_key, set_project_world_key
+from services.byok import (
+    clear_project_keys,
+    get_project_stage_key,
+    get_project_world_key,
+    set_project_auto_3d,
+    set_project_stage_key,
+    set_project_world_key,
+)
 from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
 from services.pipeline import enqueue_job, retry_delayed_project, start_job
@@ -163,6 +171,17 @@ def _check_idempotency(scope: str | None, request_hash: str) -> JSONResponse | N
 @router.post("/projects")
 async def create_project(req: CreateProjectRequest, request: Request) -> Project:
     caller = _caller(request)
+    settings = get_settings()
+    if (
+        not caller.is_admin
+        and caller.device_id
+        and settings.max_projects_per_device > 0
+        and count_device_projects(caller.device_id) >= settings.max_projects_per_device
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Device project limit reached ({settings.max_projects_per_device}). Delete an old project first.",
+        )
     return to_project(create_project_row(req.name, owner_device_id=caller.device_id))
 
 
@@ -260,6 +279,17 @@ async def upload_images(
             return cached
 
     _reject_if_busy(project.status)
+    if (
+        not caller.is_admin
+        and caller.device_id
+        and settings.max_storage_bytes_per_device > 0
+    ):
+        projected = device_storage_bytes(caller.device_id, exclude_project_id=project_id) + sum(len(p) for p in payloads)
+        if projected > settings.max_storage_bytes_per_device:
+            raise HTTPException(
+                status_code=413,
+                detail="Device storage quota exceeded. Delete an existing project before uploading more.",
+            )
     set_project_auto_3d(project_id, auto_3d)
     set_project_world_key(project_id, worldlabs_key if auto_3d else None)
 
@@ -290,6 +320,8 @@ async def upload_images(
         start=False,
         byok=bool(worldlabs_key),
     )
+    if outcome != "queued":
+        clear_project_keys(project_id)
     _raise_for_enqueue(outcome, "stitch")
     storage = get_storage()
     storage.delete_prefix(f"uploads/{project_id}/")
@@ -314,14 +346,35 @@ async def get_status(project_id: str, request: Request):
 
 
 @router.post("/projects/{project_id}/retry")
-async def retry_project(project_id: str, request: Request):
+async def retry_project(
+    project_id: str,
+    request: Request,
+    x_atlas_key: str | None = Header(default=None, alias="X-Atlas-Key"),
+    x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
+    x_gemini_key: str | None = Header(default=None, alias="X-Gemini-Key"),
+):
     project = _require(project_id, request)
+    settings = get_settings()
+    atlas_key = (x_atlas_key or x_worldlabs_key or "").strip() or None
+    gemini_key = (x_gemini_key or "").strip() or None
+
     if project.status == "delayed":
+        effective_atlas = atlas_key or get_project_world_key(project_id)
+        if settings.byok_required and not effective_atlas:
+            raise HTTPException(
+                status_code=400,
+                detail="Atlas API key is required to retry (resend your X-Atlas-Key header)",
+            )
+        if atlas_key:
+            set_project_world_key(project_id, atlas_key)
         outcome = await retry_delayed_project(project_id)
         if outcome == "expired":
+            set_project_world_key(project_id, None)
             latest = get_project(project_id)
             return {"status": latest.status if latest else "failed", "error": latest.error if latest else None}
         if outcome != "queued":
+            if atlas_key:
+                set_project_world_key(project_id, None)
             raise HTTPException(status_code=409, detail="This project is already processing")
         latest = get_project(project_id)
         return {"status": latest.status if latest else "generating_3d"}
@@ -330,17 +383,40 @@ async def retry_project(project_id: str, request: Request):
     storage = get_storage()
     uploads = storage.list_keys(f"uploads/{project_id}/")
     job = project.active_job
+    byok = False
     if job == "stage":
         kind = "stage"
-    elif job == "staged_world":
-        kind = "staged_world"
-    elif job == "world":
-        kind = "world"
+        effective_gemini = gemini_key or get_project_stage_key(project_id)
+        if settings.byok_required and not effective_gemini:
+            raise HTTPException(
+                status_code=400,
+                detail="Gemini API key is required to retry staging (resend your X-Gemini-Key header)",
+            )
+        if gemini_key:
+            set_project_stage_key(project_id, gemini_key)
+        byok = bool(effective_gemini)
+    elif job in {"staged_world", "world"}:
+        kind = job
+        effective_atlas = atlas_key or get_project_world_key(project_id)
+        if settings.byok_required and not effective_atlas:
+            raise HTTPException(
+                status_code=400,
+                detail="Atlas API key is required to retry 3D generation (resend your X-Atlas-Key header)",
+            )
+        if atlas_key:
+            set_project_world_key(project_id, atlas_key)
+        byok = bool(effective_atlas)
     elif uploads:
         kind = "stitch"
+        set_project_auto_3d(project_id, bool(atlas_key))
+        if atlas_key:
+            set_project_world_key(project_id, atlas_key)
+            byok = True
     else:
         raise HTTPException(status_code=400, detail="No uploaded images to retry")
-    outcome, _job_id = await enqueue_job(project_id, kind)
+    outcome, _job_id = await enqueue_job(project_id, kind, byok=byok)
+    if outcome != "queued":
+        clear_project_keys(project_id)
     _raise_for_enqueue(outcome, kind)
     latest = get_project(project_id)
     return {"status": latest.status if latest else kind}
@@ -429,6 +505,8 @@ async def stage_project(
         project_fields={"staging_prompt": req.prompt, "staged_published": 0},
         byok=bool(gemini_key),
     )
+    if outcome != "queued":
+        set_project_stage_key(project_id, None)
     _raise_for_enqueue(outcome, "stage")
     latest = get_project(project_id)
     resp_body = {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
@@ -497,6 +575,8 @@ async def generate_3d(
         retire_worlds="staged" if source == "staged" else "original",
         byok=bool(worldlabs_key),
     )
+    if outcome != "queued":
+        set_project_world_key(project_id, None)
     _raise_for_enqueue(outcome, kind)
     latest = get_project(project_id)
     resp_body = {"status": latest.status if latest else "generating_3d"}

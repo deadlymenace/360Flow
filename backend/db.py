@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, Index, Integer, String, Text, create_engine, inspect, or_, select, text, update
+from sqlalchemy import DateTime, Float, Index, Integer, String, Text, create_engine, func, inspect, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 import logging
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -747,6 +747,39 @@ def list_projects(owner_device_id: str | None = None, *, admin: bool = False) ->
             query = query.where(ProjectRow.owner_device_id == owner_device_id)
         rows = session.scalars(query).all()
         return [_record(row) for row in rows]
+
+
+def count_device_projects(device_id: str | None) -> int:
+    if not device_id:
+        return 0
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count()).select_from(ProjectRow).where(ProjectRow.owner_device_id == device_id)
+            ).scalar_one()
+        )
+
+
+def device_storage_bytes(device_id: str | None, *, exclude_project_id: str | None = None) -> int:
+    if not device_id:
+        return 0
+    from storage import get_storage, panorama_key, staged_key, world_asset_prefix
+    with session_scope() as session:
+        project_ids = list(
+            session.scalars(
+                select(ProjectRow.id).where(ProjectRow.owner_device_id == device_id)
+            ).all()
+        )
+    storage = get_storage()
+    total = 0
+    for pid in project_ids:
+        if exclude_project_id and pid == exclude_project_id:
+            continue
+        total += storage.prefix_bytes(f"uploads/{pid}/")
+        total += storage.prefix_bytes(panorama_key(pid))
+        total += storage.prefix_bytes(staged_key(pid))
+        total += storage.prefix_bytes(world_asset_prefix(pid))
+    return total
 
 
 def rotate_share_token(project_id: str) -> ProjectRecord | None:

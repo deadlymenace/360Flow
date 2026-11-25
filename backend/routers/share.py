@@ -52,12 +52,12 @@ def _show_staged(project: ProjectRecord, *, private: bool) -> bool:
 def _world_note(project: ProjectRecord, *, show_staged: bool) -> str:
     if project.status == "delayed":
         return "Your 3D tour is delayed, we'll finish it shortly. You can look around this panorama now."
-    if show_staged and project.active_job == "staged_world":
+    if show_staged and project.status != "failed" and project.active_job == "staged_world":
         return "A 3D walkthrough of the staged room is generating."
     if project.world_preview_url and not ((project.world_marble_url or (project.world_splat_url and project.world_provider != "worldlabs_mock"))):
         return "A fast 3D preview is ready. The full walkthrough is still generating."
-    if project.active_job == "world" or (
-        project.status == "generating_3d" and project.active_job != "staged_world"
+    if project.status != "failed" and (
+        project.active_job == "world" or (project.status == "generating_3d" and project.active_job != "staged_world")
     ):
         return "The 3D walkthrough is generating. You can look around this panorama now."
     return ""
@@ -94,13 +94,13 @@ def _world_page(project: ProjectRecord, asset_base: str, source: str, *, private
         full_world = bool(project.staged_world_marble_url or (project.staged_world_splat_url and project.staged_world_provider != "worldlabs_mock"))
         ready = bool(full_world or valid_marble_url(project.staged_world_preview_url))
         preview = bool(ready and project.staged_world_preview_url and not full_world)
-        generating = project.active_job == "staged_world"
+        generating = project.status != "failed" and project.active_job == "staged_world"
     else:
         full_world = bool(project.world_marble_url or (project.world_splat_url and project.world_provider != "worldlabs_mock"))
         ready = bool(full_world or valid_marble_url(project.world_preview_url))
         preview = bool(ready and valid_marble_url(project.world_preview_url) and not full_world)
-        generating = project.active_job == "world" or (
-            project.status == "generating_3d" and project.active_job != "staged_world"
+        generating = project.status != "failed" and (
+            project.active_job == "world" or (project.status == "generating_3d" and project.active_job != "staged_world")
         )
     if full_world:
         # Self-hosted Spark viewer; the splat streams from our private cache.

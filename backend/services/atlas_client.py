@@ -460,6 +460,23 @@ def _raise_http_error(response: httpx.Response, context: str) -> None:
     raise AtlasError("3D generation failed on Atlas.", f"{context}: HTTP {status} ({msg[:160]})", status)
 
 
+def _safe_json(response: httpx.Response, context: str) -> Any:
+    try:
+        return response.json()
+    except Exception as exc:
+        raise AtlasError(
+            "3D generation returned an invalid response.",
+            f"{context}: invalid JSON ({type(exc).__name__})",
+            502,
+        ) from exc
+
+
+def _raise_op_error(op: dict[str, Any], operation_id: str) -> None:
+    err = op.get("error")
+    msg = err.get("message") if isinstance(err, dict) else str(err)
+    raise AtlasError("3D generation failed on Atlas.", f"operation {operation_id}: {msg}", 502)
+
+
 async def _post_with_retry(
     client: httpx.AsyncClient,
     url: str,
@@ -467,18 +484,19 @@ async def _post_with_retry(
     payload: dict[str, Any],
     *,
     context: str,
-    retry_attempts: int = 4,
+    retry_attempts: int = 2,
     retry_base_s: float = 1.0,
     retry_max_s: float = 30.0,
 ) -> dict[str, Any]:
-    for attempt in range(1, retry_attempts + 1):
+    attempts = max(1, retry_attempts)
+    for attempt in range(1, attempts + 1):
         resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code < 400:
-            data = resp.json()
+            data = _safe_json(resp, context)
             if not isinstance(data, dict):
-                raise AtlasError("3D generation returned an invalid response.", f"{context}: non-object JSON", resp.status_code)
+                raise AtlasError("3D generation returned an invalid response.", f"{context}: non-object JSON", 502)
             return data
-        if resp.status_code == 429 and attempt < retry_attempts:
+        if resp.status_code == 429 and attempt < attempts:
             wait = _retry_after_s(resp)
             if wait is None:
                 wait = min(retry_max_s, retry_base_s * (2 ** (attempt - 1)) + random.uniform(0.0, 0.5))
@@ -515,12 +533,22 @@ async def poll_atlas_operation(
         elif resp.status_code >= 400:
             _raise_http_error(resp, f"poll {operation_id}")
         else:
-            op = resp.json()
+            op = _safe_json(resp, f"poll {operation_id}")
+            if not isinstance(op, dict):
+                raise AtlasError(
+                    "3D generation returned an unexpected response.",
+                    f"poll {operation_id}: expected JSON object",
+                    502,
+                )
             if op.get("done") is True:
                 if op.get("error"):
-                    err = op["error"]
-                    msg = err.get("message") if isinstance(err, dict) else str(err)
-                    raise AtlasError("3D generation failed on Atlas.", f"operation {operation_id}: {msg}", 502)
+                    _raise_op_error(op, operation_id)
+                if not isinstance(op.get("response"), dict):
+                    raise AtlasError(
+                        "3D generation returned an unexpected response.",
+                        f"operation {operation_id}: missing response object",
+                        502,
+                    )
                 return op
         if asyncio.get_running_loop().time() >= deadline:
             raise AtlasError("3D generation timed out waiting for Atlas.", f"operation {operation_id} timed out", 504)
@@ -566,7 +594,10 @@ async def resolve_read_url(
     )
     if resp.status_code >= 400:
         return None
-    body = resp.json()
+    try:
+        body = resp.json()
+    except Exception:
+        return None
     url = body.get("url") if isinstance(body, dict) else None
     return url if isinstance(url, str) and url.startswith("https://") else None
 
@@ -584,6 +615,7 @@ async def run_atlas_pipeline(
     synthesize_baseline: bool = False,
     pose_timeout_s: int = 300,
     splat_timeout_s: int = 1800,
+    max_submit_attempts: int = 2,
     on_operation=None,
     on_submitting=None,
     on_tick=None,
@@ -593,47 +625,79 @@ async def run_atlas_pipeline(
     if not cleaned_key:
         raise AtlasError("Atlas API key is required for 3D generation.", "Atlas API key missing", 400)
     root = valid_atlas_base_url(base_url)
+    pano_hash = hashlib.sha256(panorama_bytes).hexdigest()[:24]
+    submit_retries = max(1, int(max_submit_attempts))
     slices = slice_equirectangular(panorama_bytes, count=slice_count, hfov_deg=hfov_deg)
 
-    # 1. Upload sliced pinhole JPEG crops as project assets
+    # 1. Upload sliced pinhole JPEG crops as project assets (deterministic Idempotency-Key)
     asset_ids: list[str] = []
     for sl in slices:
         if on_tick is not None:
             on_tick()
-        asset_req = build_asset_create_request(f"{project_label}-{sl.name}", sl.image_bytes, sl.mime_type)
+        try:
+            asset_req = build_asset_create_request(f"{project_label}-{sl.name}", sl.image_bytes, sl.mime_type)
+        except ValueError as exc:
+            raise AtlasError("Panorama slice is invalid for Atlas upload.", str(exc), 400) from exc
+        asset_headers = {
+            "WLT-Api-Key": cleaned_key,
+            "Content-Type": "application/json",
+            "Idempotency-Key": _idempotency_key("asset", [project_label, pano_hash, sl.name]),
+        }
         asset_resp = await _post_with_retry(
             client,
             f"{root}/assets",
-            {"WLT-Api-Key": cleaned_key, "Content-Type": "application/json"},
+            asset_headers,
             asset_req,
             context=f"upload {sl.name}",
+            retry_attempts=submit_retries,
         )
         aid = asset_resp.get("id")
         if not isinstance(aid, str) or not aid:
-            raise AtlasError("Atlas asset upload failed.", "missing asset id", 502)
+            raise AtlasError("Atlas asset upload returned an unexpected response.", "missing asset id", 502)
         asset_ids.append(aid)
 
     # 2. Estimate posed RGBD frames (cameras + linear-depth EXRs)
-    pose_req = build_images_to_posed_rgbd_request(asset_ids, target_resolution=(1280, 720), refine_poses=True)
+    try:
+        pose_req = build_images_to_posed_rgbd_request(asset_ids, target_resolution=(1280, 720), refine_poses=True)
+    except ValueError as exc:
+        raise AtlasError("Atlas pose request could not be built.", str(exc), 502) from exc
     pose_headers = {
         "WLT-Api-Key": cleaned_key,
         "Content-Type": "application/json",
-        "Idempotency-Key": _idempotency_key("pose", [project_label, *asset_ids]),
+        "Idempotency-Key": _idempotency_key("pose", [project_label, pano_hash]),
     }
     pose_submit = await _post_with_retry(
-        client, f"{root}/tasks:images2PosedRGBD", pose_headers, pose_req, context="images2PosedRGBD"
+        client,
+        f"{root}/tasks:images2PosedRGBD",
+        pose_headers,
+        pose_req,
+        context="images2PosedRGBD",
+        retry_attempts=submit_retries,
     )
     pose_op_id = pose_submit.get("id")
     if not isinstance(pose_op_id, str) or not pose_op_id:
         raise AtlasError("Atlas posing did not return an operation ID.", "missing pose operation id", 502)
-    if pose_submit.get("done") is True and not pose_submit.get("error"):
+    if pose_submit.get("done") is True:
+        if pose_submit.get("error"):
+            _raise_op_error(pose_submit, pose_op_id)
+        if not isinstance(pose_submit.get("response"), dict):
+            raise AtlasError("Atlas posing returned an unexpected response.", "missing pose response", 502)
         pose_op = pose_submit
     else:
         pose_op = await poll_atlas_operation(client, root, cleaned_key, pose_op_id, pose_timeout_s, on_tick=on_tick)
 
+    pose_resp = pose_op.get("response")
+    raw_frames = pose_resp.get("frames") if isinstance(pose_resp, dict) else None
+    if not isinstance(raw_frames, list):
+        raise AtlasError("Atlas posing returned an unexpected response.", "missing response.frames list", 502)
     posed_frames = []
-    for fr in (pose_op.get("response") or {}).get("frames") or []:
-        if isinstance(fr, dict) and fr.get("imageAsset") and fr.get("camera") and fr.get("depth"):
+    for fr in raw_frames:
+        if (
+            isinstance(fr, dict)
+            and isinstance(fr.get("imageAsset"), dict)
+            and isinstance(fr.get("camera"), dict)
+            and isinstance(fr.get("depth"), dict)
+        ):
             posed_frames.append(
                 {
                     "imageAsset": {"assetId": fr["imageAsset"]["assetId"]}
@@ -643,57 +707,90 @@ async def run_atlas_pipeline(
                     "depth": fr["depth"],
                 }
             )
+    if len(posed_frames) < 2:
+        raise AtlasError(
+            "Atlas posing returned too few usable frames.",
+            f"images2PosedRGBD returned {len(posed_frames)} valid frames",
+            502,
+        )
 
     # 3. Optionally synthesize translated baseline frames with atlasGenerate
-    if synthesize_baseline and posed_frames:
+    if synthesize_baseline:
         target_cams = build_translated_target_cameras(slices, baseline_m=0.35, max_views=4)
         gen_req = build_atlas_generate_request(posed_frames[:4], target_cams, return_depth=True)
         gen_headers = {
             "WLT-Api-Key": cleaned_key,
             "Content-Type": "application/json",
-            "Idempotency-Key": _idempotency_key("gen", [project_label, pose_op_id]),
+            "Idempotency-Key": _idempotency_key("gen", [project_label, pano_hash]),
         }
         gen_submit = await _post_with_retry(
-            client, f"{root}/tasks:atlasGenerate", gen_headers, gen_req, context="atlasGenerate"
+            client,
+            f"{root}/tasks:atlasGenerate",
+            gen_headers,
+            gen_req,
+            context="atlasGenerate",
+            retry_attempts=submit_retries,
         )
         gen_op_id = gen_submit.get("id")
-        if isinstance(gen_op_id, str) and gen_op_id:
-            gen_op = (
-                gen_submit
-                if gen_submit.get("done") is True and not gen_submit.get("error")
-                else await poll_atlas_operation(client, root, cleaned_key, gen_op_id, pose_timeout_s, on_tick=on_tick)
-            )
-            for gf in (gen_op.get("response") or {}).get("frames") or []:
-                if isinstance(gf, dict) and gf.get("imageAsset") and gf.get("camera") and gf.get("depth"):
-                    posed_frames.append(
-                        {
-                            "imageAsset": {"assetId": gf["imageAsset"]["assetId"]}
-                            if gf["imageAsset"].get("assetId")
-                            else gf["imageAsset"],
-                            "camera": gf["camera"],
-                            "depth": gf["depth"],
-                        }
-                    )
+        if not isinstance(gen_op_id, str) or not gen_op_id:
+            raise AtlasError("Atlas baseline generation returned an unexpected response.", "missing gen op id", 502)
+        if gen_submit.get("done") is True:
+            if gen_submit.get("error"):
+                _raise_op_error(gen_submit, gen_op_id)
+            if not isinstance(gen_submit.get("response"), dict):
+                raise AtlasError("Atlas baseline generation returned an unexpected response.", "missing gen response", 502)
+            gen_op = gen_submit
+        else:
+            gen_op = await poll_atlas_operation(client, root, cleaned_key, gen_op_id, pose_timeout_s, on_tick=on_tick)
+        gen_resp = gen_op.get("response")
+        for gf in (gen_resp.get("frames") if isinstance(gen_resp, dict) and isinstance(gen_resp.get("frames"), list) else []):
+            if (
+                isinstance(gf, dict)
+                and isinstance(gf.get("imageAsset"), dict)
+                and isinstance(gf.get("camera"), dict)
+                and isinstance(gf.get("depth"), dict)
+            ):
+                posed_frames.append(
+                    {
+                        "imageAsset": {"assetId": gf["imageAsset"]["assetId"]}
+                        if gf["imageAsset"].get("assetId")
+                        else gf["imageAsset"],
+                        "camera": gf["camera"],
+                        "depth": gf["depth"],
+                    }
+                )
 
     # 4. Reconstruct Gaussian splats (draft by default)
     phase = "draft" if draft else "full"
     if on_submitting is not None:
         await on_submitting(phase)
-    splats_req = build_posed_images_to_splats_request(posed_frames, draft=draft)
+    try:
+        splats_req = build_posed_images_to_splats_request(posed_frames, draft=draft)
+    except ValueError as exc:
+        raise AtlasError("Atlas splat request could not be built.", str(exc), 502) from exc
     splats_headers = {
         "WLT-Api-Key": cleaned_key,
         "Content-Type": "application/json",
-        "Idempotency-Key": _idempotency_key("splats", [project_label, pose_op_id, phase]),
+        "Idempotency-Key": _idempotency_key("splats", [project_label, pano_hash, phase]),
     }
     splat_submit = await _post_with_retry(
-        client, f"{root}/tasks:posedImages2Splats", splats_headers, splats_req, context="posedImages2Splats"
+        client,
+        f"{root}/tasks:posedImages2Splats",
+        splats_headers,
+        splats_req,
+        context="posedImages2Splats",
+        retry_attempts=submit_retries,
     )
     splat_op_id = splat_submit.get("id")
     if not isinstance(splat_op_id, str) or not splat_op_id:
         raise AtlasError("Atlas splat generation did not return an operation ID.", "missing splat op id", 502)
     if on_operation is not None:
         await on_operation(splat_op_id, phase)
-    if splat_submit.get("done") is True and not splat_submit.get("error"):
+    if splat_submit.get("done") is True:
+        if splat_submit.get("error"):
+            _raise_op_error(splat_submit, splat_op_id)
+        if not isinstance(splat_submit.get("response"), dict):
+            raise AtlasError("Atlas splat generation returned an unexpected response.", "missing splat response", 502)
         splat_op = splat_submit
     else:
         splat_op = await poll_atlas_operation(client, root, cleaned_key, splat_op_id, splat_timeout_s, on_tick=on_tick)

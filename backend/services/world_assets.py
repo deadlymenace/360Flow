@@ -132,7 +132,14 @@ async def _store_download(project_id: str, key: str, kind: str, url: str, *, api
         return True
 
 
-async def cache_world_asset(project_id: str, source: str, kind: str, url: object) -> bool:
+async def cache_world_asset(
+    project_id: str,
+    source: str,
+    kind: str,
+    url: object,
+    *,
+    api_key: str | None = None,
+) -> bool:
     """Download one asset into private storage. Never logs the URL."""
     safe = allowed_asset_url(url)
     if safe is None:
@@ -144,13 +151,20 @@ async def cache_world_asset(project_id: str, source: str, kind: str, url: object
     async with fill_lock(project_id):
         if storage.exists(key):  # another request filled it while we waited
             return True
-        return await _store_download(project_id, key, kind, safe)
+        return await _store_download(project_id, key, kind, safe, api_key=api_key)
 
 
-async def cache_world_assets(project_id: str, source: str, splat_url: object, mesh_url: object) -> None:
+async def cache_world_assets(
+    project_id: str,
+    source: str,
+    splat_url: object,
+    mesh_url: object,
+    *,
+    api_key: str | None = None,
+) -> None:
     for kind, url in (("spz", splat_url), ("glb", mesh_url)):
         try:
-            await cache_world_asset(project_id, source, kind, url)
+            await cache_world_asset(project_id, source, kind, url, api_key=api_key)
         except Exception:
             logger.exception("Caching world %s for %s failed", kind, project_id)
 
@@ -176,7 +190,9 @@ async def world_asset_stream(project, source: str, kind: str):
         staged = source == "staged"
         attr = {"spz": "splat_url", "glb": "mesh_url"}[kind]
         url = getattr(project, f"{'staged_' if staged else ''}world_{attr}", None)
-        if not await cache_world_asset(project.id, source, kind, url):
+        from services.byok import get_project_world_key
+
+        if not await cache_world_asset(project.id, source, kind, url, api_key=get_project_world_key(project.id)):
             return None
     try:
         return await asyncio.to_thread(storage.open_stream, key)
@@ -194,26 +210,29 @@ async def world_asset_bytes(project, source: str, kind: str) -> bytes | None:
 
 
 async def _fetch_world_record(world_id: str) -> dict | None:
-    """Read-only GET of an existing World Labs world (no generation, no credits)."""
-    from services.world_gen import WORLDLABS_BASE
+    """Read-only GET of an existing Atlas operation (no generation, no credits)."""
     from services.world_urls import valid_world_id
 
     settings = get_settings()
     if not settings.worldlabs_api_key or valid_world_id(world_id) is None:
         return None
+    base = settings.atlas_api_base_url.rstrip("/")
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=False) as client:
         response = await client.get(
-            f"{WORLDLABS_BASE}/marble/v1/worlds/{world_id}",
+            f"{base}/operations/{world_id}",
             headers={"WLT-Api-Key": settings.worldlabs_api_key},
         )
     if response.status_code != 200:
-        logger.warning("World Labs world lookup for %s returned HTTP %d", world_id, response.status_code)
+        logger.warning("Atlas operation lookup for %s returned HTTP %d", world_id, response.status_code)
         return None
     body = response.json()
     if not isinstance(body, dict):
         return None
-    world = body.get("world") if isinstance(body.get("world"), dict) else body
-    return world
+    if isinstance(body.get("response"), dict):
+        return body["response"]
+    if isinstance(body.get("world"), dict):
+        return body["world"]
+    return body
 
 
 async def refetch_lowest_splat(project, source: str = "original", *, apply: bool = False) -> str:

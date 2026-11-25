@@ -42,6 +42,11 @@ def set_project_stage_key(project_id: str, api_key: str | None) -> None:
             _stage_keys_by_project.pop(project_id, None)
 
 
+def get_project_stage_key(project_id: str) -> str | None:
+    with _lock:
+        return _stage_keys_by_project.get(project_id)
+
+
 def pop_project_stage_key(project_id: str) -> str | None:
     with _lock:
         return _stage_keys_by_project.pop(project_id, None)
