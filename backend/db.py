@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import re
 import secrets
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, Index, Integer, String, Text, create_engine, func, inspect, or_, select, text, update
+from sqlalchemy import BigInteger, DateTime, Float, Index, Integer, String, Text, create_engine, func, inspect, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 import logging
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -109,6 +110,7 @@ class ProjectRow(Base):
     # JSON for a World Labs operation already paid for when a job failed on the
     # 429 cap. The next 3D run for that source polls it instead of paying again.
     resume_operation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reserved_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=0)
 
 
 class JobRow(Base):
@@ -137,6 +139,7 @@ class JobRow(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rate_limit_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    submit_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     rate_limit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -227,6 +230,7 @@ _EXTRA_COLUMNS = {
     "preview_token": "VARCHAR(64)",
     "preview_expires_at": "TIMESTAMP WITH TIME ZONE",
     "resume_operation": "TEXT",
+    "reserved_bytes": "BIGINT",
 }
 
 _JOB_EXTRA_COLUMNS = {
@@ -235,6 +239,7 @@ _JOB_EXTRA_COLUMNS = {
     "lease_owner": "VARCHAR(64)",
     "lease_expires_at": "TIMESTAMP WITH TIME ZONE",
     "rate_limit_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "submit_attempts": "INTEGER NOT NULL DEFAULT 0",
     "rate_limit_started_at": "TIMESTAMP WITH TIME ZONE",
 }
 
@@ -302,6 +307,7 @@ class JobRecord:
     lease_owner: str | None = None
     lease_expires_at: datetime | None = None
     rate_limit_attempts: int = 0
+    submit_attempts: int = 0
     rate_limit_started_at: datetime | None = None
 
 
@@ -510,6 +516,7 @@ def _job_record(row: JobRow) -> JobRecord:
         lease_owner=row.lease_owner,
         lease_expires_at=row.lease_expires_at,
         rate_limit_attempts=row.rate_limit_attempts or 0,
+        submit_attempts=row.submit_attempts or 0,
         rate_limit_started_at=row.rate_limit_started_at,
     )
 
@@ -718,7 +725,29 @@ def _share_expired(when: datetime | None, now: datetime | None = None) -> bool:
     return when <= current
 
 
-def create_project(name: str, owner_device_id: str | None = None) -> ProjectRecord:
+_device_cap_lock = threading.Lock()
+_job_submit_lock = threading.Lock()
+
+
+class DeviceProjectCapError(Exception):
+    pass
+
+
+class DeviceStorageCapError(Exception):
+    pass
+
+
+def _acquire_device_lock(session: Session, device_id: str) -> None:
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": f"cap:{device_id}"})
+
+
+def create_project(
+    name: str,
+    owner_device_id: str | None = None,
+    *,
+    max_projects: int = 0,
+) -> ProjectRecord:
     now = datetime.now(timezone.utc)
     row = ProjectRow(
         id=str(uuid4()),
@@ -733,11 +762,24 @@ def create_project(name: str, owner_device_id: str | None = None) -> ProjectReco
         preview_token=secrets.token_urlsafe(16),
         preview_expires_at=share_deadline(now),
         staged_published=0,
+        reserved_bytes=0,
     )
-    with session_scope() as session:
-        session.add(row)
-        session.flush()
-        return _record(row)
+    with _device_cap_lock:
+        with session_scope() as session:
+            if owner_device_id and max_projects > 0:
+                _acquire_device_lock(session, owner_device_id)
+                current = int(
+                    session.execute(
+                        select(func.count())
+                        .select_from(ProjectRow)
+                        .where(ProjectRow.owner_device_id == owner_device_id)
+                    ).scalar_one()
+                )
+                if current >= max_projects:
+                    raise DeviceProjectCapError(f"Device project limit reached ({max_projects})")
+            session.add(row)
+            session.flush()
+            return _record(row)
 
 
 def list_projects(owner_device_id: str | None = None, *, admin: bool = False) -> list[ProjectRecord]:
@@ -760,26 +802,104 @@ def count_device_projects(device_id: str | None) -> int:
         )
 
 
-def device_storage_bytes(device_id: str | None, *, exclude_project_id: str | None = None) -> int:
-    if not device_id:
-        return 0
+def _device_storage_bytes_in_session(
+    session: Session,
+    device_id: str,
+    *,
+    exclude_project_id: str | None = None,
+) -> int:
     from storage import get_storage, panorama_key, staged_key, world_asset_prefix
-    with session_scope() as session:
-        project_ids = list(
-            session.scalars(
-                select(ProjectRow.id).where(ProjectRow.owner_device_id == device_id)
-            ).all()
-        )
+
+    rows = session.execute(
+        select(ProjectRow.id, ProjectRow.reserved_bytes).where(ProjectRow.owner_device_id == device_id)
+    ).all()
     storage = get_storage()
     total = 0
-    for pid in project_ids:
+    for pid, reserved in rows:
         if exclude_project_id and pid == exclude_project_id:
             continue
-        total += storage.prefix_bytes(f"uploads/{pid}/")
+        upload_bytes = max(storage.prefix_bytes(f"uploads/{pid}/"), int(reserved or 0))
+        total += upload_bytes
         total += storage.prefix_bytes(panorama_key(pid))
         total += storage.prefix_bytes(staged_key(pid))
         total += storage.prefix_bytes(world_asset_prefix(pid))
     return total
+
+
+def device_storage_bytes(device_id: str | None, *, exclude_project_id: str | None = None) -> int:
+    if not device_id:
+        return 0
+    with session_scope() as session:
+        return _device_storage_bytes_in_session(session, device_id, exclude_project_id=exclude_project_id)
+
+
+def reserve_device_storage(
+    device_id: str | None,
+    project_id: str,
+    incoming_bytes: int,
+    max_bytes: int,
+) -> bool:
+    """Atomically verify per-device storage cap and reserve ``incoming_bytes`` on ``project_id``."""
+    if not device_id or max_bytes <= 0:
+        return True
+    with _device_cap_lock:
+        with session_scope() as session:
+            _acquire_device_lock(session, device_id)
+            row = session.get(ProjectRow, project_id)
+            if row is None:
+                return False
+            used = _device_storage_bytes_in_session(session, device_id, exclude_project_id=project_id)
+            if used + incoming_bytes > max_bytes:
+                return False
+            row.reserved_bytes = max(0, int(incoming_bytes))
+            row.updated_at = datetime.now(timezone.utc)
+            session.flush()
+            return True
+
+
+def release_device_storage_reservation(project_id: str) -> None:
+    with _device_cap_lock:
+        with session_scope() as session:
+            session.execute(
+                update(ProjectRow)
+                .where(ProjectRow.id == project_id, ProjectRow.reserved_bytes != 0)
+                .values(reserved_bytes=0)
+            )
+
+
+def can_store_world_asset(project_id: str, incoming_bytes: int, max_bytes: int) -> bool:
+    """Atomically check whether writing a cached world asset fits within the owner's storage cap."""
+    if max_bytes <= 0:
+        return True
+    with _device_cap_lock:
+        with session_scope() as session:
+            row = session.get(ProjectRow, project_id)
+            if row is None:
+                return False
+            if not row.owner_device_id:
+                return True
+            _acquire_device_lock(session, row.owner_device_id)
+            used = _device_storage_bytes_in_session(session, row.owner_device_id)
+            return used + incoming_bytes <= max_bytes
+
+
+def claim_job_submit_attempt(job_id: str, max_attempts: int) -> tuple[bool, int]:
+    """Atomically increment and check durable ``submit_attempts`` on ``jobs``."""
+    with _job_submit_lock:
+        with session_scope() as session:
+            query = select(JobRow).where(JobRow.id == job_id)
+            if session.get_bind().dialect.name == "postgresql":
+                query = query.with_for_update()
+            row = session.scalar(query)
+            if row is None:
+                return True, 0
+            current = int(row.submit_attempts or 0)
+            if current >= max_attempts:
+                return False, current
+            row.submit_attempts = current + 1
+            row.updated_at = datetime.now(timezone.utc)
+            session.flush()
+            return True, row.submit_attempts
 
 
 def rotate_share_token(project_id: str) -> ProjectRecord | None:

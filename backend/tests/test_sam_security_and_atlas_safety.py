@@ -530,3 +530,210 @@ def test_per_device_project_and_storage_caps_and_enqueue_key_cleanup(client, mon
 
 async def _async_none():
     return None
+
+
+def test_nit1_busy_enqueue_or_retry_never_wipes_inflight_key(client, monkeypatch):
+    import routers.projects as rp
+
+    monkeypatch.setenv("BYOK_REQUIRED", "true")
+    created = client.post("/api/v1/projects", json={"name": "Inflight Key Guard"}).json()
+    pid = created["id"]
+    key = panorama_key(pid)
+    get_storage().put_bytes(key, _pano_bytes(), "image/jpeg")
+
+    # Case A: delayed job already picked up by another worker while /retry arrives
+    db.update_project(pid, status="delayed", panorama_key=key, active_job="world")
+    byok.set_project_world_key(pid, "atl-inflight-owner")
+
+    async def fake_retry_busy(_pid: str) -> str:
+        return "busy"
+
+    monkeypatch.setattr(rp, "retry_delayed_project", fake_retry_busy)
+    resp = client.post(f"/api/v1/projects/{pid}/retry", headers={"X-Atlas-Key": "atl-second-caller"})
+    assert resp.status_code == 409
+    assert byok.get_project_world_key(pid) == "atl-inflight-owner"
+
+    # Case B: failed job /retry hits busy enqueue (e.g. concurrent retry already started)
+    db.update_project(pid, status="failed", active_job="world")
+
+    async def fake_enqueue_busy(*args, **kwargs):
+        return ("busy", None)
+
+    monkeypatch.setattr(rp, "enqueue_job", fake_enqueue_busy)
+    resp2 = client.post(f"/api/v1/projects/{pid}/retry", headers={"X-Atlas-Key": "atl-second-caller"})
+    assert resp2.status_code == 409
+    assert byok.get_project_world_key(pid) == "atl-inflight-owner"
+
+    # Case C: /generate-3d busy preserves existing key
+    db.update_project(pid, status="stitched", active_job=None)
+    resp3 = client.post(f"/api/v1/projects/{pid}/generate-3d", headers={"X-Atlas-Key": "atl-second-caller"})
+    assert resp3.status_code == 409
+    assert byok.get_project_world_key(pid) == "atl-inflight-owner"
+    byok.clear_project_keys(pid)
+
+
+def test_nit2_atomic_concurrent_caps_and_world_asset_storage_cap(client, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    tok = client.raw.post("/api/v1/devices").json()["token"]
+    auth = {"Authorization": f"Bearer {tok}"}
+
+    # 1. Atomic concurrent create_project under MAX_PROJECTS_PER_DEVICE=2
+    monkeypatch.setenv("MAX_PROJECTS_PER_DEVICE", "2")
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(
+            pool.map(
+                lambda i: client.raw.post("/api/v1/projects", json={"name": f"Conc-{i}"}, headers=auth),
+                range(5),
+            )
+        )
+    ok_res = [r for r in results if r.status_code == 200]
+    cap_res = [r for r in results if r.status_code == 429]
+    assert len(ok_res) == 2 and len(cap_res) == 3
+
+    # 2. Atomic concurrent uploads under MAX_STORAGE_BYTES_PER_DEVICE
+    p1 = ok_res[0].json()["id"]
+    p2 = ok_res[1].json()["id"]
+    img = _jpeg_bytes()
+    per_upload = len(img) * 2
+    monkeypatch.setenv("MAX_STORAGE_BYTES_PER_DEVICE", str(per_upload + 200))
+    files = [("images", ("01.jpg", img, "image/jpeg")), ("images", ("02.jpg", img, "image/jpeg"))]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        up_res = list(
+            pool.map(
+                lambda pid: client.raw.post(f"/api/v1/projects/{pid}/upload?auto_3d=false", files=files, headers=auth),
+                [p1, p2],
+            )
+        )
+    statuses = sorted(r.status_code for r in up_res)
+    assert statuses == [200, 413]
+
+    # 3. World asset caching skips writing if splat would exceed MAX_STORAGE_BYTES_PER_DEVICE
+    class _FakeResp:
+        status_code = 200
+        headers = {"content-length": "500"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aiter_bytes(self, chunk_size=65536):
+            yield b"S" * 500
+
+    class _FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def stream(self, method, url, headers=None):
+            return _FakeResp()
+
+    monkeypatch.setattr(world_assets.httpx, "AsyncClient", _FakeClient)
+    # Set storage cap tightly so 500-byte splat exceeds it
+    used_now = db.device_storage_bytes(db.get_project(p1).owner_device_id)
+    monkeypatch.setenv("MAX_STORAGE_BYTES_PER_DEVICE", str(used_now + 100))
+    stored = asyncio.run(
+        world_assets.cache_world_asset(
+            p1,
+            "original",
+            "spz",
+            "https://storage.googleapis.com/bucket/large.spz",
+        )
+    )
+    assert stored is False
+    assert not get_storage().exists(world_assets.world_asset_key(p1, "original", "spz"))
+
+
+def test_nit3_store_world_early_returns_wipe_key_and_lease_lost_preserves_it(client, monkeypatch):
+    created = client.post("/api/v1/projects", json={"name": "Store Early Return"}).json()
+    pid = created["id"]
+    res = {"provider": "atlas", "world_id": "op-1", "splat_url": "https://cdn.example.com/a.spz", "operation_id": "op-1"}
+
+    # 1. saved=None early return still wipes key
+    byok.set_project_world_key(pid, "atl-early-1")
+    monkeypatch.setattr(pipeline, "update_project", lambda *a, **kw: None)
+    monkeypatch.setattr(pipeline, "delete_worlds", lambda *a, **kw: _async_none())
+    asyncio.run(pipeline._store_world(pid, res, False, []))
+    assert byok.get_project_world_key(pid) is None
+
+    # 2. deleted project early return still wipes key
+    monkeypatch.undo()
+    byok.set_project_world_key(pid, "atl-early-2")
+    monkeypatch.setattr(pipeline, "_deleted", lambda _pid: True)
+    monkeypatch.setattr(pipeline, "delete_worlds", lambda *a, **kw: _async_none())
+    asyncio.run(pipeline._store_world(pid, res, False, []))
+    assert byok.get_project_world_key(pid) is None
+
+    # 3. LeaseLost preserves key for new owner
+    monkeypatch.undo()
+    byok.set_project_world_key(pid, "atl-new-owner")
+
+    def raise_lease(_pid: str):
+        raise world_gen.LeaseLost()
+
+    monkeypatch.setattr(pipeline, "_guard_write", raise_lease)
+    with pytest.raises(world_gen.LeaseLost):
+        asyncio.run(pipeline._store_world(pid, res, False, []))
+    assert byok.get_project_world_key(pid) == "atl-new-owner"
+    byok.clear_project_keys(pid)
+
+
+def test_nit4_fail_world_and_fail_stage_wipe_key_only_after_lease_check(client, monkeypatch):
+    created = client.post("/api/v1/projects", json={"name": "Lease Failure Guard"}).json()
+    pid = created["id"]
+
+    # Stale worker (_may_write=False, project still exists) must NOT wipe new owner's keys
+    byok.set_project_world_key(pid, "atl-live-owner")
+    byok.set_project_stage_key(pid, "gem-live-owner")
+    monkeypatch.setattr(pipeline, "_may_write", lambda _pid: False)
+    pipeline._fail_world(pid, "err", "detail", False)
+    pipeline._fail_stage(pid, "err", "detail")
+    assert byok.get_project_world_key(pid) == "atl-live-owner"
+    assert byok.get_project_stage_key(pid) == "gem-live-owner"
+
+    # Authorized worker (_may_write=True) DOES wipe keys
+    monkeypatch.setattr(pipeline, "_may_write", lambda _pid: True)
+    pipeline._fail_world(pid, "err", "detail", False)
+    pipeline._fail_stage(pid, "err", "detail")
+    assert byok.get_project_world_key(pid) is None
+    assert byok.get_project_stage_key(pid) is None
+
+
+def test_nit5_submit_attempts_persisted_in_job_row_across_restart(client, monkeypatch):
+    monkeypatch.setenv("ATLAS_MAX_SUBMIT_ATTEMPTS_PER_JOB", "2")
+    created = client.post("/api/v1/projects", json={"name": "Durable Submit Count"}).json()
+    pid = created["id"]
+    key = panorama_key(pid)
+    get_storage().put_bytes(key, _pano_bytes(), "image/jpeg")
+    db.update_project(pid, status="stitched", panorama_key=key, active_job=None)
+    job = db.create_job(pid, "world")
+
+    # Simulate 2 persisted submit attempts in DB (e.g. before a restart)
+    ok1, c1 = db.claim_job_submit_attempt(job.id, 2)
+    ok2, c2 = db.claim_job_submit_attempt(job.id, 2)
+    assert (ok1, c1) == (True, 1)
+    assert (ok2, c2) == (True, 2)
+    assert db.get_job(job.id).submit_attempts == 2
+
+    # Next run after "restart" sees submit_attempts == 2 and refuses 3rd submit cleanly
+    calls = 0
+
+    async def fake_gen(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        await kwargs["on_submitting"]("draft")
+        return {"provider": "atlas", "world_id": "op-x", "splat_url": "https://cdn.example/x.spz", "operation_id": "op-x"}
+
+    monkeypatch.setattr(pipeline, "generate_world", fake_gen)
+    byok.set_project_world_key(pid, "atl-durable")
+    asyncio.run(pipeline.run_job(job.id))
+    assert calls == 1
+    assert db.get_project(pid).status == "failed"
+    assert byok.get_project_world_key(pid) is None

@@ -118,10 +118,20 @@ async def _store_download(project_id: str, key: str, kind: str, url: str, *, api
             return False
         if not ok or not path.is_file() or path.stat().st_size == 0:
             return False
-        from db import get_project
+        from db import can_store_world_asset, get_project
 
         if get_project(project_id) is None:
             # Deleted while downloading: write nothing.
+            return False
+        settings = get_settings()
+        file_size = path.stat().st_size
+        if not can_store_world_asset(project_id, file_size, settings.max_storage_bytes_per_device):
+            logger.warning(
+                "Skipping world %s cache for %s (%d bytes): device storage cap exceeded",
+                key.rsplit("/", 1)[-1],
+                project_id,
+                file_size,
+            )
             return False
         storage = get_storage()
         await asyncio.to_thread(storage.put_file, key, path, content_type)

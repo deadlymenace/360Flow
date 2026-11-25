@@ -29,6 +29,7 @@ from db import (
     begin_job,
     claim_delayed_job,
     claim_job_lease,
+    claim_job_submit_attempt,
     claim_resumable_jobs,
     delay_expired,
     delete_job,
@@ -85,7 +86,6 @@ logger = logging.getLogger(__name__)
 _stitch_pool: ThreadPoolExecutor | None = None
 _world_semaphore: asyncio.Semaphore | None = None
 _in_flight: set[str] = set()
-_job_submit_counts: dict[str, int] = {}
 # Abort callbacks for jobs running in this process, by job id.
 _abort_hooks: dict[str, object] = {}
 # The job this task is running, so write guards can check its lease.
@@ -514,7 +514,6 @@ async def run_job(job_id: str) -> None:
             if keep:
                 release_job_lease(job_id, WORKER_ID)
             else:
-                _job_submit_counts.pop(job_id, None)
                 delete_owned_job(job_id, WORKER_ID)
     if follow and owned and not abandoned and not keep:
         has_byok = get_project_world_key(job.project_id) is not None
@@ -647,13 +646,14 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
 
 
 def _fail_stage(project_id: str, message: str, detail: str | None = None) -> None:
-    set_project_stage_key(project_id, None)
     if _deleted(project_id):
+        set_project_stage_key(project_id, None)
         logger.info("Project %s deleted during staging", project_id)
         return
     if not _may_write(project_id):
         logger.warning("Project %s: not recording a staging failure without the lease", project_id)
         return
+    set_project_stage_key(project_id, None)
     client_message = message or "Staging failed. Try again."
     if detail:
         logger.error("Project %s staging provider error: %s", project_id, detail)
@@ -766,14 +766,13 @@ async def _run_world(
             _require_lease(job_id)
             if job_id:
                 max_attempts = get_settings().atlas_max_submit_attempts_per_job
-                next_count = _job_submit_counts.get(job_id, 0) + 1
-                if next_count > max_attempts:
+                allowed, _attempts = claim_job_submit_attempt(job_id, max_attempts)
+                if not allowed:
                     raise ProviderFailure(
                         WORLD_FAILED_MESSAGE,
                         f"Atlas submit attempt cap ({max_attempts}) reached for job {job_id}",
                         503,
                     )
-                _job_submit_counts[job_id] = next_count
                 update_job(job_id, operation_phase="submitting", status="running")
 
         async def on_operation(operation_id: str, phase: str) -> None:
@@ -973,64 +972,69 @@ def _store_preview(project_id: str, result: dict, staged_source: bool, created_i
 
 
 async def _store_world(project_id: str, result: dict, staged_source: bool, created_ids: list[str], *, api_key: str | None = None) -> None:
-    final_id, marble = _accepted_world(result)
-    if final_id:
-        created_ids.append(final_id)
-    if _deleted(project_id):
-        await delete_worlds(created_ids)
-        return
-    _guard_write(project_id)
-    operation_id = result.get("operation_id")
-    stored_operation = operation_id[:64] if isinstance(operation_id, str) else None
-    source = "staged" if staged_source else "original"
-    # A regenerated world replaces the cached splat/mesh of the old one.
-    clear_world_assets(project_id, source)
-    if staged_source:
-        saved = update_project(
-            project_id,
-            status="complete",
-            staged_world_provider=result.get("provider"),
-            staged_world_id=final_id,
-            staged_world_marble_url=marble,
-            staged_world_splat_url=result.get("splat_url"),
-            staged_world_mesh_url=result.get("mesh_url"),
-            staged_world_thumbnail_url=result.get("thumbnail_url"),
-            staged_world_operation_id=stored_operation,
-            active_job=None,
-            error=None,
-            provider_error=None,
-        )
-    else:
-        saved = update_project(
-            project_id,
-            status="complete",
-            world_provider=result.get("provider"),
-            world_id=final_id,
-            world_marble_url=marble,
-            world_splat_url=result.get("splat_url"),
-            world_mesh_url=result.get("mesh_url"),
-            world_thumbnail_url=result.get("thumbnail_url"),
-            world_operation_id=stored_operation,
-            active_job=None,
-            error=None,
-            provider_error=None,
-        )
-    if saved is None:
-        await delete_worlds(created_ids)
-        delete_project_assets(project_id)
-        return
-    logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
-    # Pull the splat and mesh into private storage now, so viewers never touch the CDN.
-    cache_kw = {}
+    should_clear = True
     try:
-        if "api_key" in inspect.signature(cache_world_assets).parameters:
-            cache_kw["api_key"] = api_key
-    except (TypeError, ValueError):
-        pass
-    try:
+        final_id, marble = _accepted_world(result)
+        if final_id:
+            created_ids.append(final_id)
+        if _deleted(project_id):
+            await delete_worlds(created_ids)
+            return
+        _guard_write(project_id)
+        operation_id = result.get("operation_id")
+        stored_operation = operation_id[:64] if isinstance(operation_id, str) else None
+        source = "staged" if staged_source else "original"
+        # A regenerated world replaces the cached splat/mesh of the old one.
+        clear_world_assets(project_id, source)
+        if staged_source:
+            saved = update_project(
+                project_id,
+                status="complete",
+                staged_world_provider=result.get("provider"),
+                staged_world_id=final_id,
+                staged_world_marble_url=marble,
+                staged_world_splat_url=result.get("splat_url"),
+                staged_world_mesh_url=result.get("mesh_url"),
+                staged_world_thumbnail_url=result.get("thumbnail_url"),
+                staged_world_operation_id=stored_operation,
+                active_job=None,
+                error=None,
+                provider_error=None,
+            )
+        else:
+            saved = update_project(
+                project_id,
+                status="complete",
+                world_provider=result.get("provider"),
+                world_id=final_id,
+                world_marble_url=marble,
+                world_splat_url=result.get("splat_url"),
+                world_mesh_url=result.get("mesh_url"),
+                world_thumbnail_url=result.get("thumbnail_url"),
+                world_operation_id=stored_operation,
+                active_job=None,
+                error=None,
+                provider_error=None,
+            )
+        if saved is None:
+            await delete_worlds(created_ids)
+            delete_project_assets(project_id)
+            return
+        logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
+        # Pull the splat and mesh into private storage now, so viewers never touch the CDN.
+        cache_kw = {}
+        try:
+            if "api_key" in inspect.signature(cache_world_assets).parameters:
+                cache_kw["api_key"] = api_key
+        except (TypeError, ValueError):
+            pass
         await cache_world_assets(project_id, source, result.get("splat_url"), result.get("mesh_url"), **cache_kw)
+    except LeaseLost:
+        should_clear = False
+        raise
     finally:
-        set_project_world_key(project_id, None)
+        if should_clear:
+            set_project_world_key(project_id, None)
 
 
 def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: bool) -> str | None:
@@ -1202,10 +1206,12 @@ def _delay_world(project_id: str, job_id: str | None, detail: str, staged_source
 
 
 def _fail_world(project_id: str, message: str, detail: str | None, staged_source: bool) -> None:
-    set_project_world_key(project_id, None)
     if not _may_write(project_id):
+        if _deleted(project_id):
+            set_project_world_key(project_id, None)
         logger.warning("Project %s: not recording a 3D failure without the project or lease", project_id)
         return
+    set_project_world_key(project_id, None)
     if detail:
         logger.error("Project %s world provider error: %s", project_id, detail)
     else:
@@ -1227,6 +1233,7 @@ async def _fail_world_clean(
     staged_source: bool,
 ) -> None:
     if _deleted(project_id):
+        set_project_world_key(project_id, None)
         logger.info("Project %s deleted during world generation", project_id)
         await delete_worlds(created_ids)
         return
