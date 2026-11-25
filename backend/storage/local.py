@@ -98,3 +98,11 @@ class LocalStorage:
     def materialize(self, key: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(self.get_bytes(key))
+
+    def prefix_bytes(self, prefix: str) -> int:
+        root = self._path(prefix)
+        if root.is_file():
+            return root.stat().st_size
+        if not root.exists():
+            return 0
+        return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())

@@ -2,19 +2,43 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import json
 import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from auth import Caller, require_caller
-from db import TRANSIENT_STATUSES, cancel_delayed_project, delete_project, get_project, rotate_share_token, update_project
+from db import (
+    TRANSIENT_STATUSES,
+    cancel_delayed_project,
+    delete_project,
+    get_idempotency_record,
+    get_project,
+    revoke_share_token,
+    rotate_share_token,
+    save_idempotency_record,
+    update_project,
+)
+from db import (
+    DeviceProjectCapError,
+    release_device_storage_reservation,
+    reserve_device_storage,
+)
 from db import create_project as create_project_row
 from db import list_projects as list_project_rows
 from models.project import CreateProjectRequest, Project, StageRequest, UploadMetadata
 from routers.responses import jpeg_response, labeled_jpeg, status_body, to_project
+from services.byok import (
+    clear_project_keys,
+    get_project_stage_key,
+    get_project_world_key,
+    set_project_auto_3d,
+    set_project_stage_key,
+    set_project_world_key,
+)
 from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
 from services.pipeline import enqueue_job, retry_delayed_project, start_job
@@ -126,10 +150,41 @@ def _raise_for_enqueue(outcome: str, kind: str) -> None:
         raise HTTPException(status_code=429, detail=message)
 
 
+def _idempotency_scope(caller: Caller, method: str, path: str, idem_key: str | None) -> str | None:
+    cleaned = (idem_key or "").strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > 128:
+        raise HTTPException(status_code=400, detail="Idempotency-Key is too long")
+    owner = caller.device_id or "admin"
+    return hashlib.sha256(f"{owner}|{method}|{path}|{cleaned}".encode("utf-8")).hexdigest()
+
+
+def _check_idempotency(scope: str | None, request_hash: str) -> JSONResponse | None:
+    if not scope:
+        return None
+    found = get_idempotency_record(scope)
+    if found is None:
+        return None
+    saved_hash, status_code, response_json = found
+    if saved_hash != request_hash:
+        raise HTTPException(status_code=409, detail="Idempotency-Key reused with different request parameters")
+    return JSONResponse(status_code=status_code, content=json.loads(response_json))
+
+
 @router.post("/projects")
 async def create_project(req: CreateProjectRequest, request: Request) -> Project:
     caller = _caller(request)
-    return to_project(create_project_row(req.name, owner_device_id=caller.device_id))
+    settings = get_settings()
+    cap = 0 if caller.is_admin else settings.max_projects_per_device
+    try:
+        row = create_project_row(req.name, owner_device_id=caller.device_id, max_projects=cap)
+    except DeviceProjectCapError:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Device project limit reached ({settings.max_projects_per_device}). Delete an old project first.",
+        )
+    return to_project(row)
 
 
 @router.get("/projects")
@@ -149,6 +204,7 @@ async def get_one(project_id: str, request: Request) -> Project:
 async def remove_project(project_id: str, request: Request) -> Response:
     """Delete the capture, its files, hosted worlds, and its share link."""
     project = _require(project_id, request)
+    clear_project_keys(project_id)
     world_ids = [
         project.world_id,
         project.world_preview_id,
@@ -173,17 +229,34 @@ async def rotate_share(project_id: str, request: Request) -> Project:
     return to_project(updated)
 
 
+@router.post("/projects/{project_id}/share/revoke")
+async def revoke_share(project_id: str, request: Request) -> Project:
+    """Immediately expire and rotate both the public share token and owner preview token."""
+    _require(project_id, request)
+    updated = revoke_share_token(project_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return to_project(updated)
+
+
 @router.post("/projects/{project_id}/upload")
 async def upload_images(
     project_id: str,
     request: Request,
     images: list[UploadFile] = File(...),
     metadata: str | None = Form(default=None),
+    auto_3d: bool = Query(default=True),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_atlas_key: str | None = Header(default=None, alias="X-Atlas-Key"),
+    x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
 ):
+    caller = _caller(request)
     project = _require(project_id, request)
-    _reject_if_busy(project.status)
-    _reject_declared_body(request)
     settings = get_settings()
+    worldlabs_key = (x_atlas_key or x_worldlabs_key or "").strip() or None
+    if settings.byok_required and auto_3d and not worldlabs_key:
+        raise HTTPException(status_code=400, detail="Atlas API key is required (send X-Atlas-Key)")
+    _reject_declared_body(request)
     count = len(images)
     if count < settings.min_images or count > settings.max_images:
         raise HTTPException(
@@ -195,46 +268,85 @@ async def upload_images(
         normalize_upload(await _read_limited(image, settings.max_image_bytes), max_pixels=settings.max_image_pixels)
         for image in images
     ]
+    scope = _idempotency_scope(caller, "POST", f"/api/v1/projects/{project_id}/upload", idempotency_key)
+    req_hash = ""
+    if scope:
+        hasher = hashlib.sha256()
+        hasher.update(f"auto_3d={auto_3d}|{metadata or ''}".encode("utf-8"))
+        for payload in payloads:
+            hasher.update(hashlib.sha256(payload).digest())
+        req_hash = hasher.hexdigest()
+        cached = _check_idempotency(scope, req_hash)
+        if cached is not None:
+            return cached
 
-    outcome, job_id = await enqueue_job(
-        project_id,
-        "stitch",
-        project_fields={
-            "image_count": count,
-            "error": None,
-            "provider_error": None,
-            "hfov_deg": meta.hfov_deg,
-            "yaws_json": json.dumps(meta.yaws_deg) if meta.yaws_deg is not None else None,
-            "pitches_json": json.dumps(meta.pitches_deg) if meta.pitches_deg is not None else None,
-            "lens": meta.lens,
-            "panorama_key": None,
-            "staged_key": None,
-            "staging_prompt": None,
-            "staging_provider": None,
-            "staging_notes": None,
-            "staging_status": None,
-            "staging_error": None,
-            "staged_published": 0,
-            # New photos: an operation paid for on the old ones must not resume.
-            "resume_operation": None,
-        },
-        replace_delayed=True,
-        retire_worlds="all",
-        start=False,
-    )
-    _raise_for_enqueue(outcome, "stitch")
-    storage = get_storage()
-    storage.delete_prefix(f"uploads/{project_id}/")
-    storage.delete_prefix(panorama_key(project_id))
-    storage.delete_prefix(staged_key(project_id))
-    storage.delete_prefix(world_asset_prefix(project_id))
-    for index, payload in enumerate(payloads):
-        storage.put_bytes(upload_key(project_id, index), payload, "image/jpeg")
+    _reject_if_busy(project.status)
+    incoming_bytes = sum(len(p) for p in payloads)
+    reserved = False
+    if not caller.is_admin and caller.device_id and settings.max_storage_bytes_per_device > 0:
+        if not reserve_device_storage(caller.device_id, project_id, incoming_bytes, settings.max_storage_bytes_per_device):
+            raise HTTPException(
+                status_code=413,
+                detail="Device storage quota exceeded. Delete an existing project before uploading more.",
+            )
+        reserved = True
+
+    prev_world_key = get_project_world_key(project_id)
+    set_project_auto_3d(project_id, auto_3d)
+    if auto_3d:
+        set_project_world_key(project_id, worldlabs_key)
+
+    try:
+        outcome, job_id = await enqueue_job(
+            project_id,
+            "stitch",
+            project_fields={
+                "image_count": count,
+                "error": None,
+                "provider_error": None,
+                "hfov_deg": meta.hfov_deg,
+                "yaws_json": json.dumps(meta.yaws_deg) if meta.yaws_deg is not None else None,
+                "pitches_json": json.dumps(meta.pitches_deg) if meta.pitches_deg is not None else None,
+                "lens": meta.lens,
+                "panorama_key": None,
+                "staged_key": None,
+                "staging_prompt": None,
+                "staging_provider": None,
+                "staging_notes": None,
+                "staging_status": None,
+                "staging_error": None,
+                "staged_published": 0,
+                # New photos: an operation paid for on the old ones must not resume.
+                "resume_operation": None,
+            },
+            replace_delayed=True,
+            retire_worlds="all",
+            start=False,
+            byok=bool(worldlabs_key),
+        )
+        if outcome != "queued":
+            set_project_world_key(project_id, prev_world_key)
+        elif not auto_3d:
+            set_project_world_key(project_id, None)
+        _raise_for_enqueue(outcome, "stitch")
+        storage = get_storage()
+        storage.delete_prefix(f"uploads/{project_id}/")
+        storage.delete_prefix(panorama_key(project_id))
+        storage.delete_prefix(staged_key(project_id))
+        storage.delete_prefix(world_asset_prefix(project_id))
+        for index, payload in enumerate(payloads):
+            storage.put_bytes(upload_key(project_id, index), payload, "image/jpeg")
+    finally:
+        if reserved:
+            release_device_storage_reservation(project_id)
     logger.info("Project %s: stored %d images", project_id, count)
     if job_id:
         await start_job(job_id)
     latest = get_project(project_id)
-    return {"status": latest.status if latest else "stitching", "image_count": count}
+    resp_body = {"status": latest.status if latest else "stitching", "image_count": count}
+    if scope:
+        save_idempotency_record(scope, req_hash, 200, json.dumps(resp_body))
+    return resp_body
 
 
 @router.get("/projects/{project_id}/status")
@@ -243,14 +355,35 @@ async def get_status(project_id: str, request: Request):
 
 
 @router.post("/projects/{project_id}/retry")
-async def retry_project(project_id: str, request: Request):
+async def retry_project(
+    project_id: str,
+    request: Request,
+    x_atlas_key: str | None = Header(default=None, alias="X-Atlas-Key"),
+    x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
+    x_gemini_key: str | None = Header(default=None, alias="X-Gemini-Key"),
+):
     project = _require(project_id, request)
+    settings = get_settings()
+    atlas_key = (x_atlas_key or x_worldlabs_key or "").strip() or None
+    gemini_key = (x_gemini_key or "").strip() or None
+
     if project.status == "delayed":
+        prev_world_key = get_project_world_key(project_id)
+        effective_atlas = atlas_key or prev_world_key
+        if settings.byok_required and not effective_atlas:
+            raise HTTPException(
+                status_code=400,
+                detail="Atlas API key is required to retry (resend your X-Atlas-Key header)",
+            )
+        if atlas_key:
+            set_project_world_key(project_id, atlas_key)
         outcome = await retry_delayed_project(project_id)
         if outcome == "expired":
+            set_project_world_key(project_id, None)
             latest = get_project(project_id)
             return {"status": latest.status if latest else "failed", "error": latest.error if latest else None}
         if outcome != "queued":
+            set_project_world_key(project_id, prev_world_key)
             raise HTTPException(status_code=409, detail="This project is already processing")
         latest = get_project(project_id)
         return {"status": latest.status if latest else "generating_3d"}
@@ -259,17 +392,45 @@ async def retry_project(project_id: str, request: Request):
     storage = get_storage()
     uploads = storage.list_keys(f"uploads/{project_id}/")
     job = project.active_job
+    byok = False
+    prev_world_key = get_project_world_key(project_id)
+    prev_stage_key = get_project_stage_key(project_id)
     if job == "stage":
         kind = "stage"
-    elif job == "staged_world":
-        kind = "staged_world"
-    elif job == "world":
-        kind = "world"
+        effective_gemini = gemini_key or prev_stage_key
+        if settings.byok_required and not effective_gemini:
+            raise HTTPException(
+                status_code=400,
+                detail="Gemini API key is required to retry staging (resend your X-Gemini-Key header)",
+            )
+        if gemini_key:
+            set_project_stage_key(project_id, gemini_key)
+        byok = bool(effective_gemini)
+    elif job in {"staged_world", "world"}:
+        kind = job
+        effective_atlas = atlas_key or prev_world_key
+        if settings.byok_required and not effective_atlas:
+            raise HTTPException(
+                status_code=400,
+                detail="Atlas API key is required to retry 3D generation (resend your X-Atlas-Key header)",
+            )
+        if atlas_key:
+            set_project_world_key(project_id, atlas_key)
+        byok = bool(effective_atlas)
     elif uploads:
         kind = "stitch"
+        set_project_auto_3d(project_id, bool(atlas_key))
+        if atlas_key:
+            set_project_world_key(project_id, atlas_key)
+            byok = True
     else:
         raise HTTPException(status_code=400, detail="No uploaded images to retry")
-    outcome, _job_id = await enqueue_job(project_id, kind)
+    outcome, _job_id = await enqueue_job(project_id, kind, byok=byok)
+    if outcome != "queued":
+        if kind == "stage":
+            set_project_stage_key(project_id, prev_stage_key)
+        else:
+            set_project_world_key(project_id, prev_world_key)
     _raise_for_enqueue(outcome, kind)
     latest = get_project(project_id)
     return {"status": latest.status if latest else kind}
@@ -326,23 +487,47 @@ async def unpublish_staged(project_id: str, request: Request) -> Project:
 
 
 @router.post("/projects/{project_id}/stage")
-async def stage_project(project_id: str, req: StageRequest, request: Request):
+async def stage_project(
+    project_id: str,
+    req: StageRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_gemini_key: str | None = Header(default=None, alias="X-Gemini-Key"),
+):
+    caller = _caller(request)
     project = _require(project_id, request)
+    settings = get_settings()
+    gemini_key = (x_gemini_key or "").strip() or None
+    if settings.byok_required and not gemini_key:
+        raise HTTPException(status_code=400, detail="Gemini API key is required (send X-Gemini-Key)")
+    scope = _idempotency_scope(caller, "POST", f"/api/v1/projects/{project_id}/stage", idempotency_key)
+    req_hash = hashlib.sha256(req.prompt.encode("utf-8")).hexdigest() if scope else ""
+    cached = _check_idempotency(scope, req_hash)
+    if cached is not None:
+        return cached
     if not project.panorama_key:
         raise HTTPException(status_code=400, detail="No panorama available to stage")
-    if staging_quota_blocks(project.owner_device_id):
+    if not gemini_key and staging_quota_blocks(project.owner_device_id):
         raise HTTPException(status_code=429, detail=STAGING_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
-    if project.staging_status == "staging" and not get_settings().jobs_inline:
+    if project.staging_status == "staging" and not settings.jobs_inline:
         raise HTTPException(status_code=409, detail="This project is already processing")
+    prev_stage_key = get_project_stage_key(project_id)
+    set_project_stage_key(project_id, gemini_key)
     outcome, _job_id = await enqueue_job(
         project_id,
         "stage",
         project_fields={"staging_prompt": req.prompt, "staged_published": 0},
+        byok=bool(gemini_key),
     )
+    if outcome != "queued":
+        set_project_stage_key(project_id, prev_stage_key)
     _raise_for_enqueue(outcome, "stage")
     latest = get_project(project_id)
-    return {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
+    resp_body = {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
+    if scope:
+        save_idempotency_record(scope, req_hash, 200, json.dumps(resp_body))
+    return resp_body
 
 
 @router.get("/projects/{project_id}/stage/status")
@@ -369,22 +554,51 @@ async def get_stage_status(project_id: str, request: Request):
 
 
 @router.post("/projects/{project_id}/generate-3d")
-async def generate_3d(project_id: str, request: Request, source: str = Query(default="original")):
+async def generate_3d(
+    project_id: str,
+    request: Request,
+    source: str = Query(default="original"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_atlas_key: str | None = Header(default=None, alias="X-Atlas-Key"),
+    x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
+):
     if source not in {"original", "staged"}:
         raise HTTPException(status_code=400, detail="source must be original or staged")
+    caller = _caller(request)
     project = _require(project_id, request)
+    settings = get_settings()
+    worldlabs_key = (x_atlas_key or x_worldlabs_key or "").strip() or None
+    if settings.byok_required and not worldlabs_key:
+        raise HTTPException(status_code=400, detail="Atlas API key is required (send X-Atlas-Key)")
+    scope = _idempotency_scope(caller, "POST", f"/api/v1/projects/{project_id}/generate-3d", idempotency_key)
+    req_hash = hashlib.sha256(source.encode("utf-8")).hexdigest() if scope else ""
+    cached = _check_idempotency(scope, req_hash)
+    if cached is not None:
+        return cached
     if source == "original" and not project.panorama_key:
         raise HTTPException(status_code=400, detail="No panorama available for a 3D world")
     if source == "staged" and not project.staged_key:
         raise HTTPException(status_code=400, detail="Stage the panorama before generating a 3D world from it")
-    if world_quota_blocks(project.owner_device_id):
+    if world_quota_blocks(project.owner_device_id, byok=bool(worldlabs_key)):
         raise HTTPException(status_code=429, detail=WORLD_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
+    prev_world_key = get_project_world_key(project_id)
+    set_project_world_key(project_id, worldlabs_key)
     kind = "staged_world" if source == "staged" else "world"
-    outcome, _job_id = await enqueue_job(project_id, kind, retire_worlds="staged" if source == "staged" else "original")
+    outcome, _job_id = await enqueue_job(
+        project_id,
+        kind,
+        retire_worlds="staged" if source == "staged" else "original",
+        byok=bool(worldlabs_key),
+    )
+    if outcome != "queued":
+        set_project_world_key(project_id, prev_world_key)
     _raise_for_enqueue(outcome, kind)
     latest = get_project(project_id)
-    return {"status": latest.status if latest else "generating_3d"}
+    resp_body = {"status": latest.status if latest else "generating_3d"}
+    if scope:
+        save_idempotency_record(scope, req_hash, 200, json.dumps(resp_body))
+    return resp_body
 
 
 @router.get("/projects/{project_id}/generate-3d/status")
@@ -397,18 +611,20 @@ async def get_generate_3d_status(project_id: str, request: Request):
     share = body.share_url or ""
     private = body.preview_url or share
     assets = None
-    if project.panorama_key and (project.world_provider or project.world_marble_url or project.world_preview_url):
+    orig_ready = bool(project.world_marble_url or (project.world_splat_url and project.world_provider != "worldlabs_mock"))
+    if project.panorama_key and (project.world_provider or orig_ready or project.world_preview_url):
         assets = {
             "viewer_url": f"{share}/world",
-            "ready": bool(project.world_marble_url),
-            "draft_ready": bool(project.world_preview_url) and not project.world_marble_url,
+            "ready": orig_ready,
+            "draft_ready": bool(project.world_preview_url) and not orig_ready,
         }
     staged_assets = None
-    if project.staged_key and (project.staged_world_provider or project.staged_world_marble_url):
+    staged_ready = bool(project.staged_world_marble_url or (project.staged_world_splat_url and project.staged_world_provider != "worldlabs_mock"))
+    if project.staged_key and (project.staged_world_provider or staged_ready):
         staged_assets = {
             "viewer_url": f"{private}/world?source=staged",
-            "ready": bool(project.staged_world_marble_url),
-            "draft_ready": bool(project.staged_world_preview_url) and not project.staged_world_marble_url,
+            "ready": staged_ready,
+            "draft_ready": bool(project.staged_world_preview_url) and not staged_ready,
         }
     return {
         "status": project.status,
@@ -441,7 +657,7 @@ async def _project_world_asset(project_id: str, request: Request, source: str, k
     if source not in {"original", "staged"}:
         raise HTTPException(status_code=400, detail="source must be original or staged")
     project = _require(project_id, request)
-    ready = project.staged_world_marble_url if source == "staged" else project.world_marble_url
+    ready = (project.staged_world_marble_url or (project.staged_world_splat_url if project.staged_world_provider != "worldlabs_mock" else None)) if source == "staged" else (project.world_marble_url or (project.world_splat_url if project.world_provider != "worldlabs_mock" else None))
     if not ready:
         raise HTTPException(status_code=404, detail="3D world not ready yet")
     found = await world_asset_stream(project, source, kind)

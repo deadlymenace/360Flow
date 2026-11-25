@@ -92,3 +92,17 @@ class S3Storage:
     def materialize(self, key: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(self.get_bytes(key))
+
+    def prefix_bytes(self, prefix: str) -> int:
+        total = 0
+        token = None
+        while True:
+            kwargs = {"Bucket": self.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            page = self.client.list_objects_v2(**kwargs)
+            total += sum(int(item.get("Size", 0)) for item in page.get("Contents", []))
+            if not page.get("IsTruncated"):
+                break
+            token = page.get("NextContinuationToken")
+        return total

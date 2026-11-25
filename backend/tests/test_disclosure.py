@@ -8,7 +8,6 @@ from services.world_gen import (
     WORLD_CREDITS_MESSAGE,
     WORLD_FAILED_MESSAGE,
     WORLD_PROVIDER_QUOTA_MESSAGE,
-    build_world_request,
     generation_models,
     world_client_message,
 )
@@ -219,21 +218,23 @@ def test_full_world_poll_allows_at_least_fifteen_minutes():
 
 
 def test_generation_runs_draft_then_full_model():
-    assert generation_models("marble-1.0-draft", "marble-1.1") == ["marble-1.0-draft", "marble-1.1"]
-    assert generation_models(None, "marble-1.1") == ["marble-1.1"]
-    assert generation_models("marble-1.1", "marble-1.1") == ["marble-1.1"]
+    assert generation_models("atlas-draft", "atlas-refined") == ["atlas-draft", "atlas-refined"]
+    assert generation_models(None, "atlas-draft") == ["atlas-draft"]
+    assert generation_models("atlas-draft", "atlas-draft") == ["atlas-draft"]
 
 
-def test_world_request_marks_equirect_as_pano():
-    body = build_world_request("Living Room", "asset-123", "marble-1.1", public=True)
-    assert body["world_prompt"]["type"] == "image"
-    assert body["world_prompt"]["is_pano"] is True
-    assert body["world_prompt"]["image_prompt"] == {
-        "source": "media_asset",
-        "media_asset_id": "asset-123",
-    }
-    assert body["permission"]["public"] is True
-    assert body["model"] == "marble-1.1"
+def test_atlas_splats_request_uses_draft_mode_and_posed_frames():
+    from services.atlas_client import build_posed_images_to_splats_request
+    from services.pano_slicer import pinhole_camera_dict
+
+    _rot, cam = pinhole_camera_dict(0.0, 0.0)
+    frames = [
+        {"imageAsset": {"assetId": f"asset-{i}"}, "camera": cam, "depth": {"depthAsset": {"assetId": f"depth-{i}"}}}
+        for i in range(2)
+    ]
+    body = build_posed_images_to_splats_request(frames, draft=True)
+    assert body["refine"] is False
+    assert len(body["posedFrames"]) == 2
 
 
 def test_decode_roundtrip_of_labeled_jpeg():

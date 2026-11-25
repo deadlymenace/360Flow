@@ -19,6 +19,8 @@ os.environ["RATE_LIMIT_PER_MINUTE"] = "10000"
 os.environ["SHARE_RATE_PER_MINUTE"] = "10000"
 os.environ["SHARE_ASSET_RATE_PER_MINUTE"] = "10000"
 os.environ["DEVICE_REGISTRATIONS_PER_HOUR"] = "10000"
+os.environ.setdefault("MAX_PROJECTS_PER_DEVICE", "10000")
+os.environ.setdefault("MAX_STORAGE_BYTES_PER_DEVICE", "0")
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["WORLDLABS_API_KEY"] = ""
 os.environ["PUBLIC_BASE_URL"] = "http://testserver"

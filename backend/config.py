@@ -79,10 +79,16 @@ class Settings:
     rate_limit_per_minute: int
     device_registrations_per_hour: int
     trusted_proxy_count: int
+    allow_open_device_registration: bool
+    byok_required: bool
+    shared_api_rate_limiting: bool
     gemini_daily_limit: int
     worldlabs_daily_limit: int
+    worldlabs_monthly_limit: int
     global_daily_worlds_cap: int
     global_daily_credits_cap: int
+    global_monthly_credits_cap: int
+    worldlabs_hard_credit_floor: int
     share_rate_per_minute: int
     share_asset_rate_per_minute: int
     world_delay_max_hours: int
@@ -94,6 +100,11 @@ class Settings:
     gemini_api_key: str | None
     gemini_model: str
     gemini_image_size: str
+    atlas_api_base_url: str
+    atlas_draft_mode: bool
+    atlas_synthesize_baseline: bool
+    atlas_slice_count: int
+    atlas_slice_hfov_deg: float
     worldlabs_api_key: str | None
     worldlabs_model: str
     worldlabs_draft_model: str | None
@@ -115,6 +126,9 @@ class Settings:
     max_image_bytes: int
     max_images: int
     min_images: int
+    max_projects_per_device: int
+    max_storage_bytes_per_device: int
+    atlas_max_submit_attempts_per_job: int
     log_level: str
 
     @property
@@ -135,7 +149,7 @@ class Settings:
 
     @property
     def world_mode(self) -> str:
-        return "worldlabs" if self.worldlabs_api_key else "mock"
+        return "atlas" if self.worldlabs_api_key else "mock"
 
     @property
     def auth_mode(self) -> str:
@@ -160,10 +174,9 @@ def get_settings() -> Settings:
     image_size = (_blank("GEMINI_IMAGE_SIZE") or "1K").upper()
     if image_size not in {"1K", "2K", "4K"}:
         image_size = "1K"
+    atlas_draft_mode = _bool("ATLAS_DRAFT_MODE", True)
     draft = os.environ.get("WORLDLABS_DRAFT_MODEL")
-    if draft is None:
-        draft_model = "marble-1.0-draft"
-    elif draft.strip().lower() in {"", "off", "none", "false"}:
+    if draft is None or draft.strip().lower() in {"", "off", "none", "false"}:
         draft_model = None
     else:
         draft_model = draft.strip()
@@ -194,10 +207,16 @@ def get_settings() -> Settings:
         rate_limit_per_minute=max(1, _int("RATE_LIMIT_PER_MINUTE", 120)),
         device_registrations_per_hour=max(1, _int("DEVICE_REGISTRATIONS_PER_HOUR", 30)),
         trusted_proxy_count=max(0, _int("TRUSTED_PROXY_COUNT", 1)),
+        allow_open_device_registration=_bool("ALLOW_OPEN_DEVICE_REGISTRATION", True),
+        byok_required=_bool("BYOK_REQUIRED", False),
+        shared_api_rate_limiting=_bool("SHARED_API_RATE_LIMITING", False),
         gemini_daily_limit=max(0, _int("GEMINI_JOBS_PER_DEVICE_PER_DAY", 20)),
         worldlabs_daily_limit=max(0, _int("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", 10)),
+        worldlabs_monthly_limit=max(0, _int("WORLDLABS_JOBS_PER_DEVICE_PER_MONTH", 0)),
         global_daily_worlds_cap=max(0, _int("GLOBAL_DAILY_WORLDS_CAP", 100)),
         global_daily_credits_cap=max(0, _int("GLOBAL_DAILY_CREDITS_CAP", 30000)),
+        global_monthly_credits_cap=max(0, _int("GLOBAL_MONTHLY_CREDITS_CAP", 0)),
+        worldlabs_hard_credit_floor=max(0, _int("WORLDLABS_HARD_CREDIT_FLOOR", 0)),
         share_rate_per_minute=max(1, _int("SHARE_RATE_PER_MINUTE", 60)),
         share_asset_rate_per_minute=max(1, _int("SHARE_ASSET_RATE_PER_MINUTE", 300)),
         world_delay_max_hours=max(1, _int("WORLD_DELAY_MAX_HOURS", 24)),
@@ -209,8 +228,13 @@ def get_settings() -> Settings:
         gemini_api_key=_blank("GEMINI_API_KEY"),
         gemini_model=_blank("GEMINI_MODEL") or "gemini-3.1-flash-image",
         gemini_image_size=image_size,
-        worldlabs_api_key=_blank("WORLDLABS_API_KEY"),
-        worldlabs_model=_blank("WORLDLABS_MODEL") or "marble-1.1",
+        atlas_api_base_url=_blank("ATLAS_API_BASE_URL") or "https://api.atlas.worldlabs.ai/api/v2",
+        atlas_draft_mode=atlas_draft_mode,
+        atlas_synthesize_baseline=_bool("ATLAS_SYNTHESIZE_BASELINE", False),
+        atlas_slice_count=min(12, max(8, _int("ATLAS_SLICE_COUNT", 10))),
+        atlas_slice_hfov_deg=min(120.0, max(60.0, _float("ATLAS_SLICE_HFOV_DEG", 90.0))),
+        worldlabs_api_key=_blank("ATLAS_API_KEY") or _blank("WORLDLABS_API_KEY"),
+        worldlabs_model=_blank("WORLDLABS_MODEL") or ("atlas-draft" if atlas_draft_mode else "atlas-refined"),
         worldlabs_draft_model=draft_model,
         worldlabs_public=_bool("WORLDLABS_PUBLIC", False),
         worldlabs_low_credit_threshold=max(0, _int("WORLDLABS_LOW_CREDIT_THRESHOLD", 6000)),
@@ -230,5 +254,8 @@ def get_settings() -> Settings:
         max_image_bytes=_int("MAX_IMAGE_BYTES", 12 * 1024 * 1024),
         max_images=_int("MAX_IMAGES", 24),
         min_images=_int("MIN_IMAGES", 2),
+        max_projects_per_device=max(0, _int("MAX_PROJECTS_PER_DEVICE", 20)),
+        max_storage_bytes_per_device=max(0, _int("MAX_STORAGE_BYTES_PER_DEVICE", 200 * 1024 * 1024)),
+        atlas_max_submit_attempts_per_job=max(1, _int("ATLAS_MAX_SUBMIT_ATTEMPTS_PER_JOB", 2)),
         log_level=_blank("LOG_LEVEL") or "INFO",
     )

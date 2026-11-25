@@ -11,6 +11,7 @@ Set JOBS_INLINE=1 to await the work inside the request (used by tests).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import contextvars
 import hashlib
 import json
@@ -28,6 +29,7 @@ from db import (
     begin_job,
     claim_delayed_job,
     claim_job_lease,
+    claim_job_submit_attempt,
     claim_resumable_jobs,
     delay_expired,
     delete_job,
@@ -42,6 +44,13 @@ from db import (
     update_project,
 )
 from db import _as_utc as _as_utc
+from services.byok import (
+    get_project_stage_key,
+    get_project_world_key,
+    pop_project_auto_3d,
+    set_project_stage_key,
+    set_project_world_key,
+)
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE
 from services.staging import StagingProviderError, stage_image
 from services.stitcher import stitch_images
@@ -82,6 +91,20 @@ _abort_hooks: dict[str, object] = {}
 # The job this task is running, so write guards can check its lease.
 _current_job: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_job", default=None)
 _INTERRUPTED_WORLD = "3D generation was interrupted. Retry from the app."
+
+
+def _byok_kwargs(fn, api_key: str | None, require_byok: bool) -> dict[str, object]:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    extra: dict[str, object] = {}
+    if accepts_var_kw or "api_key" in params:
+        extra["api_key"] = api_key
+    if accepts_var_kw or "require_byok" in params:
+        extra["require_byok"] = require_byok
+    return extra
 _INTERRUPTED_WORLD_DETAIL = (
     "Interrupted before a World Labs operation id was saved; not started again, to avoid a second charge."
 )
@@ -142,6 +165,7 @@ async def enqueue_job(
     replace_delayed: bool = False,
     retire_worlds: str | None = None,
     start: bool = True,
+    byok: bool = False,
 ) -> tuple[str, str | None]:
     """Claim the project and queue one job.
 
@@ -154,6 +178,7 @@ async def enqueue_job(
         project_fields=project_fields,
         replace_delayed=replace_delayed,
         retire_worlds=retire_worlds,
+        byok=byok,
     )
     if outcome == "quota" and kind in {"world", "staged_world"}:
         update_project(project_id, error=WORLD_QUOTA_MESSAGE, active_job=None)
@@ -491,7 +516,8 @@ async def run_job(job_id: str) -> None:
             else:
                 delete_owned_job(job_id, WORKER_ID)
     if follow and owned and not abandoned and not keep:
-        await enqueue_job(job.project_id, follow)
+        has_byok = get_project_world_key(job.project_id) is not None
+        await enqueue_job(job.project_id, follow, byok=has_byok)
 
 
 async def run_stitch(project_id: str) -> str | None:
@@ -551,7 +577,7 @@ async def run_stitch(project_id: str) -> str | None:
         logger.exception("Project %s stitch failed", project_id)
         update_project(project_id, status="failed", error="Stitching failed. Try again.")
         return None
-    return "world"
+    return "world" if pop_project_auto_3d(project_id) else None
 
 
 async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None = None) -> None:
@@ -575,8 +601,20 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
         def before_generate() -> None:
             _require_lease(job_id)
 
+        stage_key = get_project_stage_key(project_id)
+        require_byok = get_settings().byok_required
+        if require_byok and not stage_key:
+            _fail_stage(
+                project_id,
+                "Gemini API key missing (server restarted or key expired). Resend your X-Gemini-Key header and retry.",
+                "BYOK Gemini key missing",
+            )
+            return
         staged_bytes, provider, notes = await stage_image(
-            original, project.staging_prompt, before_generate=before_generate
+            original,
+            project.staging_prompt,
+            before_generate=before_generate,
+            **_byok_kwargs(stage_image, stage_key, require_byok),
         )
         if _deleted(project_id):
             return
@@ -596,6 +634,7 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
         if saved is None:
             delete_project_assets(project_id)
             return
+        set_project_stage_key(project_id, None)
         logger.info("Project %s staged via %s", project_id, provider)
     except LeaseLost:
         raise
@@ -608,11 +647,13 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
 
 def _fail_stage(project_id: str, message: str, detail: str | None = None) -> None:
     if _deleted(project_id):
+        set_project_stage_key(project_id, None)
         logger.info("Project %s deleted during staging", project_id)
         return
     if not _may_write(project_id):
         logger.warning("Project %s: not recording a staging failure without the lease", project_id)
         return
+    set_project_stage_key(project_id, None)
     client_message = message or "Staging failed. Try again."
     if detail:
         logger.error("Project %s staging provider error: %s", project_id, detail)
@@ -710,9 +751,28 @@ async def _run_world(
             if job_id:
                 update_job(job_id, media_asset_id=media_id)
 
+        require_byok = get_settings().byok_required
+        world_key = get_project_world_key(project_id)
+        if require_byok and not world_key:
+            _fail_world(
+                project_id,
+                "Atlas API key missing (server restarted or key expired). Resend your X-Atlas-Key header and retry.",
+                "BYOK Atlas key missing",
+                staged_source,
+            )
+            return None
+
         async def on_submitting(phase: str) -> None:
             _require_lease(job_id)
             if job_id:
+                max_attempts = get_settings().atlas_max_submit_attempts_per_job
+                allowed, _attempts = claim_job_submit_attempt(job_id, max_attempts)
+                if not allowed:
+                    raise ProviderFailure(
+                        WORLD_FAILED_MESSAGE,
+                        f"Atlas submit attempt cap ({max_attempts}) reached for job {job_id}",
+                        503,
+                    )
                 update_job(job_id, operation_phase="submitting", status="running")
 
         async def on_operation(operation_id: str, phase: str) -> None:
@@ -730,8 +790,9 @@ async def _run_world(
             on_operation=on_operation,
             on_submitting=on_submitting,
             on_tick=on_tick,
+            **_byok_kwargs(generate_world, world_key, require_byok),
         )
-        await _store_world(project_id, result, staged_source, created_ids)
+        await _store_world(project_id, result, staged_source, created_ids, api_key=world_key)
     except LeaseLost:
         raise
     except RateLimitExceeded as exc:
@@ -788,7 +849,23 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
         def on_tick() -> None:
             touch_job(job.id)
 
-        parsed = await poll_world_operation(job.operation_id or "", timeout_s, on_tick=on_tick)
+        world_key = get_project_world_key(project_id)
+        require_byok = get_settings().byok_required
+        if require_byok and not world_key:
+            await _fail_world_clean(
+                project_id,
+                created_ids,
+                "Atlas API key missing (server restarted or key expired). Resend your X-Atlas-Key header and retry.",
+                "BYOK Atlas key missing on resume",
+                staged_source,
+            )
+            return None
+        parsed = await poll_world_operation(
+            job.operation_id or "",
+            timeout_s,
+            on_tick=on_tick,
+            **_byok_kwargs(poll_world_operation, world_key, require_byok),
+        )
         if phase == "draft":
             _store_preview(project_id, parsed, staged_source, created_ids)
             if _deleted(project_id):
@@ -811,8 +888,9 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
                 on_operation=on_operation,
                 on_submitting=on_submitting,
                 on_tick=on_tick,
+                **_byok_kwargs(continue_full_world, world_key, require_byok),
             )
-        await _store_world(project_id, parsed, staged_source, created_ids)
+        await _store_world(project_id, parsed, staged_source, created_ids, api_key=world_key)
     except LeaseLost:
         raise
     except RateLimitExceeded as exc:
@@ -867,8 +945,6 @@ def _world_inputs(project: ProjectRecord, staged_source: bool) -> tuple[bytes, s
 def _accepted_world(result: dict) -> tuple[str | None, str | None]:
     world_id = valid_world_id(result.get("world_id"))
     marble = valid_marble_url(result.get("marble_url"))
-    if marble is None and world_id:
-        marble = f"https://marble.worldlabs.ai/world/{world_id}"
     return world_id, marble
 
 
@@ -895,56 +971,70 @@ def _store_preview(project_id: str, result: dict, staged_source: bool, created_i
         )
 
 
-async def _store_world(project_id: str, result: dict, staged_source: bool, created_ids: list[str]) -> None:
-    final_id, marble = _accepted_world(result)
-    if final_id:
-        created_ids.append(final_id)
-    if _deleted(project_id):
-        await delete_worlds(created_ids)
-        return
-    _guard_write(project_id)
-    operation_id = result.get("operation_id")
-    stored_operation = operation_id[:64] if isinstance(operation_id, str) else None
-    source = "staged" if staged_source else "original"
-    # A regenerated world replaces the cached splat/mesh of the old one.
-    clear_world_assets(project_id, source)
-    if staged_source:
-        saved = update_project(
-            project_id,
-            status="complete",
-            staged_world_provider=result.get("provider"),
-            staged_world_id=final_id,
-            staged_world_marble_url=marble,
-            staged_world_splat_url=result.get("splat_url"),
-            staged_world_mesh_url=result.get("mesh_url"),
-            staged_world_thumbnail_url=result.get("thumbnail_url"),
-            staged_world_operation_id=stored_operation,
-            active_job=None,
-            error=None,
-            provider_error=None,
-        )
-    else:
-        saved = update_project(
-            project_id,
-            status="complete",
-            world_provider=result.get("provider"),
-            world_id=final_id,
-            world_marble_url=marble,
-            world_splat_url=result.get("splat_url"),
-            world_mesh_url=result.get("mesh_url"),
-            world_thumbnail_url=result.get("thumbnail_url"),
-            world_operation_id=stored_operation,
-            active_job=None,
-            error=None,
-            provider_error=None,
-        )
-    if saved is None:
-        await delete_worlds(created_ids)
-        delete_project_assets(project_id)
-        return
-    logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
-    # Pull the splat and mesh into private storage now, so viewers never touch the CDN.
-    await cache_world_assets(project_id, source, result.get("splat_url"), result.get("mesh_url"))
+async def _store_world(project_id: str, result: dict, staged_source: bool, created_ids: list[str], *, api_key: str | None = None) -> None:
+    should_clear = True
+    try:
+        final_id, marble = _accepted_world(result)
+        if final_id:
+            created_ids.append(final_id)
+        if _deleted(project_id):
+            await delete_worlds(created_ids)
+            return
+        _guard_write(project_id)
+        operation_id = result.get("operation_id")
+        stored_operation = operation_id[:64] if isinstance(operation_id, str) else None
+        source = "staged" if staged_source else "original"
+        # A regenerated world replaces the cached splat/mesh of the old one.
+        clear_world_assets(project_id, source)
+        if staged_source:
+            saved = update_project(
+                project_id,
+                status="complete",
+                staged_world_provider=result.get("provider"),
+                staged_world_id=final_id,
+                staged_world_marble_url=marble,
+                staged_world_splat_url=result.get("splat_url"),
+                staged_world_mesh_url=result.get("mesh_url"),
+                staged_world_thumbnail_url=result.get("thumbnail_url"),
+                staged_world_operation_id=stored_operation,
+                active_job=None,
+                error=None,
+                provider_error=None,
+            )
+        else:
+            saved = update_project(
+                project_id,
+                status="complete",
+                world_provider=result.get("provider"),
+                world_id=final_id,
+                world_marble_url=marble,
+                world_splat_url=result.get("splat_url"),
+                world_mesh_url=result.get("mesh_url"),
+                world_thumbnail_url=result.get("thumbnail_url"),
+                world_operation_id=stored_operation,
+                active_job=None,
+                error=None,
+                provider_error=None,
+            )
+        if saved is None:
+            await delete_worlds(created_ids)
+            delete_project_assets(project_id)
+            return
+        logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
+        # Pull the splat and mesh into private storage now, so viewers never touch the CDN.
+        cache_kw = {}
+        try:
+            if "api_key" in inspect.signature(cache_world_assets).parameters:
+                cache_kw["api_key"] = api_key
+        except (TypeError, ValueError):
+            pass
+        await cache_world_assets(project_id, source, result.get("splat_url"), result.get("mesh_url"), **cache_kw)
+    except LeaseLost:
+        should_clear = False
+        raise
+    finally:
+        if should_clear:
+            set_project_world_key(project_id, None)
 
 
 def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: bool) -> str | None:
@@ -1117,8 +1207,11 @@ def _delay_world(project_id: str, job_id: str | None, detail: str, staged_source
 
 def _fail_world(project_id: str, message: str, detail: str | None, staged_source: bool) -> None:
     if not _may_write(project_id):
+        if _deleted(project_id):
+            set_project_world_key(project_id, None)
         logger.warning("Project %s: not recording a 3D failure without the project or lease", project_id)
         return
+    set_project_world_key(project_id, None)
     if detail:
         logger.error("Project %s world provider error: %s", project_id, detail)
     else:
@@ -1140,6 +1233,7 @@ async def _fail_world_clean(
     staged_source: bool,
 ) -> None:
     if _deleted(project_id):
+        set_project_world_key(project_id, None)
         logger.info("Project %s deleted during world generation", project_id)
         await delete_worlds(created_ids)
         return

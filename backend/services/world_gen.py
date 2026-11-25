@@ -1,4 +1,9 @@
-"""World Labs Marble generation. Uses the mock when WORLDLABS_API_KEY is unset."""
+"""World Labs Atlas v2 3D generation (replaces legacy Marble v1 API).
+
+Uses equirectangular panorama slicing (services.pano_slicer) and the Atlas
+Developer API v2 (services.atlas_client) in draft mode by default. Falls back
+to mock_generate_3d only when BYOK_REQUIRED=false and no Atlas key is set.
+"""
 
 from __future__ import annotations
 
@@ -14,25 +19,36 @@ import httpx
 
 from config import get_settings
 from db import (
-    world_ids_in_use,
     due_draft_cleanups,
     forget_draft_cleanup,
     forget_world_delete,
     note_draft_cleanup_attempt,
     pending_world_delete_ids,
     queue_world_deletes,
-    remember_draft_cleanup,
+    world_ids_in_use,
 )
-from services.world_urls import valid_marble_url, valid_upload_url, valid_world_id
+from services.atlas_client import (
+    ATLAS_API_BASE_URL,
+    ATLAS_POSE_CREDITS_PER_IMAGE,
+    ATLAS_SPLAT_DRAFT_CREDITS,
+    ATLAS_SPLAT_REFINED_CREDITS,
+    AtlasError,
+    AtlasRateLimit,
+    extract_splat_asset,
+    poll_atlas_operation,
+    resolve_read_url,
+    run_atlas_pipeline,
+)
 from services.world_gen_mock import mock_generate_3d
+from services.world_urls import valid_marble_url, valid_world_id
 
 logger = logging.getLogger(__name__)
 
-WORLDLABS_BASE = "https://api.worldlabs.ai"
-# Draft worlds finish in seconds. Full worlds have taken about 9 minutes,
-# so the poll loop waits at least 15 and keeps a few minutes of headroom.
-DRAFT_WORLD_TIMEOUT_S = 4 * 60
-FULL_WORLD_TIMEOUT_S = 20 * 60
+ATLAS_API_BASE = ATLAS_API_BASE_URL
+WORLDLABS_BASE = ATLAS_API_BASE_URL
+
+DRAFT_WORLD_TIMEOUT_S = 5 * 60
+FULL_WORLD_TIMEOUT_S = 25 * 60
 
 WORLD_FAILED_MESSAGE = "3D generation failed. Try again."
 WORLD_CREDITS_MESSAGE = "3D generation is unavailable right now (provider credits)."
@@ -43,10 +59,10 @@ WORLD_RATE_LIMIT_EXHAUSTED = (
     "3D generation is unavailable right now (provider quota). Try again from the app."
 )
 
-# Pano world generation. Draft is 150; marble-1.0 / marble-1.1 are 1,500.
-# A plus model can cost more, so 1,500 is only the minimum that must be on hand.
-DRAFT_WORLD_CREDITS = 150
-FULL_WORLD_CREDITS = 1500
+# Atlas credit estimates (1,000 credits = $1.00 USD):
+# 10 slices * 2 credits + 500 draft splat = 520 ($0.52); refined = 5,020 ($5.02).
+DRAFT_WORLD_CREDITS = ATLAS_SPLAT_DRAFT_CREDITS + 10 * ATLAS_POSE_CREDITS_PER_IMAGE
+FULL_WORLD_CREDITS = ATLAS_SPLAT_REFINED_CREDITS + 10 * ATLAS_POSE_CREDITS_PER_IMAGE
 CREDIT_CACHE_TTL_S = 30.0
 
 _credit_cache: dict | None = None
@@ -63,18 +79,14 @@ class ProviderFailure(Exception):
 
 
 class RateLimitExceeded(ProviderFailure):
-    """The job used its whole World Labs 429 budget. Callers fail it."""
+    """The job used its whole Atlas 429 budget. Callers fail it."""
 
     def __init__(self, detail: str) -> None:
         super().__init__(WORLD_RATE_LIMIT_EXHAUSTED, detail, 429)
 
 
 class OperationInFlight(ProviderFailure):
-    """A worlds:generate call was accepted, then a later request was rate limited.
-
-    The operation id has already been charged. Callers poll it instead of
-    submitting worlds:generate again.
-    """
+    """An Atlas task was accepted, then a later request was rate limited."""
 
     def __init__(self, operation_id: str, phase: str, detail: str) -> None:
         super().__init__(WORLD_PROVIDER_QUOTA_MESSAGE, detail, 429)
@@ -82,26 +94,31 @@ class OperationInFlight(ProviderFailure):
         self.phase = phase
 
 
+class LeaseLost(Exception):
+    """The job runner no longer owns this job, so no further paid call may start."""
+
+
 def world_client_message(status_code: int | None, message: str) -> str:
-    """Map credit and quota failures to a specific sentence. Everything else stays generic."""
     text = (message or "").lower()
-    if status_code == 402 or any(token in text for token in ("credit", "billing", "payment required")):
+    if status_code == 402 or any(token in text for token in ("credit", "billing", "payment required", "spend_limit")):
         return WORLD_CREDITS_MESSAGE
     if status_code == 429 or any(
         token in text
-        for token in ("quota", "rate limit", "rate_limit", "too many requests", "resource exhausted", "resource_exhausted")
+        for token in (
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "resource exhausted",
+            "concurrency_limit",
+            "task_unavailable",
+        )
     ):
         return WORLD_PROVIDER_QUOTA_MESSAGE
     return WORLD_FAILED_MESSAGE
 
 
 def retry_wait_seconds(attempt: int, retry_after: float | None) -> float:
-    """Seconds to wait after attempt ``attempt`` (1 = the first HTTP 429).
-
-    The wait is exponential in the attempt, with full jitter. A Retry-After
-    value is a floor: the wait is never shorter than that header, and never
-    longer than ``WORLDLABS_RETRY_MAX_SECONDS``.
-    """
     settings = get_settings()
     cap = settings.worldlabs_retry_max_seconds
     base = settings.worldlabs_retry_base_seconds
@@ -133,8 +150,6 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
-# Set by the job runner. Counts every HTTP 429 for one job, across polls and
-# generate calls, and raises RateLimitExceeded when the job's budget is spent.
 _rate_limit_hook: ContextVar = ContextVar("worldlabs_rate_limit_hook", default=None)
 _rate_limit_success_hook: ContextVar = ContextVar("worldlabs_rate_limit_success_hook", default=None)
 
@@ -162,12 +177,6 @@ def _note_rate_limit_success() -> None:
 
 
 async def _send_retrying_rate_limit(send):
-    """Call ``send`` again after HTTP 429, up to the configured attempt cap.
-
-    ``send`` must perform one HTTP request. A non-429 response is returned
-    immediately so a charged call is not repeated for any other status.
-    Every 429 also counts against the job's total attempt and time budget.
-    """
     attempts = get_settings().worldlabs_retry_attempts
     response = None
     for attempt in range(1, attempts + 1):
@@ -181,7 +190,7 @@ async def _send_retrying_rate_limit(send):
             return response
         delay = retry_wait_seconds(attempt, _retry_after_seconds(response))
         logger.warning(
-            "World Labs returned HTTP 429; waiting %.2fs before attempt %s of %s",
+            "Atlas returned HTTP 429; waiting %.2fs before attempt %s of %s",
             delay,
             attempt + 1,
             attempts,
@@ -198,7 +207,6 @@ def provider_detail(status_code: int | None, message: str) -> str:
 
 
 def credits_required(model: str) -> int:
-    """Minimum credits for one world. Pano input adds no extra pano-generation charge."""
     if "draft" in model:
         return DRAFT_WORLD_CREDITS
     return FULL_WORLD_CREDITS
@@ -210,7 +218,6 @@ def clear_world_credits_cache() -> None:
 
 
 def note_out_of_credits() -> None:
-    """Remember a zero balance so the next attempt waits instead of calling generate."""
     global _credit_cache
     _credit_cache = {"at": time.monotonic(), "remaining": 0.0}
     _warn_if_low(0.0)
@@ -220,7 +227,7 @@ def _warn_if_low(remaining: float) -> None:
     threshold = get_settings().worldlabs_low_credit_threshold
     if remaining < threshold:
         logger.warning(
-            "World Labs credit balance is low: %s remaining (threshold %s)",
+            "Atlas credit balance is low: %s remaining (threshold %s)",
             remaining,
             threshold,
         )
@@ -230,148 +237,91 @@ def _is_out_of_credits(exc: ProviderFailure) -> bool:
     return exc.status_code == 402 or exc.client_message == WORLD_CREDITS_MESSAGE
 
 
-async def world_credits_balance() -> float | None:
-    """Remaining World Labs credits.
-
-    The value is cached for ``CREDIT_CACHE_TTL_S``. None means the key is unset
-    or the credits call failed; callers then let generation try and rely on a
-    402 to stop.
-    """
-    global _credit_cache
-    settings = get_settings()
-    if not settings.worldlabs_api_key:
-        return None
-    now = time.monotonic()
-    if _credit_cache is not None and now - float(_credit_cache["at"]) < CREDIT_CACHE_TTL_S:
-        return _credit_cache["remaining"]
-    remaining = await _fetch_credits(settings.worldlabs_api_key)
-    _credit_cache = {"at": now, "remaining": remaining}
-    return remaining
+async def world_credits_balance(api_key: str | None = None) -> float | None:
+    """Atlas v2 has no pre-flight credit balance endpoint (402 is returned on task submission)."""
+    return None
 
 
-async def _fetch_credits(api_key: str) -> float | None:
-    timeout = httpx.Timeout(5.0)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(
-                f"{WORLDLABS_BASE}/marble/v1/credits",
-                headers={"WLT-Api-Key": api_key},
-            )
-    except Exception:
-        logger.warning("World Labs credits check failed", exc_info=True)
-        return None
-    if response.status_code >= 400:
-        logger.warning("World Labs credits check returned HTTP %s", response.status_code)
-        return None
-    try:
-        body = response.json()
-    except Exception:
-        logger.warning("World Labs credits check returned a body that is not JSON")
-        return None
-    remaining = body.get("remaining_credits") if isinstance(body, dict) else None
-    if not isinstance(remaining, (int, float)):
-        logger.warning("World Labs credits check did not include remaining_credits")
-        return None
-    logger.info("World Labs credits remaining: %s", remaining)
-    value = float(remaining)
-    _warn_if_low(value)
-    return value
-
-
-async def _require_credits(model: str) -> None:
-    """Stop before worlds:generate when the cached balance cannot pay for this model."""
-    remaining = await world_credits_balance()
+async def _require_credits(model: str, api_key: str | None = None) -> None:
+    remaining = await (world_credits_balance(api_key) if api_key else world_credits_balance())
     if remaining is None:
         return
     needed = credits_required(model)
-    if remaining >= needed:
+    floor = 0 if api_key else get_settings().worldlabs_hard_credit_floor
+    if remaining >= needed and (remaining - needed) >= floor:
         return
-    detail = f"out of credits (remaining {remaining:g}, {model} needs {needed})"
-    logger.error("World Labs %s", detail)
+    detail = f"out of credits (remaining {remaining:g}, {model} needs {needed}, floor {floor})"
+    logger.error("Atlas %s", detail)
     raise ProviderFailure(WORLD_CREDITS_MESSAGE, detail, 402)
 
 
 def generation_models(draft_model: str | None, full_model: str) -> list[str]:
-    """Draft first when configured, then the full Marble model.
-
-    marble-1.0-draft is the fast preview (about 20 seconds). marble-1.1 is the
-    full world (about 5 minutes). An empty draft model skips the preview.
-    """
     if draft_model and draft_model != full_model:
         return [draft_model, full_model]
     return [full_model]
 
 
 def world_display_name(project_id: str, *, staged: bool) -> str:
-    """Marble title. Uses the project id so the user's room name is not sent."""
     name = project_id if not staged else f"{project_id}-staged"
     return name[:64]
 
 
-def build_world_request(display_name: str, media_asset_id: str, model: str, public: bool) -> dict:
-    """Image-to-world body. ``is_pano`` is true because the stitcher emits a 2:1 equirect."""
-    name = " ".join(display_name.split())[:64] or "360Flow room"
-    return {
-        "display_name": name,
-        "model": model,
-        "permission": {"public": public},
-        "world_prompt": {
-            "type": "image",
-            "is_pano": True,
-            "image_prompt": {
-                "source": "media_asset",
-                "media_asset_id": media_asset_id,
-            },
-        },
-    }
+def _resolve_world_key(api_key: str | None, require_byok: bool) -> str | None:
+    cleaned = (api_key or "").strip() or None
+    if require_byok:
+        if not cleaned:
+            raise ProviderFailure(
+                "Atlas API key is required for 3D generation (send X-Atlas-Key).",
+                "BYOK Atlas key missing",
+                400,
+            )
+        return cleaned
+    return cleaned or get_settings().worldlabs_api_key
 
 
-def _splat_size_rank(name: str) -> float:
-    """Approximate splat count of an ``spz_urls`` key ("100k", "500k", "2m", "full_res")."""
-    key = name.strip().lower()
-    if key in {"full", "full_res", "fullres"}:
-        return float("inf")
-    multiplier = {"k": 1e3, "m": 1e6}.get(key[-1:], 1.0)
-    digits = key[:-1] if key[-1:] in {"k", "m"} else key
-    try:
-        return float(digits) * multiplier
-    except ValueError:
-        return float("inf") - 1  # unknown labels sort just before full_res
+def _map_atlas_exc(exc: AtlasError) -> ProviderFailure:
+    if exc.status_code == 402:
+        note_out_of_credits()
+    if isinstance(exc, AtlasRateLimit):
+        return ProviderFailure(WORLD_PROVIDER_QUOTA_MESSAGE, exc.detail, 429)
+    return ProviderFailure(exc.client_message, exc.detail, exc.status_code)
 
 
 def smallest_splat_url(spz_urls: dict) -> str | None:
-    """Lowest-resolution splat: the one phones (iPhone WKWebView) can load.
-
-    The full-resolution file is ~30 MB and too heavy for the in-app viewer,
-    so only the smallest entry is cached and served.
-    """
-    candidates = [(name, url) for name, url in (spz_urls or {}).items() if isinstance(url, str) and url]
-    if not candidates:
+    if not isinstance(spz_urls, dict) or not spz_urls:
         return None
-    return min(candidates, key=lambda item: _splat_size_rank(str(item[0])))[1]
+    candidates = []
+    for key, val in spz_urls.items():
+        url = val.get("url") if isinstance(val, dict) else val
+        if isinstance(url, str) and url:
+            digits = "".join(ch for ch in str(key) if ch.isdigit())
+            rank = int(digits) if digits else (100_000 if "100" in str(key) else 10**9)
+            candidates.append((rank, url))
+    return min(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 def parse_world(operation: dict) -> dict:
-    world = operation.get("response") or {}
-    metadata = operation.get("metadata") or {}
-    world_id = valid_world_id(world.get("world_id") or world.get("id") or metadata.get("world_id"))
-    marble = valid_marble_url(world.get("world_marble_url"))
-    if not marble and world_id:
-        marble = f"https://marble.worldlabs.ai/world/{world_id}"
-    assets = world.get("assets") or {}
-    splats = (assets.get("splats") or {}).get("spz_urls") or {}
-    splat = smallest_splat_url(splats)
-    mesh = (assets.get("mesh") or {}).get("collider_mesh_url")
-    imagery = (assets.get("imagery") or {}).get("pano_url")
+    """Normalize an Atlas operation (or test payload) into 360Flow's world result shape."""
+    response = operation.get("response") or {}
+    if not isinstance(response, dict):
+        response = {}
+    asset_id, spz_url = extract_splat_asset(response)
+    if spz_url is None:
+        assets = response.get('assets') or {}
+        spz_url = smallest_splat_url(((assets.get('splats') or {}).get('spz_urls')) or {})
+    op_id = valid_world_id(operation.get("id") or operation.get("operation_id"))
+    world_id = valid_world_id(response.get("world_id") or asset_id or op_id)
+    # Atlas does not expose a hosted Marble viewer page; all rendering uses 360Flow Spark.js
+    marble_url = valid_marble_url(response.get("world_marble_url"))
     return {
+        "provider": "atlas",
         "world_id": world_id,
-        "marble_url": marble,
-        "splat_url": splat,
-        "mesh_url": mesh,
-        "thumbnail_url": assets.get("thumbnail_url"),
-        "imagery_url": imagery,
-        "provider": "worldlabs",
-        "operation_id": operation.get("operation_id"),
+        "marble_url": marble_url,
+        "splat_url": spz_url,
+        "splat_asset_id": asset_id,
+        "mesh_url": None,
+        "thumbnail_url": None,
+        "operation_id": op_id,
     }
 
 
@@ -383,16 +333,15 @@ async def generate_world(
     on_operation=None,
     on_submitting=None,
     on_tick=None,
+    *,
+    api_key: str | None = None,
+    require_byok: bool = False,
 ) -> dict:
-    """Generate a draft world first, then the full world from the same panorama.
-
-    ``on_submitting`` runs immediately before each worlds:generate call.
-    ``on_operation`` runs as soon as World Labs returns an operation id, before
-    the poll loop, so a restart can re-poll that id instead of generating again.
-    """
+    """Slice an equirectangular panorama and generate an Atlas 3D splat (draft by default)."""
     settings = get_settings()
-    models = generation_models(settings.worldlabs_draft_model, settings.worldlabs_model)
-    if not settings.worldlabs_api_key:
+    effective_key = _resolve_world_key(api_key, require_byok)
+    if not effective_key:
+        models = generation_models(settings.worldlabs_draft_model, settings.worldlabs_model)
         return await _mock_world(
             models,
             on_preview=on_preview,
@@ -401,42 +350,80 @@ async def generate_world(
             on_tick=on_tick,
         )
 
-    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+    draft = settings.atlas_draft_mode
+    model_name = "atlas-draft" if draft else "atlas-refined"
+    byok_key = effective_key if (api_key and api_key.strip()) else None
+    await _require_credits(model_name, api_key=byok_key)
+
     timeout = httpx.Timeout(60.0, read=180.0)
-    await _require_credits(models[0])
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        media_id = await _upload_panorama(client, headers, image_bytes)
-        if on_media is not None:
-            await on_media(media_id)
-        return await _generate_models(
-            client,
-            headers,
-            display_name,
-            media_id,
-            models,
-            settings.worldlabs_public,
-            on_preview=on_preview,
-            on_operation=on_operation,
-            on_submitting=on_submitting,
-            on_tick=on_tick,
-        )
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            result = await run_atlas_pipeline(
+                client,
+                api_key=effective_key,
+                panorama_bytes=image_bytes,
+                project_label=display_name,
+                base_url=settings.atlas_api_base_url,
+                slice_count=settings.atlas_slice_count,
+                hfov_deg=settings.atlas_slice_hfov_deg,
+                draft=draft,
+                synthesize_baseline=settings.atlas_synthesize_baseline,
+                pose_timeout_s=DRAFT_WORLD_TIMEOUT_S,
+                splat_timeout_s=DRAFT_WORLD_TIMEOUT_S if draft else FULL_WORLD_TIMEOUT_S,
+                max_submit_attempts=getattr(settings, "atlas_max_submit_attempts_per_job", 2),
+                on_operation=on_operation,
+                on_submitting=on_submitting,
+                on_tick=on_tick,
+            )
+            if on_media is not None and result.get("splat_asset_id"):
+                await on_media(str(result["splat_asset_id"]))
+            return result
+    except AtlasError as exc:
+        raise _map_atlas_exc(exc) from exc
 
 
-async def poll_world_operation(operation_id: str, timeout_s: int, on_tick=None) -> dict:
-    """Poll an operation World Labs already accepted. Does not call worlds:generate."""
-    settings = get_settings()
-    if not settings.worldlabs_api_key:
+async def poll_world_operation(
+    operation_id: str,
+    timeout_s: int,
+    on_tick=None,
+    *,
+    api_key: str | None = None,
+    require_byok: bool = False,
+) -> dict:
+    """Poll an existing Atlas operation without resubmitting tasks."""
+    effective_key = _resolve_world_key(api_key, require_byok)
+    if not effective_key:
         if on_tick is not None:
             on_tick()
         result = await mock_generate_3d("memory")
         result["operation_id"] = operation_id
         return result
-    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+
+    settings = get_settings()
     timeout = httpx.Timeout(60.0, read=180.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        operation = await _poll_until_done(client, headers, operation_id, timeout_s, on_tick=on_tick)
-    _raise_operation_error(operation)
-    return parse_world(operation)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            op = await poll_atlas_operation(
+                client,
+                settings.atlas_api_base_url.rstrip("/"),
+                effective_key,
+                operation_id,
+                timeout_s,
+                on_tick=on_tick,
+            )
+            parsed = parse_world(op)
+            resolved = await resolve_read_url(
+                client,
+                settings.atlas_api_base_url.rstrip("/"),
+                effective_key,
+                parsed.get("splat_asset_id"),
+                parsed.get("splat_url"),
+            )
+            if resolved:
+                parsed["splat_url"] = resolved
+            return parsed
+    except AtlasError as exc:
+        raise _map_atlas_exc(exc) from exc
 
 
 async def continue_full_world(
@@ -446,30 +433,44 @@ async def continue_full_world(
     on_operation=None,
     on_submitting=None,
     on_tick=None,
+    *,
+    api_key: str | None = None,
+    require_byok: bool = False,
 ) -> dict:
-    """Start the full model after a resumed draft. Does not regenerate the draft."""
+    """Run refined Atlas splat reconstruction from panorama slices."""
     settings = get_settings()
-    model = settings.worldlabs_model
-    if not settings.worldlabs_api_key:
-        return await _mock_world([model], on_operation=on_operation, on_submitting=on_submitting, on_tick=on_tick)
-    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
-    timeout = httpx.Timeout(60.0, read=180.0)
-    await _require_credits(model)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        media_id = media_asset_id or await _upload_panorama(client, headers, image_bytes)
-        return await _generate_model(
-            client,
-            headers,
-            display_name,
-            media_id,
-            model,
-            settings.worldlabs_public,
-            FULL_WORLD_TIMEOUT_S,
-            phase="full",
+    effective_key = _resolve_world_key(api_key, require_byok)
+    if not effective_key:
+        return await _mock_world(
+            [settings.worldlabs_model],
             on_operation=on_operation,
             on_submitting=on_submitting,
             on_tick=on_tick,
         )
+    byok_key = effective_key if (api_key and api_key.strip()) else None
+    await _require_credits("atlas-refined", api_key=byok_key)
+    timeout = httpx.Timeout(60.0, read=180.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            return await run_atlas_pipeline(
+                client,
+                api_key=effective_key,
+                panorama_bytes=image_bytes,
+                project_label=display_name,
+                base_url=settings.atlas_api_base_url,
+                slice_count=settings.atlas_slice_count,
+                hfov_deg=settings.atlas_slice_hfov_deg,
+                draft=False,
+                synthesize_baseline=settings.atlas_synthesize_baseline,
+                pose_timeout_s=DRAFT_WORLD_TIMEOUT_S,
+                splat_timeout_s=FULL_WORLD_TIMEOUT_S,
+                max_submit_attempts=getattr(settings, "atlas_max_submit_attempts_per_job", 2),
+                on_operation=on_operation,
+                on_submitting=on_submitting,
+                on_tick=on_tick,
+            )
+    except AtlasError as exc:
+        raise _map_atlas_exc(exc) from exc
 
 
 async def _mock_world(models: list[str], on_preview=None, on_operation=None, on_submitting=None, on_tick=None) -> dict:
@@ -490,94 +491,11 @@ async def _mock_world(models: list[str], on_preview=None, on_operation=None, on_
     return result
 
 
-class LeaseLost(Exception):
-    """The job runner no longer owns this job, so no further paid call may start."""
-
-
-async def _generate_models(
-    client: httpx.AsyncClient,
-    headers: dict,
-    display_name: str,
-    media_id: str,
-    models: list[str],
-    public: bool,
-    on_preview=None,
-    on_operation=None,
-    on_submitting=None,
-    on_tick=None,
-) -> dict:
-    final = None
-    draft_operation_id: str | None = None
-
-    async def _remember_operation(operation_id: str, remembered_phase: str) -> None:
-        nonlocal draft_operation_id
-        if remembered_phase == "draft":
-            draft_operation_id = operation_id
-        if on_operation is not None:
-            await on_operation(operation_id, remembered_phase)
-
-    for index, model in enumerate(models):
-        phase = "full" if index == len(models) - 1 else "draft"
-        timeout_s = DRAFT_WORLD_TIMEOUT_S if phase == "draft" else FULL_WORLD_TIMEOUT_S
-        try:
-            parsed = await _generate_model(
-                client,
-                headers,
-                display_name,
-                media_id,
-                model,
-                public,
-                timeout_s,
-                phase=phase,
-                on_operation=_remember_operation,
-                on_submitting=on_submitting,
-                on_tick=on_tick,
-            )
-        except LeaseLost:
-            # A lost lease at the draft step must never fall through to the full model.
-            raise
-        except ProviderFailure as exc:
-            if isinstance(exc, OperationInFlight) or exc.status_code == 429:
-                raise
-            if phase == "draft" and not _is_out_of_credits(exc):
-                logger.error("Draft world failed (%s); continuing with the full model", exc.detail)
-                await _abandon_draft_operation(client, headers, draft_operation_id)
-                continue
-            raise
-        except Exception:
-            if phase == "draft":
-                logger.exception("Draft world failed; continuing with the full model")
-                await _abandon_draft_operation(client, headers, draft_operation_id)
-                continue
-            raise
-        if phase == "draft":
-            if on_preview is not None:
-                try:
-                    await on_preview(parsed)
-                except LeaseLost:
-                    raise
-        else:
-            final = parsed
-    if final is None:
-        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs did not return a world")
-    return final
-
-
 def queue_unshared_world_deletes(world_ids: list[str | None], reason: str) -> int:
-    """Queue worlds for background deletion, skipping any still in use.
-
-    Call after the deleted project rows are gone: any project that still
-    references a world (another device's, or an ownerless demo/share project)
-    keeps it. World Labs deletion cannot be undone. No World Labs call is made
-    here; ``retry_pending_world_deletes`` does the deletes and checks again.
-    """
     ids = list(dict.fromkeys(valid_world_id(item) for item in world_ids if valid_world_id(item)))
     if not ids or not get_settings().worldlabs_api_key:
-        # Same as delete_worlds: no key means mock worlds, nothing to delete.
         return 0
     shared = world_ids_in_use(ids)
-    for world_id in sorted(shared):
-        logger.warning("Keeping World Labs world %s: another project still references it", world_id)
     queued = [item for item in ids if item not in shared]
     if queued:
         queue_world_deletes(queued, reason)
@@ -585,12 +503,6 @@ def queue_unshared_world_deletes(world_ids: list[str | None], reason: str) -> in
 
 
 async def delete_worlds(world_ids: list[str | None]) -> None:
-    """Ask Marble to delete worlds this API created.
-
-    A missing key or a mock world is skipped. A World Labs error does not block
-    deleting the local project; the world id is queued and retried. 404 means
-    the world is already gone.
-    """
     settings = get_settings()
     ids = list(dict.fromkeys(valid_world_id(item) for item in world_ids if valid_world_id(item)))
     if not ids or not settings.worldlabs_api_key:
@@ -602,20 +514,14 @@ async def delete_worlds(world_ids: list[str | None]) -> None:
             ok, error = await _delete_one(client, headers, world_id)
             if ok:
                 forget_world_delete(world_id)
-                continue
-            logger.error("Marble delete for %s failed: %s", world_id, error)
-            queue_world_deletes([world_id], error or "delete failed")
+            else:
+                queue_world_deletes([world_id], error or "delete failed")
 
 
-# A draft finishes in seconds. Stop polling an operation that never settles.
 _DRAFT_CLEANUP_ATTEMPTS = 24
 
 
 async def retry_pending_world_deletes(*, force: bool = False) -> int:
-    """Retry Marble deletes, and poll draft operations that were left behind.
-
-    The draft poll is a GET. It does not call worlds:generate.
-    """
     settings = get_settings()
     if not settings.worldlabs_api_key:
         return 0
@@ -629,251 +535,52 @@ async def retry_pending_world_deletes(*, force: bool = False) -> int:
     async with httpx.AsyncClient(timeout=timeout) as client:
         for world_id in ids:
             if world_ids_in_use([world_id]):
-                # A project points at this world again (or still); never delete it.
-                logger.warning("Not deleting World Labs world %s: a project still references it", world_id)
                 forget_world_delete(world_id)
                 continue
             ok, error = await _delete_one(client, headers, world_id)
             if ok:
                 forget_world_delete(world_id)
                 cleared += 1
+            else:
+                queue_world_deletes([world_id], error or "delete failed")
+        for operation_id, attempts in cleanups:
+            if attempts >= _DRAFT_CLEANUP_ATTEMPTS:
+                forget_draft_cleanup(operation_id)
                 continue
-            logger.error("Marble delete retry for %s failed: %s", world_id, error)
-            queue_world_deletes([world_id], error or "delete failed")
-        await _settle_draft_cleanups(client, headers, cleanups)
+            checked = valid_world_id(operation_id)
+            if checked is None:
+                forget_draft_cleanup(operation_id)
+                continue
+            try:
+                resp = await client.get(f"{settings.atlas_api_base_url.rstrip('/')}/operations/{checked}", headers=headers)
+            except Exception:
+                note_draft_cleanup_attempt(checked)
+                continue
+            if resp.status_code >= 400:
+                note_draft_cleanup_attempt(checked)
+                continue
+            body = resp.json() if resp.content else {}
+            if isinstance(body, dict) and body.get("done"):
+                asset_id, _url = extract_splat_asset(body.get("response"))
+                if asset_id:
+                    queue_world_deletes([asset_id], "orphaned draft")
+                forget_draft_cleanup(checked)
+            else:
+                note_draft_cleanup_attempt(checked)
     return cleared
 
 
 async def _delete_one(client: httpx.AsyncClient, headers: dict, world_id: str) -> tuple[bool, str | None]:
     if valid_world_id(world_id) is None:
         return False, "invalid world id"
-    url = f"{WORLDLABS_BASE}/marble/v1/worlds/{world_id}"
+    base = get_settings().atlas_api_base_url.rstrip("/")
+    url = f"{base}/assets/{world_id}"
     try:
         response = await client.delete(url, headers=headers)
     except Exception:
-        logger.exception("Could not delete Marble world %s", world_id)
+        logger.exception("Could not delete Atlas asset %s", world_id)
         return False, "request failed"
     if response.status_code in {200, 204, 404}:
-        logger.info("Deleted Marble world %s", world_id)
+        logger.info("Deleted Atlas asset %s", world_id)
         return True, None
     return False, f"HTTP {response.status_code}"
-
-
-async def _upload_panorama(client: httpx.AsyncClient, headers: dict, image_bytes: bytes) -> str:
-    prepared = await _send_retrying_rate_limit(
-        lambda: client.post(
-            f"{WORLDLABS_BASE}/marble/v1/media-assets:prepare_upload",
-            headers={**headers, "Content-Type": "application/json"},
-            json={"file_name": "panorama.jpg", "kind": "image", "extension": "jpg"},
-        )
-    )
-    _raise_for_status(prepared, "World Labs could not prepare the upload")
-    payload = prepared.json()
-    media_id = (payload.get("media_asset") or {}).get("media_asset_id")
-    upload = payload.get("upload_info") or {}
-    upload_url = valid_upload_url(upload.get("upload_url"))
-    method = str(upload.get("upload_method") or "PUT").upper()
-    if not media_id or upload_url is None or method not in {"PUT", "POST"}:
-        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs returned an upload URL that was not accepted")
-    put_headers = dict(upload.get("required_headers") or {})
-    uploaded = await _send_retrying_rate_limit(
-        lambda: client.request(method, upload_url, content=image_bytes, headers=put_headers)
-    )
-    _raise_for_status(uploaded, "World Labs upload failed")
-    return media_id
-
-
-async def _generate_model(
-    client: httpx.AsyncClient,
-    headers: dict,
-    display_name: str,
-    media_id: str,
-    model: str,
-    public: bool,
-    timeout_s: int,
-    phase: str = "full",
-    on_operation=None,
-    on_submitting=None,
-    on_tick=None,
-) -> dict:
-    body = build_world_request(display_name, media_id, model, public)
-    await _require_credits(model)
-    if on_submitting is not None:
-        await on_submitting(phase)
-    started = await _send_retrying_rate_limit(
-        lambda: client.post(
-            f"{WORLDLABS_BASE}/marble/v1/worlds:generate",
-            headers={**headers, "Content-Type": "application/json"},
-            json=body,
-        )
-    )
-    _raise_for_status(started, "World Labs rejected world generation")
-    operation = started.json()
-    operation_id = valid_world_id(operation.get("operation_id"))
-    if operation_id is None:
-        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs returned an operation id that was not accepted")
-    if on_operation is not None:
-        await on_operation(operation_id, phase)
-    clear_world_credits_cache()
-    operation = await _poll_until_done(
-        client, headers, operation_id, timeout_s, operation, on_tick=on_tick, phase=phase
-    )
-    _raise_operation_error(operation)
-    parsed = parse_world(operation)
-    parsed["model"] = model
-    return parsed
-
-
-async def _poll_until_done(
-    client: httpx.AsyncClient,
-    headers: dict,
-    operation_id: str,
-    timeout_s: int,
-    operation: dict | None = None,
-    on_tick=None,
-    phase: str = "full",
-) -> dict:
-    operation_id = valid_world_id(operation_id) or ""
-    if not operation_id:
-        raise ProviderFailure(WORLD_FAILED_MESSAGE, "World Labs returned an operation id that was not accepted")
-    operation = operation or {"operation_id": operation_id, "done": False}
-    deadline = time.monotonic() + timeout_s
-    while not operation.get("done"):
-        if on_tick is not None:
-            on_tick()
-        if time.monotonic() > deadline:
-            raise ProviderFailure(WORLD_FAILED_MESSAGE, f"HTTP timeout: operation {operation_id} exceeded {timeout_s}s")
-        polled = await _send_retrying_rate_limit(
-            lambda: client.get(f"{WORLDLABS_BASE}/marble/v1/operations/{operation_id}", headers=headers)
-        )
-        if polled.status_code == 429:
-            message = _response_message(polled) or "rate limited"
-            raise OperationInFlight(operation_id, phase, provider_detail(429, message))
-        _raise_for_status(polled, "World Labs status check failed")
-        operation = polled.json()
-        if not operation.get("done"):
-            await asyncio.sleep(5)
-    return operation
-
-
-async def _abandon_draft_operation(
-    client: httpx.AsyncClient, headers: dict, operation_id: str | None
-) -> None:
-    """One free GET. A finished world is queued for delete; a live one is remembered.
-
-    This never calls worlds:generate and never raises into the full-model attempt.
-    """
-    try:
-        checked = valid_world_id(operation_id)
-        if checked is None:
-            return
-        response = await client.get(f"{WORLDLABS_BASE}/marble/v1/operations/{checked}", headers=headers)
-        if response.status_code >= 400:
-            remember_draft_cleanup(checked)
-            return
-        body = response.json()
-        operation = body if isinstance(body, dict) else {}
-        world_id = parse_world(operation).get("world_id")
-        if world_id:
-            queue_world_deletes([world_id], "orphaned draft")
-            forget_draft_cleanup(checked)
-            return
-        if operation.get("done"):
-            forget_draft_cleanup(checked)
-            return
-        remember_draft_cleanup(checked)
-    except Exception:
-        logger.exception("Could not check orphaned draft operation %s", operation_id)
-        try:
-            if valid_world_id(operation_id):
-                remember_draft_cleanup(str(operation_id))
-        except Exception:
-            logger.exception("Could not queue orphaned draft operation %s", operation_id)
-
-
-async def _settle_draft_cleanups(
-    client: httpx.AsyncClient,
-    headers: dict,
-    rows: list[tuple[str, int]],
-) -> None:
-    for operation_id, attempts in rows:
-        if attempts >= _DRAFT_CLEANUP_ATTEMPTS:
-            logger.error("Giving up on orphaned draft operation %s", operation_id)
-            forget_draft_cleanup(operation_id)
-            continue
-        checked = valid_world_id(operation_id)
-        if checked is None:
-            forget_draft_cleanup(operation_id)
-            continue
-        try:
-            response = await client.get(
-                f"{WORLDLABS_BASE}/marble/v1/operations/{checked}", headers=headers
-            )
-        except Exception:
-            logger.exception("Could not poll orphaned draft operation %s", checked)
-            note_draft_cleanup_attempt(checked)
-            continue
-        if response.status_code >= 400:
-            note_draft_cleanup_attempt(checked)
-            continue
-        try:
-            body = response.json()
-        except Exception:
-            note_draft_cleanup_attempt(checked)
-            continue
-        operation = body if isinstance(body, dict) else {}
-        world_id = parse_world(operation).get("world_id")
-        if world_id:
-            queue_world_deletes([world_id], "orphaned draft")
-            forget_draft_cleanup(checked)
-            continue
-        if operation.get("done"):
-            forget_draft_cleanup(checked)
-            continue
-        note_draft_cleanup_attempt(checked)
-
-
-def _raise_for_status(response: httpx.Response, fallback: str) -> None:
-    if response.status_code < 400:
-        return
-    message = _response_message(response) or fallback
-    detail = provider_detail(response.status_code, message)
-    if response.status_code == 402 or world_client_message(response.status_code, message) == WORLD_CREDITS_MESSAGE:
-        note_out_of_credits()
-        detail = f"out of credits: {detail}"
-    logger.error("World Labs request failed: %s", detail)
-    raise ProviderFailure(world_client_message(response.status_code, message), detail, response.status_code)
-
-
-def _raise_operation_error(operation: dict) -> None:
-    err = operation.get("error")
-    if not err:
-        return
-    message = err.get("message") if isinstance(err, dict) else str(err)
-    code = err.get("code") if isinstance(err, dict) else None
-    status = code if isinstance(code, int) and code >= 400 else None
-    text = message or "World Labs generation failed"
-    client_message = world_client_message(status, text)
-    detail = provider_detail(status, text)
-    if client_message == WORLD_CREDITS_MESSAGE:
-        note_out_of_credits()
-        detail = f"out of credits: {detail}"
-    logger.error("World Labs operation failed: %s", detail)
-    raise ProviderFailure(client_message, detail, status)
-
-
-def _response_message(response: httpx.Response) -> str:
-    try:
-        body = response.json()
-    except Exception:
-        body = None
-    if isinstance(body, dict):
-        error = body.get("error")
-        if isinstance(error, dict) and error.get("message"):
-            return str(error["message"])
-        if isinstance(error, str):
-            return error
-        if body.get("message"):
-            return str(body["message"])
-    text = (response.text or "").strip()
-    return text[:400]

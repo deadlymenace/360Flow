@@ -52,12 +52,12 @@ def _show_staged(project: ProjectRecord, *, private: bool) -> bool:
 def _world_note(project: ProjectRecord, *, show_staged: bool) -> str:
     if project.status == "delayed":
         return "Your 3D tour is delayed, we'll finish it shortly. You can look around this panorama now."
-    if show_staged and project.active_job == "staged_world":
+    if show_staged and project.status != "failed" and project.active_job == "staged_world":
         return "A 3D walkthrough of the staged room is generating."
-    if project.world_preview_url and not project.world_marble_url:
+    if project.world_preview_url and not ((project.world_marble_url or (project.world_splat_url and project.world_provider != "worldlabs_mock"))):
         return "A fast 3D preview is ready. The full walkthrough is still generating."
-    if project.active_job == "world" or (
-        project.status == "generating_3d" and project.active_job != "staged_world"
+    if project.status != "failed" and (
+        project.active_job == "world" or (project.status == "generating_3d" and project.active_job != "staged_world")
     ):
         return "The 3D walkthrough is generating. You can look around this panorama now."
     return ""
@@ -91,24 +91,26 @@ def _world_page(project: ProjectRecord, asset_base: str, source: str, *, private
     # The Marble page is private to our API account and the CDN asset URLs are
     # unsigned capability links, so neither is ever put in this HTML.
     if staged_source:
-        ready = bool(valid_marble_url(project.staged_world_marble_url) or valid_marble_url(project.staged_world_preview_url))
-        preview = bool(ready and project.staged_world_preview_url and not project.staged_world_marble_url)
-        generating = project.active_job == "staged_world"
+        full_world = bool(project.staged_world_marble_url or (project.staged_world_splat_url and project.staged_world_provider != "worldlabs_mock"))
+        ready = bool(full_world or valid_marble_url(project.staged_world_preview_url))
+        preview = bool(ready and project.staged_world_preview_url and not full_world)
+        generating = project.status != "failed" and project.active_job == "staged_world"
     else:
-        ready = bool(valid_marble_url(project.world_marble_url) or valid_marble_url(project.world_preview_url))
-        preview = bool(ready and valid_marble_url(project.world_preview_url) and not project.world_marble_url)
-        generating = project.active_job == "world" or (
-            project.status == "generating_3d" and project.active_job != "staged_world"
+        full_world = bool(project.world_marble_url or (project.world_splat_url and project.world_provider != "worldlabs_mock"))
+        ready = bool(full_world or valid_marble_url(project.world_preview_url))
+        preview = bool(ready and valid_marble_url(project.world_preview_url) and not full_world)
+        generating = project.status != "failed" and (
+            project.active_job == "world" or (project.status == "generating_3d" and project.active_job != "staged_world")
         )
-    full_world = bool(project.staged_world_marble_url if staged_source else project.world_marble_url)
     if full_world:
         # Self-hosted Spark viewer; the splat streams from our private cache.
+        has_staged_world = bool(project.staged_world_marble_url or (project.staged_world_splat_url and project.staged_world_provider != "worldlabs_mock"))
         return HTMLResponse(
             render_splat_page(
                 title=project.name,
                 asset_base=asset_base,
                 staged_source=staged_source,
-                has_staged=show_staged and bool(project.staged_world_marble_url),
+                has_staged=show_staged and has_staged_world,
             )
         )
     waiting = ""
@@ -215,9 +217,10 @@ async def _world_splat(project: ProjectRecord, source: str, *, private: bool):
     if source not in {"original", "staged"}:
         raise HTTPException(status_code=400, detail="source must be original or staged")
     if source == "staged":
-        if not _show_staged(project, private=private) or not project.staged_world_marble_url:
+        staged_ready = bool(project.staged_world_marble_url or (project.staged_world_splat_url and project.staged_world_provider != "worldlabs_mock"))
+        if not _show_staged(project, private=private) or not staged_ready:
             raise HTTPException(status_code=404, detail="3D world not ready yet")
-    elif not project.world_marble_url:
+    elif not ((project.world_marble_url or (project.world_splat_url and project.world_provider != "worldlabs_mock"))):
         raise HTTPException(status_code=404, detail="3D world not ready yet")
     found = await world_asset_stream(project, source, "spz")
     if found is None:

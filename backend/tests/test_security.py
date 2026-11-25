@@ -12,7 +12,7 @@ from PIL import Image
 
 from services.stitcher import _hfov_from_exif
 from services.uploads import header_dimensions, normalize_upload
-from services.world_gen import build_world_request, world_display_name
+from services.world_gen import world_display_name
 from viewer import render_pano_page
 
 
@@ -167,12 +167,12 @@ def test_project_name_is_escaped_and_not_substituted(client):
 
 def test_worlds_are_private_and_named_with_the_project_id():
     from config import get_settings
+    from services.atlas_client import build_asset_create_request
 
     assert get_settings().worldlabs_public is False
     name = world_display_name("project-123", staged=True)
-    body = build_world_request(name, "asset-1", "marble-1.1", public=False)
-    assert body["display_name"] == "project-123-staged"
-    assert body["permission"]["public"] is False
+    body = build_asset_create_request(name, b"jpeg-bytes")
+    assert body["asset"]["displayName"] == "project-123-staged"
 
 
 def test_declared_content_length_is_rejected(client):
