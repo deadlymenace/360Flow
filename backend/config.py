@@ -100,6 +100,11 @@ class Settings:
     gemini_api_key: str | None
     gemini_model: str
     gemini_image_size: str
+    atlas_api_base_url: str
+    atlas_draft_mode: bool
+    atlas_synthesize_baseline: bool
+    atlas_slice_count: int
+    atlas_slice_hfov_deg: float
     worldlabs_api_key: str | None
     worldlabs_model: str
     worldlabs_draft_model: str | None
@@ -141,7 +146,7 @@ class Settings:
 
     @property
     def world_mode(self) -> str:
-        return "worldlabs" if self.worldlabs_api_key else "mock"
+        return "atlas" if self.worldlabs_api_key else "mock"
 
     @property
     def auth_mode(self) -> str:
@@ -166,10 +171,9 @@ def get_settings() -> Settings:
     image_size = (_blank("GEMINI_IMAGE_SIZE") or "1K").upper()
     if image_size not in {"1K", "2K", "4K"}:
         image_size = "1K"
+    atlas_draft_mode = _bool("ATLAS_DRAFT_MODE", True)
     draft = os.environ.get("WORLDLABS_DRAFT_MODEL")
-    if draft is None:
-        draft_model = "marble-1.0-draft"
-    elif draft.strip().lower() in {"", "off", "none", "false"}:
+    if draft is None or draft.strip().lower() in {"", "off", "none", "false"}:
         draft_model = None
     else:
         draft_model = draft.strip()
@@ -221,8 +225,13 @@ def get_settings() -> Settings:
         gemini_api_key=_blank("GEMINI_API_KEY"),
         gemini_model=_blank("GEMINI_MODEL") or "gemini-3.1-flash-image",
         gemini_image_size=image_size,
-        worldlabs_api_key=_blank("WORLDLABS_API_KEY"),
-        worldlabs_model=_blank("WORLDLABS_MODEL") or "marble-1.1",
+        atlas_api_base_url=_blank("ATLAS_API_BASE_URL") or "https://api.atlas.worldlabs.ai/api/v2",
+        atlas_draft_mode=atlas_draft_mode,
+        atlas_synthesize_baseline=_bool("ATLAS_SYNTHESIZE_BASELINE", False),
+        atlas_slice_count=min(12, max(8, _int("ATLAS_SLICE_COUNT", 10))),
+        atlas_slice_hfov_deg=min(120.0, max(60.0, _float("ATLAS_SLICE_HFOV_DEG", 90.0))),
+        worldlabs_api_key=_blank("ATLAS_API_KEY") or _blank("WORLDLABS_API_KEY"),
+        worldlabs_model=_blank("WORLDLABS_MODEL") or ("atlas-draft" if atlas_draft_mode else "atlas-refined"),
         worldlabs_draft_model=draft_model,
         worldlabs_public=_bool("WORLDLABS_PUBLIC", False),
         worldlabs_low_credit_threshold=max(0, _int("WORLDLABS_LOW_CREDIT_THRESHOLD", 6000)),

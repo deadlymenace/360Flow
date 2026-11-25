@@ -10,6 +10,7 @@ They are deleted with the project, by "Delete all my data", and on re-upload.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import tempfile
 from pathlib import Path
@@ -45,20 +46,23 @@ def allowed_asset_url(url: object) -> str | None:
         return None
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or not host.endswith(_ALLOWED_HOST_SUFFIX):
+    allowed = host.endswith(_ALLOWED_HOST_SUFFIX) or host.endswith(".storage.googleapis.com") or host == "storage.googleapis.com"
+    if parsed.scheme != "https" or not allowed:
         return None
     if host.startswith("mock."):
         return None
     return url
 
 
-async def _download(url: str, limit: int, dest: Path) -> bool:
+async def _download(url: str, limit: int, dest: Path, *, api_key: str | None = None) -> bool:
     """Stream ``url`` to ``dest`` on disk with a size cap (never held in memory)."""
     settings = get_settings()
     headers = {}
-    if settings.worldlabs_api_key:
-        # Sent to World Labs hosts only (checked by allowed_asset_url).
-        headers["WLT-Api-Key"] = settings.worldlabs_api_key
+    parsed_host = (urlparse(url).hostname or "").lower()
+    effective_key = (api_key or "").strip() or (None if settings.byok_required else settings.worldlabs_api_key)
+    if effective_key and parsed_host.endswith(_ALLOWED_HOST_SUFFIX):
+        # Sent to World Labs hosts only (never to GCS signed URLs).
+        headers["WLT-Api-Key"] = effective_key
     timeout = httpx.Timeout(30.0, read=300.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
         async with client.stream("GET", url, headers=headers) as response:
@@ -96,13 +100,19 @@ def fill_lock(project_id: str) -> asyncio.Lock:
     return lock
 
 
-async def _store_download(project_id: str, key: str, kind: str, url: str) -> bool:
+async def _store_download(project_id: str, key: str, kind: str, url: str, *, api_key: str | None = None) -> bool:
     """Download to a temp file, then copy into storage in chunks."""
     content_type, limit = KINDS[kind]
     with tempfile.TemporaryDirectory(prefix="world-asset-") as tmp:
         path = Path(tmp) / f"asset.{kind}"
         try:
-            ok = await _download(url, limit, path)
+            sig = inspect.signature(_download)
+            if "api_key" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                ok = await _download(url, limit, path, api_key=api_key)
+            else:
+                ok = await _download(url, limit, path)
         except httpx.HTTPError as exc:
             logger.warning("World asset download for %s %s failed: %s", project_id, key, type(exc).__name__)
             return False

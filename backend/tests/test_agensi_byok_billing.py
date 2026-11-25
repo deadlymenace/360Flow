@@ -95,7 +95,7 @@ def test_byok_required_refuses_missing_keys_and_never_falls_back(client, monkeyp
         data={"metadata": meta},
     )
     assert refused.status_code == 400
-    assert "X-WorldLabs-Key" in refused.json()["detail"]
+    assert "X-Atlas-Key" in refused.json()["detail"]
 
     # Upload with auto_3d=false stitches without needing a World Labs key.
     stitched = client.raw.post(
@@ -124,7 +124,7 @@ def test_byok_required_refuses_missing_keys_and_never_falls_back(client, monkeyp
         headers=buyer_headers,
     )
     assert g3d_refused.status_code == 400
-    assert "X-WorldLabs-Key" in g3d_refused.json()["detail"]
+    assert "X-Atlas-Key" in g3d_refused.json()["detail"]
 
     # Supplying buyer keys passes them directly and clears ephemeral memory after running.
     captured: dict[str, object] = {}
@@ -218,33 +218,16 @@ def test_monthly_world_cap_and_byok_exempt_from_global_server_caps(client, monke
 
 def test_worldlabs_hard_credit_floor_blocks_low_balance(monkeypatch):
     clear_world_credits_cache()
-    monkeypatch.setenv("WORLDLABS_API_KEY", "server-wl-floor-key")
+    monkeypatch.setenv("ATLAS_API_KEY", "server-atlas-floor-key")
     monkeypatch.setenv("WORLDLABS_HARD_CREDIT_FLOOR", "5000")
 
-    class FakeResp:
-        status_code = 200
-        text = '{"remaining_credits": 5500}'
+    async def fake_balance(api_key=None):
+        return 5200.0
 
-        def json(self):
-            return {"remaining_credits": 5500}
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def get(self, *args, **kwargs):
-            return FakeResp()
-
-    monkeypatch.setattr("services.world_gen.httpx.AsyncClient", FakeClient)
-    # 5500 remaining - 1500 needed = 4000 < 5000 floor -> must block server key
+    monkeypatch.setattr("services.world_gen.world_credits_balance", fake_balance)
+    # 5200 remaining - 520 needed = 4680 < 5000 floor -> must block server key
     with pytest.raises(ProviderFailure, match="credits"):
-        asyncio.run(_require_credits("marble-1.1"))
+        asyncio.run(_require_credits("atlas-draft"))
     clear_world_credits_cache()
 
 

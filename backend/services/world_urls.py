@@ -1,4 +1,4 @@
-"""Accept only Marble HTTPS URLs and World Labs world ids.
+"""Accept only World Labs Atlas/storage HTTPS URLs and operation/asset ids.
 
 Stored URLs are rendered into share pages. A value that is not a worldlabs.ai
 HTTPS URL is dropped instead of being framed.

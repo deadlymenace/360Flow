@@ -402,10 +402,10 @@ def test_delete_notifies_world_labs_for_every_stored_world(client, monkeypatch):
     assert asyncio.run(retry_pending_world_deletes(force=True)) == 4
     assert sorted(deleted_urls) == sorted(
         [
-            "https://api.worldlabs.ai/marble/v1/worlds/world-full",
-            "https://api.worldlabs.ai/marble/v1/worlds/world-draft",
-            "https://api.worldlabs.ai/marble/v1/worlds/world-staged",
-            "https://api.worldlabs.ai/marble/v1/worlds/world-staged-draft",
+            "https://api.atlas.worldlabs.ai/api/v2/assets/world-full",
+            "https://api.atlas.worldlabs.ai/api/v2/assets/world-draft",
+            "https://api.atlas.worldlabs.ai/api/v2/assets/world-staged",
+            "https://api.atlas.worldlabs.ai/api/v2/assets/world-staged-draft",
         ]
     )
 

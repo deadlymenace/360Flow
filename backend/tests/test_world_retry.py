@@ -1,4 +1,4 @@
-"""World Labs 429 backoff, and deleting both worlds when a tour is regenerated."""
+"""Atlas 429 backoff, operation polling resume, and asset cleanup on regeneration."""
 
 from __future__ import annotations
 
@@ -9,11 +9,9 @@ from email.utils import format_datetime
 
 import pytest
 
+from services.atlas_client import AtlasRateLimit, _post_with_retry
 from services.world_gen import (
-    WORLD_PROVIDER_QUOTA_MESSAGE,
     OperationInFlight,
-    ProviderFailure,
-    _generate_models,
     _retry_after_seconds,
     retry_wait_seconds,
 )
@@ -33,42 +31,18 @@ class _Response:
         return self._body
 
 
-def _done(operation_id: str, world_id: str) -> _Response:
-    return _Response(
-        200,
-        {
-            "operation_id": operation_id,
-            "done": True,
-            "response": {
-                "world_id": world_id,
-                "world_marble_url": f"https://marble.worldlabs.ai/world/{world_id}",
-            },
-        },
-    )
-
-
 def _rate_limit(retry_after: str = "2") -> _Response:
-    return _Response(429, {"error": {"message": "slow down"}}, headers={"Retry-After": retry_after})
+    return _Response(429, {"error": {"message": "slow down", "code": "RATE_LIMIT_EXCEEDED"}}, headers={"Retry-After": retry_after})
 
 
-class _ScriptedClient:
-    def __init__(self, posts: list[_Response], gets: list[_Response] | None = None):
+class _ScriptedPostClient:
+    def __init__(self, posts: list[_Response]):
         self._posts = list(posts)
-        self._gets = list(gets or [])
-        self.posts: list[str] = []
-        self.gets: list[str] = []
+        self.calls: int = 0
 
     async def post(self, url, headers=None, json=None):
-        self.posts.append(json["model"])
-        if not self._posts:
-            raise AssertionError(f"unexpected worlds:generate for {json['model']}")
+        self.calls += 1
         return self._posts.pop(0)
-
-    async def get(self, url, headers=None):
-        self.gets.append(url)
-        if not self._gets:
-            raise AssertionError(f"unexpected poll {url}")
-        return self._gets.pop(0)
 
 
 def test_retry_wait_backs_off_with_jitter_and_honours_retry_after(monkeypatch):
@@ -96,66 +70,45 @@ def test_retry_after_parses_seconds_and_http_dates():
     assert _retry_after_seconds(_Response(429, {}, headers={"Retry-After": "not-a-date"})) is None
 
 
-def test_generate_retries_429_with_retry_after_then_stops(monkeypatch):
-    monkeypatch.setenv("WORLDLABS_RETRY_ATTEMPTS", "3")
-    monkeypatch.setenv("WORLDLABS_RETRY_BASE_SECONDS", "1")
-    monkeypatch.setenv("WORLDLABS_RETRY_MAX_SECONDS", "30")
-    monkeypatch.setattr(world_gen.random, "uniform", lambda _low, _high: 0)
+def test_atlas_post_retries_429_with_retry_after_then_succeeds(monkeypatch):
     sleeps: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
-    monkeypatch.setattr(world_gen.asyncio, "sleep", fake_sleep)
-    client = _ScriptedClient([_rate_limit("2"), _rate_limit("2"), _done("op-full", "world-full")])
-    result = asyncio.run(
-        _generate_models(client, {}, "room", "media-1", ["marble-1.1"], False)
-    )
-    assert result["world_id"] == "world-full"
-    assert client.posts == ["marble-1.1", "marble-1.1", "marble-1.1"]
-    assert client.gets == []
-    assert sleeps == [2.0, 2.0]
-
-
-def test_exhausted_429_does_not_keep_calling(monkeypatch):
-    monkeypatch.setenv("WORLDLABS_RETRY_ATTEMPTS", "3")
-    monkeypatch.setattr(world_gen.random, "uniform", lambda _low, _high: 0)
-    monkeypatch.setattr(world_gen.asyncio, "sleep", lambda _seconds: _async_none())
-    client = _ScriptedClient([_rate_limit(), _rate_limit(), _rate_limit(), _done("op-extra", "world-extra")])
-    with pytest.raises(ProviderFailure) as caught:
-        asyncio.run(_generate_models(client, {}, "room", "media-1", ["marble-1.0-draft", "marble-1.1"], False))
-    assert len(client.posts) == 3
-    assert client.posts == ["marble-1.0-draft", "marble-1.0-draft", "marble-1.0-draft"]
-    assert caught.value.status_code == 429
-    assert caught.value.client_message == WORLD_PROVIDER_QUOTA_MESSAGE
-    assert not isinstance(caught.value, OperationInFlight)
-
-
-def test_charged_draft_is_polled_instead_of_generated_again(monkeypatch):
-    monkeypatch.setenv("WORLDLABS_RETRY_ATTEMPTS", "3")
-    monkeypatch.setenv("WORLDLABS_RETRY_MAX_SECONDS", "30")
-    monkeypatch.setattr(world_gen.random, "uniform", lambda _low, _high: 0)
-    sleeps: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        sleeps.append(seconds)
-
-    monkeypatch.setattr(world_gen.asyncio, "sleep", fake_sleep)
-    accepted = _Response(200, {"operation_id": "op-draft", "done": False})
-    client = _ScriptedClient(
-        [accepted, _done("op-should-not-run", "world-full")],
-        [_rate_limit("2"), _rate_limit("2"), _rate_limit("2")],
-    )
-    with pytest.raises(OperationInFlight) as caught:
-        asyncio.run(
-            _generate_models(client, {}, "room", "media-1", ["marble-1.0-draft", "marble-1.1"], False)
+    monkeypatch.setattr("services.atlas_client.asyncio.sleep", fake_sleep)
+    client = _ScriptedPostClient([_rate_limit("2"), _rate_limit("2"), _Response(201, {"id": "op_ok"})])
+    out = asyncio.run(
+        _post_with_retry(
+            client,
+            "https://api.atlas.worldlabs.ai/api/v2/tasks:posedImages2Splats",
+            {"WLT-Api-Key": "k"},
+            {},
+            context="splats",
+            retry_attempts=3,
         )
-    assert client.posts == ["marble-1.0-draft"]
-    assert len(client.gets) == 3
-    assert all(url.endswith("/operations/op-draft") for url in client.gets)
+    )
+    assert out["id"] == "op_ok"
+    assert client.calls == 3
     assert sleeps == [2.0, 2.0]
-    assert caught.value.operation_id == "op-draft"
-    assert caught.value.phase == "draft"
+
+
+def test_atlas_post_exhausts_429_and_raises_rate_limit(monkeypatch):
+    monkeypatch.setattr("services.atlas_client.asyncio.sleep", lambda _s: _async_none())
+    client = _ScriptedPostClient([_rate_limit("0"), _rate_limit("0"), _rate_limit("0")])
+    with pytest.raises(AtlasRateLimit) as caught:
+        asyncio.run(
+            _post_with_retry(
+                client,
+                "https://api.atlas.worldlabs.ai/api/v2/tasks:posedImages2Splats",
+                {"WLT-Api-Key": "k"},
+                {},
+                context="splats",
+                retry_attempts=3,
+            )
+        )
+    assert caught.value.status_code == 429
+    assert client.calls == 3
 
 
 def test_rate_limit_after_a_charged_draft_resumes_by_polling(client, monkeypatch):
@@ -183,8 +136,9 @@ def test_rate_limit_after_a_charged_draft_resumes_by_polling(client, monkeypatch
         assert operation_id == "op-draft"
         return {
             "world_id": "world-draft",
-            "marble_url": "https://marble.worldlabs.ai/world/world-draft",
-            "provider": "worldlabs",
+            "marble_url": None,
+            "splat_url": "https://api.atlas.worldlabs.ai/assets/draft.spz",
+            "provider": "atlas",
             "operation_id": operation_id,
         }
 
@@ -195,8 +149,9 @@ def test_rate_limit_after_a_charged_draft_resumes_by_polling(client, monkeypatch
             await on_operation("op-full", "full")
         return {
             "world_id": "world-full",
-            "marble_url": "https://marble.worldlabs.ai/world/world-full",
-            "provider": "worldlabs",
+            "marble_url": None,
+            "splat_url": "https://api.atlas.worldlabs.ai/assets/full.spz",
+            "provider": "atlas",
             "operation_id": "op-full",
         }
 
@@ -219,18 +174,13 @@ def test_rate_limit_after_a_charged_draft_resumes_by_polling(client, monkeypatch
     assert calls == {"generate": 1, "poll": 1, "full": 1}
     assert finished["status"] == "complete"
     assert finished["world_ready"] is True
-    from db import get_project
-
-    record = get_project(project_id)
-    assert record.world_marble_url.endswith("/world-full")
-    assert record.world_preview_url.endswith("/world-draft")
     assert get_job(job.id) is None
 
 
 def test_regenerate_deletes_the_old_full_and_draft_worlds(client, monkeypatch, caplog):
     from db import pending_world_delete_ids, update_project
 
-    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setenv("ATLAS_API_KEY", "atlas-test")
     deleted: list[str] = []
 
     class _DeleteResponse:
@@ -251,15 +201,15 @@ def test_regenerate_deletes_the_old_full_and_draft_worlds(client, monkeypatch, c
 
         async def delete(self, url, headers=None):
             deleted.append(url)
-            assert headers["WLT-Api-Key"] == "wl-test"
+            assert headers["WLT-Api-Key"] == "atlas-test"
             return _DeleteResponse()
 
     async def generate(*args, **kwargs):
         return {
-            "provider": "worldlabs",
+            "provider": "atlas",
             "world_id": "world-new",
-            "marble_url": "https://marble.worldlabs.ai/world/world-new",
-            "splat_url": None,
+            "marble_url": None,
+            "splat_url": "https://api.atlas.worldlabs.ai/assets/world-new.spz",
             "mesh_url": None,
             "thumbnail_url": None,
             "operation_id": "op-new",
@@ -279,27 +229,21 @@ def test_regenerate_deletes_the_old_full_and_draft_worlds(client, monkeypatch, c
         active_job=None,
         world_id="world-old",
         world_preview_id="draft-old",
-        world_marble_url="https://marble.worldlabs.ai/world/world-old",
-        world_preview_url="https://marble.worldlabs.ai/world/draft-old",
     )
 
     with caplog.at_level(logging.INFO, logger="services.world_gen"):
         regenerated = client.post(f"/api/v1/projects/{project_id}/generate-3d")
         assert regenerated.status_code == 200, regenerated.text
-        # Queued during the request; the background retry pass deletes them.
         assert deleted == []
         assert {"world-old", "draft-old"} <= set(pending_world_delete_ids(force=True))
         asyncio.run(world_gen.retry_pending_world_deletes(force=True))
     assert {url.rsplit("/", 1)[-1] for url in deleted} == {"world-old", "draft-old"}
-    assert "Deleted Marble world world-old" in caplog.text
-    assert "Deleted Marble world draft-old" in caplog.text
+    assert "Deleted Atlas asset world-old" in caplog.text
+    assert "Deleted Atlas asset draft-old" in caplog.text
     assert "world-old" not in pending_world_delete_ids(force=True)
     assert "draft-old" not in pending_world_delete_ids(force=True)
     body = client.get(f"/api/v1/projects/{project_id}").json()
-    from db import get_project
-
     assert body["world_ready"] is True
-    assert get_project(project_id).world_marble_url.endswith("/world-new")
 
 
 async def _async_none() -> None:

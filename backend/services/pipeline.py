@@ -756,7 +756,7 @@ async def _run_world(
             on_tick=on_tick,
             **_byok_kwargs(generate_world, world_key, get_settings().byok_required),
         )
-        await _store_world(project_id, result, staged_source, created_ids)
+        await _store_world(project_id, result, staged_source, created_ids, api_key=world_key)
     except LeaseLost:
         raise
     except RateLimitExceeded as exc:
@@ -845,7 +845,7 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
                 on_tick=on_tick,
                 **_byok_kwargs(continue_full_world, world_key, require_byok),
             )
-        await _store_world(project_id, parsed, staged_source, created_ids)
+        await _store_world(project_id, parsed, staged_source, created_ids, api_key=world_key)
     except LeaseLost:
         raise
     except RateLimitExceeded as exc:
@@ -900,8 +900,6 @@ def _world_inputs(project: ProjectRecord, staged_source: bool) -> tuple[bytes, s
 def _accepted_world(result: dict) -> tuple[str | None, str | None]:
     world_id = valid_world_id(result.get("world_id"))
     marble = valid_marble_url(result.get("marble_url"))
-    if marble is None and world_id:
-        marble = f"https://marble.worldlabs.ai/world/{world_id}"
     return world_id, marble
 
 
@@ -928,7 +926,7 @@ def _store_preview(project_id: str, result: dict, staged_source: bool, created_i
         )
 
 
-async def _store_world(project_id: str, result: dict, staged_source: bool, created_ids: list[str]) -> None:
+async def _store_world(project_id: str, result: dict, staged_source: bool, created_ids: list[str], *, api_key: str | None = None) -> None:
     final_id, marble = _accepted_world(result)
     if final_id:
         created_ids.append(final_id)
@@ -977,7 +975,13 @@ async def _store_world(project_id: str, result: dict, staged_source: bool, creat
         return
     logger.info("Project %s %s world ready via %s", project_id, source, result.get("provider"))
     # Pull the splat and mesh into private storage now, so viewers never touch the CDN.
-    await cache_world_assets(project_id, source, result.get("splat_url"), result.get("mesh_url"))
+    cache_kw = {}
+    try:
+        if "api_key" in inspect.signature(cache_world_assets).parameters:
+            cache_kw["api_key"] = api_key
+    except (TypeError, ValueError):
+        pass
+    await cache_world_assets(project_id, source, result.get("splat_url"), result.get("mesh_url"), **cache_kw)
 
 
 def _hold_charged_operation(project_id: str, job_id: str | None, staged_source: bool) -> str | None:

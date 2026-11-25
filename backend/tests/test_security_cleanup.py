@@ -1,4 +1,4 @@
-"""Low-severity cleanup: NUL URLs, share limits, JSON headers, drafts, and credit caps."""
+"""Low-severity cleanup: NUL URLs, share limits, JSON headers, Atlas validation, and credit caps."""
 
 from __future__ import annotations
 
@@ -6,58 +6,9 @@ import asyncio
 
 import pytest
 
-from services.world_gen import (
-    ProviderFailure,
-    WORLDLABS_BASE,
-    _generate_models,
-    _poll_until_done,
-    _upload_panorama,
-)
-
-
-class _Response:
-    def __init__(self, status_code: int, body: dict):
-        self.status_code = status_code
-        self._body = body
-        self.text = str(body)
-        self.headers: dict = {}
-
-    def json(self):
-        return self._body
-
-
-def _world(operation_id: str, world_id: str, *, done: bool = True) -> _Response:
-    return _Response(
-        200,
-        {
-            "operation_id": operation_id,
-            "done": done,
-            "response": {
-                "world_id": world_id,
-                "world_marble_url": f"https://marble.worldlabs.ai/world/{world_id}",
-            },
-        },
-    )
-
-
-class _ScriptedClient:
-    def __init__(self, posts: list[_Response], gets: list[_Response] | None = None):
-        self._posts = list(posts)
-        self._gets = list(gets or [])
-        self.posts: list[str] = []
-        self.gets: list[str] = []
-
-    async def post(self, url, headers=None, json=None):
-        self.posts.append(json["model"])
-        if not self._posts:
-            raise AssertionError(f"unexpected worlds:generate for {json['model']}")
-        return self._posts.pop(0)
-
-    async def get(self, url, headers=None):
-        self.gets.append(url)
-        if not self._gets:
-            raise AssertionError(f"unexpected poll {url}")
-        return self._gets.pop(0)
+from services.atlas_client import AtlasError, valid_atlas_base_url
+from services.world_gen import WORLDLABS_BASE
+from services.world_urls import valid_upload_url, valid_world_id
 
 
 def _json_headers(response) -> None:
@@ -145,100 +96,19 @@ def test_json_responses_send_security_headers_and_share_pages_do_not_deny_frames
     assert "img-src 'self'" in share.headers["content-security-policy"]
 
 
-def test_orphaned_draft_world_is_queued_for_delete():
-    from db import pending_draft_cleanup_ids, pending_world_delete_ids
-
-    accepted = _Response(200, {"operation_id": "op-draft", "done": False})
-    client = _ScriptedClient(
-        [accepted, _world("op-full", "world-full")],
-        [_Response(500, {"error": {"message": "draft poll failed"}}), _world("op-draft", "world-draft")],
-    )
-    result = asyncio.run(
-        _generate_models(client, {}, "room", "media-1", ["marble-1.0-draft", "marble-1.1"], False)
-    )
-    assert result["world_id"] == "world-full"
-    assert client.posts == ["marble-1.0-draft", "marble-1.1"]
-    assert "world-draft" in pending_world_delete_ids(force=True)
-    assert "op-draft" not in pending_draft_cleanup_ids()
-    _clear_pending()
+def test_atlas_urls_and_world_ids_must_be_safe():
+    assert WORLDLABS_BASE == "https://api.atlas.worldlabs.ai/api/v2"
+    assert valid_atlas_base_url("https://api.atlas.worldlabs.ai/api/v2/") == "https://api.atlas.worldlabs.ai/api/v2"
+    with pytest.raises(ValueError):
+        valid_atlas_base_url("http://evil.example/api/v2")
+    assert valid_upload_url("http://evil.example/pano.jpg") is None
+    assert valid_upload_url("https://evil.example/pano.jpg") is None
+    assert valid_upload_url("https://storage.googleapis.com/bucket/pano.jpg") is not None
+    assert valid_world_id("../evil") is None
+    assert valid_world_id("op_01jexample") == "op_01jexample"
 
 
-def test_unfinished_orphaned_draft_is_remembered_for_a_later_poll():
-    from db import pending_draft_cleanup_ids
-
-    accepted = _Response(200, {"operation_id": "op-live", "done": False})
-    still_running = _Response(200, {"operation_id": "op-live", "done": False})
-    client = _ScriptedClient(
-        [accepted, _world("op-full", "world-full")],
-        [_Response(500, {"error": {"message": "draft poll failed"}}), still_running],
-    )
-    result = asyncio.run(
-        _generate_models(client, {}, "room", "media-1", ["marble-1.0-draft", "marble-1.1"], False)
-    )
-    assert result["world_id"] == "world-full"
-    assert "op-live" in pending_draft_cleanup_ids()
-    assert any(url.endswith("/operations/op-live") for url in client.gets)
-    _clear_pending()
-
-
-def test_upload_url_must_be_https_on_an_allowed_host():
-    class _UploadClient:
-        def __init__(self, upload_info: dict):
-            self.upload_info = upload_info
-            self.requested: list[tuple[str, str]] = []
-
-        async def post(self, url, headers=None, json=None):
-            return _Response(
-                200,
-                {"media_asset": {"media_asset_id": "media-1"}, "upload_info": self.upload_info},
-            )
-
-        async def request(self, method, url, content=None, headers=None):
-            self.requested.append((method, url))
-            return _Response(200, {})
-
-    refused = _UploadClient({"upload_url": "http://evil.example/pano.jpg", "upload_method": "PUT"})
-    with pytest.raises(ProviderFailure):
-        asyncio.run(_upload_panorama(refused, {}, b"jpeg"))
-    assert refused.requested == []
-
-    foreign = _UploadClient({"upload_url": "https://evil.example/pano.jpg", "upload_method": "PUT"})
-    with pytest.raises(ProviderFailure):
-        asyncio.run(_upload_panorama(foreign, {}, b"jpeg"))
-    assert foreign.requested == []
-
-    wrong_method = _UploadClient(
-        {"upload_url": "https://storage.googleapis.com/bucket/pano.jpg", "upload_method": "GET"}
-    )
-    with pytest.raises(ProviderFailure):
-        asyncio.run(_upload_panorama(wrong_method, {}, b"jpeg"))
-    assert wrong_method.requested == []
-
-    allowed = _UploadClient(
-        {"upload_url": "https://storage.googleapis.com/bucket/pano.jpg", "upload_method": "PUT"}
-    )
-    media_id = asyncio.run(_upload_panorama(allowed, {}, b"jpeg"))
-    assert media_id == "media-1"
-    assert allowed.requested == [("PUT", "https://storage.googleapis.com/bucket/pano.jpg")]
-
-
-def test_operation_id_is_checked_before_the_poll_url():
-    class _PollClient:
-        def __init__(self):
-            self.gets: list[str] = []
-
-        async def get(self, url, headers=None):
-            self.gets.append(url)
-            return _world("nope", "world-1")
-
-    client = _PollClient()
-    with pytest.raises(ProviderFailure):
-        asyncio.run(_poll_until_done(client, {}, "../evil", 5))
-    assert client.gets == []
-    assert WORLDLABS_BASE
-
-
-def test_global_daily_credit_cap_reserves_draft_and_full(monkeypatch):
+def test_global_daily_credit_cap_reserves_atlas_draft_credits(monkeypatch):
     from sqlalchemy import delete
 
     from config import get_settings
@@ -247,20 +117,20 @@ def test_global_daily_credit_cap_reserves_draft_and_full(monkeypatch):
 
     monkeypatch.delenv("GLOBAL_DAILY_CREDITS_CAP", raising=False)
     assert get_settings().global_daily_credits_cap == 30000
-    assert reserved_world_credits() == 1650
+    assert reserved_world_credits() == 520
 
     with session_scope() as session:
         session.execute(delete(DailyUsageRow).where(DailyUsageRow.device_id == GLOBAL_QUOTA_DEVICE))
-    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setenv("ATLAS_API_KEY", "atlas-test")
     monkeypatch.setenv("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", "10")
     monkeypatch.setenv("GLOBAL_DAILY_WORLDS_CAP", "100")
-    monkeypatch.setenv("GLOBAL_DAILY_CREDITS_CAP", "1650")
+    monkeypatch.setenv("GLOBAL_DAILY_CREDITS_CAP", "520")
     assert consume_world_quota("credit-cap-a") is True
     assert consume_world_quota("credit-cap-b") is False
 
     with session_scope() as session:
         row = session.get(DailyUsageRow, (GLOBAL_QUOTA_DEVICE, _today(), "wl_credits"))
-        assert row is not None and row.count == 1650
+        assert row is not None and row.count == 520
         session.expire_all()
         release_world_quota(session, "credit-cap-a", _today())
         session.expire_all()
@@ -276,26 +146,12 @@ def test_zero_credit_cap_does_not_block(monkeypatch):
 
     with session_scope() as session:
         session.execute(delete(DailyUsageRow).where(DailyUsageRow.device_id == GLOBAL_QUOTA_DEVICE))
-    monkeypatch.setenv("WORLDLABS_API_KEY", "wl-test")
+    monkeypatch.setenv("ATLAS_API_KEY", "atlas-test")
     monkeypatch.setenv("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", "10")
     monkeypatch.setenv("GLOBAL_DAILY_WORLDS_CAP", "100")
     monkeypatch.setenv("GLOBAL_DAILY_CREDITS_CAP", "0")
     assert consume_world_quota("credit-off-a") is True
     assert consume_world_quota("credit-off-b") is True
-
-
-def _clear_pending() -> None:
-    from db import (
-        forget_draft_cleanup,
-        forget_world_delete,
-        pending_draft_cleanup_ids,
-        pending_world_delete_ids,
-    )
-
-    for operation_id in pending_draft_cleanup_ids():
-        forget_draft_cleanup(operation_id)
-    for world_id in pending_world_delete_ids(force=True):
-        forget_world_delete(world_id)
 
 
 def _today() -> str:

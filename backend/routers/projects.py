@@ -226,14 +226,15 @@ async def upload_images(
     metadata: str | None = Form(default=None),
     auto_3d: bool = Query(default=True),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_atlas_key: str | None = Header(default=None, alias="X-Atlas-Key"),
     x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
 ):
     caller = _caller(request)
     project = _require(project_id, request)
     settings = get_settings()
-    worldlabs_key = (x_worldlabs_key or "").strip() or None
+    worldlabs_key = (x_atlas_key or x_worldlabs_key or "").strip() or None
     if settings.byok_required and auto_3d and not worldlabs_key:
-        raise HTTPException(status_code=400, detail="World Labs API key is required (send X-WorldLabs-Key)")
+        raise HTTPException(status_code=400, detail="Atlas API key is required (send X-Atlas-Key)")
     _reject_declared_body(request)
     count = len(images)
     if count < settings.min_images or count > settings.max_images:
@@ -465,6 +466,7 @@ async def generate_3d(
     request: Request,
     source: str = Query(default="original"),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_atlas_key: str | None = Header(default=None, alias="X-Atlas-Key"),
     x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
 ):
     if source not in {"original", "staged"}:
@@ -472,9 +474,9 @@ async def generate_3d(
     caller = _caller(request)
     project = _require(project_id, request)
     settings = get_settings()
-    worldlabs_key = (x_worldlabs_key or "").strip() or None
+    worldlabs_key = (x_atlas_key or x_worldlabs_key or "").strip() or None
     if settings.byok_required and not worldlabs_key:
-        raise HTTPException(status_code=400, detail="World Labs API key is required (send X-WorldLabs-Key)")
+        raise HTTPException(status_code=400, detail="Atlas API key is required (send X-Atlas-Key)")
     scope = _idempotency_scope(caller, "POST", f"/api/v1/projects/{project_id}/generate-3d", idempotency_key)
     req_hash = hashlib.sha256(source.encode("utf-8")).hexdigest() if scope else ""
     cached = _check_idempotency(scope, req_hash)
@@ -513,18 +515,20 @@ async def get_generate_3d_status(project_id: str, request: Request):
     share = body.share_url or ""
     private = body.preview_url or share
     assets = None
-    if project.panorama_key and (project.world_provider or project.world_marble_url or project.world_preview_url):
+    orig_ready = bool(project.world_marble_url or (project.world_splat_url and project.world_provider != "worldlabs_mock"))
+    if project.panorama_key and (project.world_provider or orig_ready or project.world_preview_url):
         assets = {
             "viewer_url": f"{share}/world",
-            "ready": bool(project.world_marble_url),
-            "draft_ready": bool(project.world_preview_url) and not project.world_marble_url,
+            "ready": orig_ready,
+            "draft_ready": bool(project.world_preview_url) and not orig_ready,
         }
     staged_assets = None
-    if project.staged_key and (project.staged_world_provider or project.staged_world_marble_url):
+    staged_ready = bool(project.staged_world_marble_url or (project.staged_world_splat_url and project.staged_world_provider != "worldlabs_mock"))
+    if project.staged_key and (project.staged_world_provider or staged_ready):
         staged_assets = {
             "viewer_url": f"{private}/world?source=staged",
-            "ready": bool(project.staged_world_marble_url),
-            "draft_ready": bool(project.staged_world_preview_url) and not project.staged_world_marble_url,
+            "ready": staged_ready,
+            "draft_ready": bool(project.staged_world_preview_url) and not staged_ready,
         }
     return {
         "status": project.status,
@@ -557,7 +561,7 @@ async def _project_world_asset(project_id: str, request: Request, source: str, k
     if source not in {"original", "staged"}:
         raise HTTPException(status_code=400, detail="source must be original or staged")
     project = _require(project_id, request)
-    ready = project.staged_world_marble_url if source == "staged" else project.world_marble_url
+    ready = (project.staged_world_marble_url or (project.staged_world_splat_url if project.staged_world_provider != "worldlabs_mock" else None)) if source == "staged" else (project.world_marble_url or (project.world_splat_url if project.world_provider != "worldlabs_mock" else None))
     if not ready:
         raise HTTPException(status_code=404, detail="3D world not ready yet")
     found = await world_asset_stream(project, source, kind)

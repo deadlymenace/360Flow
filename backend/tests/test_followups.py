@@ -73,23 +73,37 @@ def test_renewal_checks_owner_and_expiry(client):
 
 
 def test_lost_lease_at_draft_does_not_continue_to_full(monkeypatch):
-    phases = []
+    import io
+    from PIL import Image
 
-    async def fake_generate_model(client, headers, name, media, model, public, timeout_s, *, phase, **kwargs):
-        phases.append(phase)
-        if phase == "draft":
-            raise LeaseLost()
-        return {"world_id": "w"}
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 32), (80, 90, 100)).save(buf, format="JPEG")
+    calls = []
 
-    monkeypatch.setattr(world_gen, "_generate_model", fake_generate_model)
+    async def fake_atlas(pano_bytes, *, api_key, on_submitting=None, **kwargs):
+        calls.append("submit")
+        if on_submitting:
+            on_submitting("atlas", "op-1")
+        raise LeaseLost()
 
-    async def run():
-        async with httpx.AsyncClient() as client:
-            await world_gen._generate_models(client, {}, "n", "m", ["draft-model", "full-model"], False)
+    monkeypatch.setattr(world_gen, "run_atlas_pipeline", fake_atlas)
+    monkeypatch.setenv("ALLOW_TEST_PROVIDERS", "true")
+    monkeypatch.setattr(world_gen, "get_settings", lambda: type("S", (), {
+        "atlas_api_base_url": "https://api.atlas.worldlabs.ai/api/v2",
+        "atlas_draft_mode": True,
+        "atlas_synthesize_baseline": False,
+        "atlas_slice_count": 8,
+        "atlas_slice_hfov_deg": 90.0,
+        "world_timeout_s": 30,
+        "public_worlds": False,
+        "atlas_api_key": "test-atlas-key",
+        "worldlabs_api_key": "",
+        "world_mode": staticmethod(lambda: "atlas"),
+    })())
 
     with pytest.raises(LeaseLost):
-        asyncio.run(run())
-    assert phases == ["draft"]
+        asyncio.run(world_gen.generate_world(buf.getvalue(), "n", api_key="test-atlas-key", on_submitting=lambda *a: calls.append("lease")))
+    assert calls == ["submit", "lease"]
 
 
 def test_gemini_text_only_retry_rechecks_the_lease(monkeypatch):

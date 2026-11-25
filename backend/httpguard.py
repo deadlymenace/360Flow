@@ -216,7 +216,7 @@ class GuardMiddleware:
                 [
                     (b"access-control-allow-origin", origin.encode()),
                     (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
-                    (b"access-control-allow-headers", b"Authorization, Content-Type, X-API-Key, X-Buyer-Key, X-WorldLabs-Key, X-Gemini-Key, Idempotency-Key"),
+                    (b"access-control-allow-headers", b"Authorization, Content-Type, X-API-Key, X-Buyer-Key, X-Atlas-Key, X-WorldLabs-Key, X-Gemini-Key, Idempotency-Key"),
                     (b"vary", b"Origin"),
                 ],
             )
