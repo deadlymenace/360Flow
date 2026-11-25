@@ -12,6 +12,7 @@ from db import fail_interrupted_jobs, init_db
 from db import try_resume_leadership
 from services.pipeline import resume_durable_jobs, retry_delayed_worlds
 from httpguard import GuardMiddleware
+from routers.admin_keys import router as admin_keys_router
 from routers.devices import router as devices_router
 from routers.projects import router as projects_router
 from routers.share import router as share_router
@@ -119,6 +120,7 @@ def create_app() -> FastAPI:
         )
         return JSONResponse(status_code=422, content={"detail": "Invalid request"})
 
+    app.include_router(admin_keys_router, prefix="/api/v1")
     app.include_router(devices_router, prefix="/api/v1")
     app.include_router(projects_router, prefix="/api/v1")
     app.include_router(share_router)

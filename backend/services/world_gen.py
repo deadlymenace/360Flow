@@ -230,14 +230,15 @@ def _is_out_of_credits(exc: ProviderFailure) -> bool:
     return exc.status_code == 402 or exc.client_message == WORLD_CREDITS_MESSAGE
 
 
-async def world_credits_balance() -> float | None:
+async def world_credits_balance(api_key: str | None = None) -> float | None:
     """Remaining World Labs credits.
 
-    The value is cached for ``CREDIT_CACHE_TTL_S``. None means the key is unset
-    or the credits call failed; callers then let generation try and rely on a
-    402 to stop.
+    The value is cached for ``CREDIT_CACHE_TTL_S`` for the server key. None
+    means the key is unset or the credits call failed.
     """
     global _credit_cache
+    if api_key:
+        return await _fetch_credits(api_key)
     settings = get_settings()
     if not settings.worldlabs_api_key:
         return None
@@ -278,15 +279,16 @@ async def _fetch_credits(api_key: str) -> float | None:
     return value
 
 
-async def _require_credits(model: str) -> None:
-    """Stop before worlds:generate when the cached balance cannot pay for this model."""
-    remaining = await world_credits_balance()
+async def _require_credits(model: str, api_key: str | None = None) -> None:
+    """Stop before worlds:generate when the balance cannot pay or would breach the hard credit floor."""
+    remaining = await (world_credits_balance(api_key) if api_key else world_credits_balance())
     if remaining is None:
         return
     needed = credits_required(model)
-    if remaining >= needed:
+    floor = 0 if api_key else get_settings().worldlabs_hard_credit_floor
+    if remaining >= needed and (remaining - needed) >= floor:
         return
-    detail = f"out of credits (remaining {remaining:g}, {model} needs {needed})"
+    detail = f"out of credits (remaining {remaining:g}, {model} needs {needed}, floor {floor})"
     logger.error("World Labs %s", detail)
     raise ProviderFailure(WORLD_CREDITS_MESSAGE, detail, 402)
 
@@ -375,6 +377,19 @@ def parse_world(operation: dict) -> dict:
     }
 
 
+def _resolve_world_key(api_key: str | None, require_byok: bool) -> str | None:
+    cleaned = (api_key or "").strip() or None
+    if require_byok:
+        if not cleaned:
+            raise ProviderFailure(
+                "World Labs API key is required for 3D generation.",
+                "BYOK World Labs key missing",
+                400,
+            )
+        return cleaned
+    return cleaned or get_settings().worldlabs_api_key
+
+
 async def generate_world(
     image_bytes: bytes,
     display_name: str,
@@ -383,16 +398,15 @@ async def generate_world(
     on_operation=None,
     on_submitting=None,
     on_tick=None,
+    *,
+    api_key: str | None = None,
+    require_byok: bool = False,
 ) -> dict:
-    """Generate a draft world first, then the full world from the same panorama.
-
-    ``on_submitting`` runs immediately before each worlds:generate call.
-    ``on_operation`` runs as soon as World Labs returns an operation id, before
-    the poll loop, so a restart can re-poll that id instead of generating again.
-    """
+    """Generate a draft world first, then the full world from the same panorama."""
     settings = get_settings()
     models = generation_models(settings.worldlabs_draft_model, settings.worldlabs_model)
-    if not settings.worldlabs_api_key:
+    effective_key = _resolve_world_key(api_key, require_byok)
+    if not effective_key:
         return await _mock_world(
             models,
             on_preview=on_preview,
@@ -401,9 +415,10 @@ async def generate_world(
             on_tick=on_tick,
         )
 
-    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+    headers = {"WLT-Api-Key": effective_key}
+    byok_key = effective_key if (api_key and api_key.strip()) else None
     timeout = httpx.Timeout(60.0, read=180.0)
-    await _require_credits(models[0])
+    await _require_credits(models[0], api_key=byok_key)
     async with httpx.AsyncClient(timeout=timeout) as client:
         media_id = await _upload_panorama(client, headers, image_bytes)
         if on_media is not None:
@@ -419,19 +434,27 @@ async def generate_world(
             on_operation=on_operation,
             on_submitting=on_submitting,
             on_tick=on_tick,
+            byok_key=byok_key,
         )
 
 
-async def poll_world_operation(operation_id: str, timeout_s: int, on_tick=None) -> dict:
+async def poll_world_operation(
+    operation_id: str,
+    timeout_s: int,
+    on_tick=None,
+    *,
+    api_key: str | None = None,
+    require_byok: bool = False,
+) -> dict:
     """Poll an operation World Labs already accepted. Does not call worlds:generate."""
-    settings = get_settings()
-    if not settings.worldlabs_api_key:
+    effective_key = _resolve_world_key(api_key, require_byok)
+    if not effective_key:
         if on_tick is not None:
             on_tick()
         result = await mock_generate_3d("memory")
         result["operation_id"] = operation_id
         return result
-    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+    headers = {"WLT-Api-Key": effective_key}
     timeout = httpx.Timeout(60.0, read=180.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         operation = await _poll_until_done(client, headers, operation_id, timeout_s, on_tick=on_tick)
@@ -446,15 +469,20 @@ async def continue_full_world(
     on_operation=None,
     on_submitting=None,
     on_tick=None,
+    *,
+    api_key: str | None = None,
+    require_byok: bool = False,
 ) -> dict:
     """Start the full model after a resumed draft. Does not regenerate the draft."""
     settings = get_settings()
     model = settings.worldlabs_model
-    if not settings.worldlabs_api_key:
+    effective_key = _resolve_world_key(api_key, require_byok)
+    if not effective_key:
         return await _mock_world([model], on_operation=on_operation, on_submitting=on_submitting, on_tick=on_tick)
-    headers = {"WLT-Api-Key": settings.worldlabs_api_key}
+    headers = {"WLT-Api-Key": effective_key}
+    byok_key = effective_key if (api_key and api_key.strip()) else None
     timeout = httpx.Timeout(60.0, read=180.0)
-    await _require_credits(model)
+    await _require_credits(model, api_key=byok_key)
     async with httpx.AsyncClient(timeout=timeout) as client:
         media_id = media_asset_id or await _upload_panorama(client, headers, image_bytes)
         return await _generate_model(
@@ -469,6 +497,7 @@ async def continue_full_world(
             on_operation=on_operation,
             on_submitting=on_submitting,
             on_tick=on_tick,
+            byok_key=byok_key,
         )
 
 
@@ -505,6 +534,7 @@ async def _generate_models(
     on_operation=None,
     on_submitting=None,
     on_tick=None,
+    byok_key: str | None = None,
 ) -> dict:
     final = None
     draft_operation_id: str | None = None
@@ -532,6 +562,7 @@ async def _generate_models(
                 on_operation=_remember_operation,
                 on_submitting=on_submitting,
                 on_tick=on_tick,
+                byok_key=byok_key,
             )
         except LeaseLost:
             # A lost lease at the draft step must never fall through to the full model.
@@ -695,9 +726,10 @@ async def _generate_model(
     on_operation=None,
     on_submitting=None,
     on_tick=None,
+    byok_key: str | None = None,
 ) -> dict:
     body = build_world_request(display_name, media_id, model, public)
-    await _require_credits(model)
+    await _require_credits(model, api_key=byok_key)
     if on_submitting is not None:
         await on_submitting(phase)
     started = await _send_retrying_rate_limit(

@@ -41,6 +41,23 @@ class DeviceRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class BuyerKeyRow(Base):
+    """Revocable, subscription-linked buyer API key mapped to an isolated device_id."""
+
+    __tablename__ = "buyer_keys"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    label: Mapped[str] = mapped_column(Text)
+    key_prefix: Mapped[str] = mapped_column(String(20))
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    device_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    active: Mapped[int] = mapped_column(Integer, default=1)
+    subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    monthly_world_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ProjectRow(Base):
     __tablename__ = "projects"
 
@@ -132,6 +149,25 @@ class DailyUsageRow(Base):
     day: Mapped[str] = mapped_column(String(10), primary_key=True)
     kind: Mapped[str] = mapped_column(String(16), primary_key=True)
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MonthlyUsageRow(Base):
+    __tablename__ = "monthly_usage"
+
+    device_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), primary_key=True)
+    count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class IdempotencyRecordRow(Base):
+    __tablename__ = "idempotency_records"
+
+    scope_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    status_code: Mapped[int] = mapped_column(Integer)
+    response_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class RateWindowRow(Base):
@@ -560,6 +596,110 @@ def device_id_for_token(token: str) -> str | None:
         return row.id if row else None
 
 
+def _buyer_key_dict(row: BuyerKeyRow) -> dict:
+    return {
+        "id": row.id,
+        "label": row.label,
+        "key_prefix": row.key_prefix,
+        "device_id": row.device_id,
+        "active": bool(row.active),
+        "subscription_expires_at": row.subscription_expires_at,
+        "monthly_world_limit": row.monthly_world_limit,
+        "created_at": row.created_at,
+        "revoked_at": row.revoked_at,
+    }
+
+
+def create_buyer_key(
+    label: str,
+    *,
+    subscription_expires_at: datetime | None = None,
+    monthly_world_limit: int | None = None,
+) -> tuple[dict, str]:
+    """Issue a revocable per-buyer key (`f360_...`). Returns (metadata, raw_key)."""
+    now = datetime.now(timezone.utc)
+    device_id = str(uuid4())
+    key_id = str(uuid4())
+    raw_key = f"f360_{secrets.token_urlsafe(32)}"
+    prefix = raw_key[:14]
+    device_row = DeviceRow(id=device_id, token_hash=hash_device_token(raw_key), created_at=now)
+    key_row = BuyerKeyRow(
+        id=key_id,
+        label=label.strip()[:120] or "buyer",
+        key_prefix=prefix,
+        key_hash=hash_device_token(raw_key),
+        device_id=device_id,
+        active=1,
+        subscription_expires_at=subscription_expires_at,
+        monthly_world_limit=monthly_world_limit,
+        created_at=now,
+    )
+    with session_scope() as session:
+        session.add(device_row)
+        session.add(key_row)
+        session.flush()
+        return _buyer_key_dict(key_row), raw_key
+
+
+def list_buyer_keys() -> list[dict]:
+    with session_scope() as session:
+        rows = session.scalars(select(BuyerKeyRow).order_by(BuyerKeyRow.created_at.desc())).all()
+        return [_buyer_key_dict(row) for row in rows]
+
+
+def revoke_buyer_key(key_id: str) -> dict | None:
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        row = session.get(BuyerKeyRow, key_id)
+        if row is None:
+            return None
+        row.active = 0
+        row.revoked_at = now
+        session.flush()
+        return _buyer_key_dict(row)
+
+
+_UNSET = object()
+
+
+def update_buyer_key(
+    key_id: str,
+    *,
+    active: bool | None = None,
+    subscription_expires_at: object = _UNSET,
+    monthly_world_limit: object = _UNSET,
+) -> dict | None:
+    with session_scope() as session:
+        row = session.get(BuyerKeyRow, key_id)
+        if row is None:
+            return None
+        if active is not None:
+            row.active = 1 if active else 0
+            if active:
+                row.revoked_at = None
+        if subscription_expires_at is not _UNSET:
+            row.subscription_expires_at = subscription_expires_at  # type: ignore[assignment]
+        if monthly_world_limit is not _UNSET:
+            row.monthly_world_limit = monthly_world_limit  # type: ignore[assignment]
+        session.flush()
+        return _buyer_key_dict(row)
+
+
+def authenticate_buyer_key(token: str) -> tuple[str, str | None, str | None, int | None]:
+    """Return (status, key_id, device_id, monthly_world_limit). Status: ok | inactive | missing."""
+    digest = hash_device_token(token)
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        row = session.scalar(select(BuyerKeyRow).where(BuyerKeyRow.key_hash == digest))
+        if row is None:
+            return "missing", None, None, None
+        if not row.active:
+            return "inactive", row.id, row.device_id, row.monthly_world_limit
+        if row.subscription_expires_at is not None and _aware(row.subscription_expires_at) <= now:
+            return "inactive", row.id, row.device_id, row.monthly_world_limit
+        return "ok", row.id, row.device_id, row.monthly_world_limit
+
+
 def share_deadline(now: datetime | None = None) -> datetime | None:
     """When the current share token stops working. None means it does not expire."""
     days = get_settings().share_link_ttl_days
@@ -617,6 +757,18 @@ def rotate_share_token(project_id: str) -> ProjectRecord | None:
         share_expires_at=deadline,
         preview_token=secrets.token_urlsafe(16),
         preview_expires_at=deadline,
+    )
+
+
+def revoke_share_token(project_id: str) -> ProjectRecord | None:
+    """Immediately invalidate both share and preview links by rotating and backdating expiry."""
+    expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    return update_project(
+        project_id,
+        share_token=secrets.token_urlsafe(16),
+        share_expires_at=expired_at,
+        preview_token=secrets.token_urlsafe(16),
+        preview_expires_at=expired_at,
     )
 
 
@@ -994,10 +1146,112 @@ _RELEASE_QUOTA = text(
 )
 
 
-def release_world_quota(session: Session, device_id: str | None, day: str) -> None:
-    """Give back one world charge, and the reserved credits, from ``day``."""
+_BUMP_MONTHLY_QUOTA = text(
+    """
+    INSERT INTO monthly_usage (device_id, month, kind, count)
+    SELECT :device_id, :month, :kind, :amount
+    WHERE :amount <= :limit
+    ON CONFLICT (device_id, month, kind)
+    DO UPDATE SET count = monthly_usage.count + :amount
+    WHERE monthly_usage.count + :amount <= :limit
+    RETURNING count
+    """
+)
+
+_RELEASE_MONTHLY_QUOTA = text(
+    """
+    UPDATE monthly_usage
+    SET count = CASE WHEN count > :amount THEN count - :amount ELSE 0 END
+    WHERE device_id = :device_id AND month = :month AND kind = :kind AND count > 0
+    RETURNING count
+    """
+)
+
+
+def _quota_month(when: datetime | None = None) -> str:
+    current = _aware(when) if when is not None else datetime.now(timezone.utc)
+    return current.astimezone(timezone.utc).strftime("%Y-%m")
+
+
+def _effective_monthly_world_limit(session: Session, device_id: str | None) -> int:
     settings = get_settings()
-    if not settings.worldlabs_api_key:
+    limit = settings.worldlabs_monthly_limit
+    if device_id:
+        row = session.scalar(select(BuyerKeyRow).where(BuyerKeyRow.device_id == device_id))
+        if row is not None and row.monthly_world_limit is not None:
+            return max(0, int(row.monthly_world_limit))
+    return max(0, int(limit))
+
+
+def bump_monthly_quota(
+    session: Session,
+    device_id: str,
+    kind: str,
+    limit: int,
+    amount: int = 1,
+    month: str | None = None,
+) -> bool:
+    if limit <= 0:
+        return True
+    amount = max(1, int(amount))
+    row = session.execute(
+        _BUMP_MONTHLY_QUOTA,
+        {
+            "device_id": device_id,
+            "month": month or _quota_month(),
+            "kind": kind,
+            "limit": limit,
+            "amount": amount,
+        },
+    ).first()
+    return row is not None
+
+
+def monthly_quota_available(device_id: str | None, kind: str, limit: int, needed: int = 1) -> bool:
+    if not device_id or limit <= 0:
+        return True
+    month = _quota_month()
+    with session_scope() as session:
+        row = session.get(MonthlyUsageRow, (device_id, month, kind))
+        used = 0 if row is None else row.count
+        return used + max(1, needed) <= limit
+
+
+def get_idempotency_record(scope_key: str) -> tuple[str, int, str] | None:
+    with session_scope() as session:
+        row = session.get(IdempotencyRecordRow, scope_key)
+        if row is None:
+            return None
+        return row.request_hash, row.status_code, row.response_json
+
+
+def save_idempotency_record(scope_key: str, request_hash: str, status_code: int, response_json: str) -> None:
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        existing = session.get(IdempotencyRecordRow, scope_key)
+        if existing is None:
+            session.add(
+                IdempotencyRecordRow(
+                    scope_key=scope_key,
+                    request_hash=request_hash,
+                    status_code=status_code,
+                    response_json=response_json,
+                    created_at=now,
+                )
+            )
+
+
+def release_world_quota(session: Session, device_id: str | None, day: str, *, byok: bool = False) -> None:
+    """Give back one world charge, and the reserved credits, from ``day`` and its month."""
+    settings = get_settings()
+    month = day[:7]
+    monthly_limit = _effective_monthly_world_limit(session, device_id)
+    if device_id and monthly_limit > 0 and (byok or settings.worldlabs_api_key):
+        session.execute(
+            _RELEASE_MONTHLY_QUOTA,
+            {"device_id": device_id, "month": month, "kind": "worldlabs", "amount": 1},
+        )
+    if byok or not settings.worldlabs_api_key:
         return
     if device_id and settings.worldlabs_daily_limit > 0:
         session.execute(
@@ -1020,12 +1274,28 @@ def release_world_quota(session: Session, device_id: str | None, day: str) -> No
                 "amount": reserved_world_credits(),
             },
         )
+    if settings.global_monthly_credits_cap > 0:
+        from services.quota import reserved_world_credits
+
+        session.execute(
+            _RELEASE_MONTHLY_QUOTA,
+            {
+                "device_id": GLOBAL_QUOTA_DEVICE,
+                "month": month,
+                "kind": "wl_credits",
+                "amount": reserved_world_credits(),
+            },
+        )
 
 
-def charge_world_quota(session: Session, device_id: str | None) -> bool:
-    """Device cap, the global world cap, and the global credit cap, in one transaction."""
+def charge_world_quota(session: Session, device_id: str | None, *, byok: bool = False) -> bool:
+    """Device daily/monthly caps, global world cap, and global credit caps, in one transaction."""
     settings = get_settings()
-    if not settings.worldlabs_api_key:
+    monthly_limit = _effective_monthly_world_limit(session, device_id)
+    if device_id and monthly_limit > 0 and (byok or settings.worldlabs_api_key):
+        if not bump_monthly_quota(session, device_id, "worldlabs", monthly_limit):
+            return False
+    if byok or not settings.worldlabs_api_key:
         return True
     if device_id and settings.worldlabs_daily_limit > 0:
         if not bump_quota(session, device_id, "worldlabs", settings.worldlabs_daily_limit):
@@ -1041,6 +1311,17 @@ def charge_world_quota(session: Session, device_id: str | None) -> bool:
             GLOBAL_QUOTA_DEVICE,
             "wl_credits",
             settings.global_daily_credits_cap,
+            amount=reserved_world_credits(),
+        ):
+            return False
+    if settings.global_monthly_credits_cap > 0:
+        from services.quota import reserved_world_credits
+
+        if not bump_monthly_quota(
+            session,
+            GLOBAL_QUOTA_DEVICE,
+            "wl_credits",
+            settings.global_monthly_credits_cap,
             amount=reserved_world_credits(),
         ):
             return False
@@ -1142,6 +1423,7 @@ def begin_job(
     replace_delayed: bool = False,
     retire_worlds: str | None = None,
     charge: bool = True,
+    byok: bool = False,
 ) -> tuple[str, JobRecord | None, list[str]]:
     """Mark the project busy and insert its job in one transaction.
 
@@ -1163,6 +1445,7 @@ def begin_job(
                 replace_delayed,
                 retire_worlds,
                 charge,
+                byok,
             )
     except _EnqueueStop as exc:
         return exc.outcome, None, []
@@ -1178,6 +1461,7 @@ def _begin_job(
     replace_delayed: bool,
     retire_worlds: str | None,
     charge: bool,
+    byok: bool = False,
 ) -> tuple[str, JobRecord, list[str]]:
     dialect = session.get_bind().dialect.name
     query = select(ProjectRow).where(ProjectRow.id == project_id)
@@ -1193,7 +1477,7 @@ def _begin_job(
         for job in open_jobs:
             session.delete(job)
         session.flush()
-    if charge and kind in {"world", "staged_world"} and not charge_world_quota(session, row.owner_device_id):
+    if charge and kind in {"world", "staged_world"} and not charge_world_quota(session, row.owner_device_id, byok=byok):
         raise _EnqueueStop("quota")
     if charge and kind == "stage" and not charge_staging_quota(session, row.owner_device_id):
         raise _EnqueueStop("quota")

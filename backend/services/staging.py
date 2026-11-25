@@ -126,15 +126,22 @@ async def stage_image(
     image_bytes: bytes,
     user_prompt: str,
     before_generate=None,
+    *,
+    api_key: str | None = None,
+    require_byok: bool = False,
 ) -> tuple[bytes, str, str | None]:
     """Return a clean staged JPEG, the provider id, and any structure notes.
 
     The disclosure banner is applied later, when the image is served.
     """
     settings = get_settings()
+    resolved_key = (api_key or "").strip() or None
+    if require_byok and not resolved_key:
+        raise StagingProviderError("Gemini API key is required for virtual staging.", "BYOK Gemini key missing")
+    effective_key = resolved_key if require_byok else (resolved_key or settings.gemini_api_key)
     equirect = fit_equirect(decode_image(image_bytes))
     views = split_views(equirect)
-    provider = "gemini" if settings.gemini_api_key else "gemini_mock"
+    provider = "gemini" if effective_key else "gemini_mock"
     if provider == "gemini_mock":
         await mock_stage("memory", user_prompt)
 
@@ -144,7 +151,7 @@ async def stage_image(
     for view in views:
         instructions = build_staging_prompt(perspective=True, yaw_deg=view.yaw_deg)
         image, note = await _edit_view(
-            view, instructions, style_part, settings, before_generate=before_generate
+            view, instructions, style_part, settings, before_generate=before_generate, api_key=effective_key
         )
         edited.append(PerspectiveView(view.yaw_deg, view.hfov_deg, image))
         if note:
@@ -160,16 +167,18 @@ async def _edit_view(
     style_part: str,
     settings,
     before_generate=None,
+    *,
+    api_key: str | None = None,
 ) -> tuple[np.ndarray, str | None]:
     original = view.image
 
     async def produce(text: str) -> np.ndarray:
         if before_generate is not None:
             before_generate()
-        if not settings.gemini_api_key:
+        if not api_key:
             return apply_mock_grade(original)
         raw = await _gemini_edit(
-            settings.gemini_api_key,
+            api_key,
             settings.gemini_model,
             text,
             style_part,

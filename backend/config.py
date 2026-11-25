@@ -79,10 +79,16 @@ class Settings:
     rate_limit_per_minute: int
     device_registrations_per_hour: int
     trusted_proxy_count: int
+    allow_open_device_registration: bool
+    byok_required: bool
+    shared_api_rate_limiting: bool
     gemini_daily_limit: int
     worldlabs_daily_limit: int
+    worldlabs_monthly_limit: int
     global_daily_worlds_cap: int
     global_daily_credits_cap: int
+    global_monthly_credits_cap: int
+    worldlabs_hard_credit_floor: int
     share_rate_per_minute: int
     share_asset_rate_per_minute: int
     world_delay_max_hours: int
@@ -194,10 +200,16 @@ def get_settings() -> Settings:
         rate_limit_per_minute=max(1, _int("RATE_LIMIT_PER_MINUTE", 120)),
         device_registrations_per_hour=max(1, _int("DEVICE_REGISTRATIONS_PER_HOUR", 30)),
         trusted_proxy_count=max(0, _int("TRUSTED_PROXY_COUNT", 1)),
+        allow_open_device_registration=_bool("ALLOW_OPEN_DEVICE_REGISTRATION", True),
+        byok_required=_bool("BYOK_REQUIRED", False),
+        shared_api_rate_limiting=_bool("SHARED_API_RATE_LIMITING", False),
         gemini_daily_limit=max(0, _int("GEMINI_JOBS_PER_DEVICE_PER_DAY", 20)),
         worldlabs_daily_limit=max(0, _int("WORLDLABS_JOBS_PER_DEVICE_PER_DAY", 10)),
+        worldlabs_monthly_limit=max(0, _int("WORLDLABS_JOBS_PER_DEVICE_PER_MONTH", 0)),
         global_daily_worlds_cap=max(0, _int("GLOBAL_DAILY_WORLDS_CAP", 100)),
         global_daily_credits_cap=max(0, _int("GLOBAL_DAILY_CREDITS_CAP", 30000)),
+        global_monthly_credits_cap=max(0, _int("GLOBAL_MONTHLY_CREDITS_CAP", 0)),
+        worldlabs_hard_credit_floor=max(0, _int("WORLDLABS_HARD_CREDIT_FLOOR", 0)),
         share_rate_per_minute=max(1, _int("SHARE_RATE_PER_MINUTE", 60)),
         share_asset_rate_per_minute=max(1, _int("SHARE_ASSET_RATE_PER_MINUTE", 300)),
         world_delay_max_hours=max(1, _int("WORLD_DELAY_MAX_HOURS", 24)),

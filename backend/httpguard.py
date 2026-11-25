@@ -9,7 +9,7 @@ from fastapi import HTTPException
 
 from auth import _admin_key_matches
 from config import get_settings
-from db import allow_shared_rate, device_id_for_token
+from db import allow_shared_rate, authenticate_buyer_key, device_id_for_token
 from ratelimit import limiter
 from viewer import IMPORTMAP_CSP_HASH
 
@@ -143,10 +143,17 @@ def _bucket(headers: dict[str, str], ip: str) -> str:
     """
     if _admin_key_matches(headers.get("x-api-key")):
         return "admin"
-    authorization = headers.get("authorization", "")
-    if authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
-        if token:
+    token = (headers.get("x-buyer-key") or "").strip()
+    if not token:
+        authorization = headers.get("authorization", "")
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+    if token:
+        if token.startswith("f360_"):
+            status, _kid, device_id, _limit = authenticate_buyer_key(token)
+            if status == "ok" and device_id:
+                return "device:" + device_id
+        else:
             device_id = device_id_for_token(token)
             if device_id:
                 return "device:" + device_id
@@ -209,7 +216,7 @@ class GuardMiddleware:
                 [
                     (b"access-control-allow-origin", origin.encode()),
                     (b"access-control-allow-methods", b"GET, POST, DELETE, OPTIONS"),
-                    (b"access-control-allow-headers", b"Authorization, Content-Type, X-API-Key"),
+                    (b"access-control-allow-headers", b"Authorization, Content-Type, X-API-Key, X-Buyer-Key, X-WorldLabs-Key, X-Gemini-Key, Idempotency-Key"),
                     (b"vary", b"Origin"),
                 ],
             )
@@ -239,7 +246,10 @@ class GuardMiddleware:
         if path == "/api/v1/devices" and method == "POST":
             if not limiter.allow(f"register:{ip}", settings.device_registrations_per_hour, 3600):
                 return False
-        return limiter.allow(_bucket(headers, ip), settings.rate_limit_per_minute, 60)
+        bucket = _bucket(headers, ip)
+        if settings.shared_api_rate_limiting and not allow_shared_rate(bucket, settings.rate_limit_per_minute, 60):
+            return False
+        return limiter.allow(bucket, settings.rate_limit_per_minute, 60)
 
 
 _SHARE_FILE_SUFFIXES = (".spz", ".glb", ".jpg", ".jpeg", ".png", ".webp", ".js")

@@ -2,19 +2,31 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import json
 import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from auth import Caller, require_caller
-from db import TRANSIENT_STATUSES, cancel_delayed_project, delete_project, get_project, rotate_share_token, update_project
+from db import (
+    TRANSIENT_STATUSES,
+    cancel_delayed_project,
+    delete_project,
+    get_idempotency_record,
+    get_project,
+    revoke_share_token,
+    rotate_share_token,
+    save_idempotency_record,
+    update_project,
+)
 from db import create_project as create_project_row
 from db import list_projects as list_project_rows
 from models.project import CreateProjectRequest, Project, StageRequest, UploadMetadata
 from routers.responses import jpeg_response, labeled_jpeg, status_body, to_project
+from services.byok import clear_project_keys, set_project_auto_3d, set_project_stage_key, set_project_world_key
 from services.disclosure import DISCLOSURE_TEXT
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE, staging_quota_blocks, world_quota_blocks
 from services.pipeline import enqueue_job, retry_delayed_project, start_job
@@ -126,6 +138,28 @@ def _raise_for_enqueue(outcome: str, kind: str) -> None:
         raise HTTPException(status_code=429, detail=message)
 
 
+def _idempotency_scope(caller: Caller, method: str, path: str, idem_key: str | None) -> str | None:
+    cleaned = (idem_key or "").strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > 128:
+        raise HTTPException(status_code=400, detail="Idempotency-Key is too long")
+    owner = caller.device_id or "admin"
+    return hashlib.sha256(f"{owner}|{method}|{path}|{cleaned}".encode("utf-8")).hexdigest()
+
+
+def _check_idempotency(scope: str | None, request_hash: str) -> JSONResponse | None:
+    if not scope:
+        return None
+    found = get_idempotency_record(scope)
+    if found is None:
+        return None
+    saved_hash, status_code, response_json = found
+    if saved_hash != request_hash:
+        raise HTTPException(status_code=409, detail="Idempotency-Key reused with different request parameters")
+    return JSONResponse(status_code=status_code, content=json.loads(response_json))
+
+
 @router.post("/projects")
 async def create_project(req: CreateProjectRequest, request: Request) -> Project:
     caller = _caller(request)
@@ -149,6 +183,7 @@ async def get_one(project_id: str, request: Request) -> Project:
 async def remove_project(project_id: str, request: Request) -> Response:
     """Delete the capture, its files, hosted worlds, and its share link."""
     project = _require(project_id, request)
+    clear_project_keys(project_id)
     world_ids = [
         project.world_id,
         project.world_preview_id,
@@ -173,17 +208,33 @@ async def rotate_share(project_id: str, request: Request) -> Project:
     return to_project(updated)
 
 
+@router.post("/projects/{project_id}/share/revoke")
+async def revoke_share(project_id: str, request: Request) -> Project:
+    """Immediately expire and rotate both the public share token and owner preview token."""
+    _require(project_id, request)
+    updated = revoke_share_token(project_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return to_project(updated)
+
+
 @router.post("/projects/{project_id}/upload")
 async def upload_images(
     project_id: str,
     request: Request,
     images: list[UploadFile] = File(...),
     metadata: str | None = Form(default=None),
+    auto_3d: bool = Query(default=True),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
 ):
+    caller = _caller(request)
     project = _require(project_id, request)
-    _reject_if_busy(project.status)
-    _reject_declared_body(request)
     settings = get_settings()
+    worldlabs_key = (x_worldlabs_key or "").strip() or None
+    if settings.byok_required and auto_3d and not worldlabs_key:
+        raise HTTPException(status_code=400, detail="World Labs API key is required (send X-WorldLabs-Key)")
+    _reject_declared_body(request)
     count = len(images)
     if count < settings.min_images or count > settings.max_images:
         raise HTTPException(
@@ -195,6 +246,21 @@ async def upload_images(
         normalize_upload(await _read_limited(image, settings.max_image_bytes), max_pixels=settings.max_image_pixels)
         for image in images
     ]
+    scope = _idempotency_scope(caller, "POST", f"/api/v1/projects/{project_id}/upload", idempotency_key)
+    req_hash = ""
+    if scope:
+        hasher = hashlib.sha256()
+        hasher.update(f"auto_3d={auto_3d}|{metadata or ''}".encode("utf-8"))
+        for payload in payloads:
+            hasher.update(hashlib.sha256(payload).digest())
+        req_hash = hasher.hexdigest()
+        cached = _check_idempotency(scope, req_hash)
+        if cached is not None:
+            return cached
+
+    _reject_if_busy(project.status)
+    set_project_auto_3d(project_id, auto_3d)
+    set_project_world_key(project_id, worldlabs_key if auto_3d else None)
 
     outcome, job_id = await enqueue_job(
         project_id,
@@ -221,6 +287,7 @@ async def upload_images(
         replace_delayed=True,
         retire_worlds="all",
         start=False,
+        byok=bool(worldlabs_key),
     )
     _raise_for_enqueue(outcome, "stitch")
     storage = get_storage()
@@ -234,7 +301,10 @@ async def upload_images(
     if job_id:
         await start_job(job_id)
     latest = get_project(project_id)
-    return {"status": latest.status if latest else "stitching", "image_count": count}
+    resp_body = {"status": latest.status if latest else "stitching", "image_count": count}
+    if scope:
+        save_idempotency_record(scope, req_hash, 200, json.dumps(resp_body))
+    return resp_body
 
 
 @router.get("/projects/{project_id}/status")
@@ -326,23 +396,44 @@ async def unpublish_staged(project_id: str, request: Request) -> Project:
 
 
 @router.post("/projects/{project_id}/stage")
-async def stage_project(project_id: str, req: StageRequest, request: Request):
+async def stage_project(
+    project_id: str,
+    req: StageRequest,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_gemini_key: str | None = Header(default=None, alias="X-Gemini-Key"),
+):
+    caller = _caller(request)
     project = _require(project_id, request)
+    settings = get_settings()
+    gemini_key = (x_gemini_key or "").strip() or None
+    if settings.byok_required and not gemini_key:
+        raise HTTPException(status_code=400, detail="Gemini API key is required (send X-Gemini-Key)")
+    scope = _idempotency_scope(caller, "POST", f"/api/v1/projects/{project_id}/stage", idempotency_key)
+    req_hash = hashlib.sha256(req.prompt.encode("utf-8")).hexdigest() if scope else ""
+    cached = _check_idempotency(scope, req_hash)
+    if cached is not None:
+        return cached
     if not project.panorama_key:
         raise HTTPException(status_code=400, detail="No panorama available to stage")
-    if staging_quota_blocks(project.owner_device_id):
+    if not gemini_key and staging_quota_blocks(project.owner_device_id):
         raise HTTPException(status_code=429, detail=STAGING_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
-    if project.staging_status == "staging" and not get_settings().jobs_inline:
+    if project.staging_status == "staging" and not settings.jobs_inline:
         raise HTTPException(status_code=409, detail="This project is already processing")
+    set_project_stage_key(project_id, gemini_key)
     outcome, _job_id = await enqueue_job(
         project_id,
         "stage",
         project_fields={"staging_prompt": req.prompt, "staged_published": 0},
+        byok=bool(gemini_key),
     )
     _raise_for_enqueue(outcome, "stage")
     latest = get_project(project_id)
-    return {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
+    resp_body = {"status": (latest.staging_status if latest else None) or "staging", "prompt": req.prompt}
+    if scope:
+        save_idempotency_record(scope, req_hash, 200, json.dumps(resp_body))
+    return resp_body
 
 
 @router.get("/projects/{project_id}/stage/status")
@@ -369,22 +460,47 @@ async def get_stage_status(project_id: str, request: Request):
 
 
 @router.post("/projects/{project_id}/generate-3d")
-async def generate_3d(project_id: str, request: Request, source: str = Query(default="original")):
+async def generate_3d(
+    project_id: str,
+    request: Request,
+    source: str = Query(default="original"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    x_worldlabs_key: str | None = Header(default=None, alias="X-WorldLabs-Key"),
+):
     if source not in {"original", "staged"}:
         raise HTTPException(status_code=400, detail="source must be original or staged")
+    caller = _caller(request)
     project = _require(project_id, request)
+    settings = get_settings()
+    worldlabs_key = (x_worldlabs_key or "").strip() or None
+    if settings.byok_required and not worldlabs_key:
+        raise HTTPException(status_code=400, detail="World Labs API key is required (send X-WorldLabs-Key)")
+    scope = _idempotency_scope(caller, "POST", f"/api/v1/projects/{project_id}/generate-3d", idempotency_key)
+    req_hash = hashlib.sha256(source.encode("utf-8")).hexdigest() if scope else ""
+    cached = _check_idempotency(scope, req_hash)
+    if cached is not None:
+        return cached
     if source == "original" and not project.panorama_key:
         raise HTTPException(status_code=400, detail="No panorama available for a 3D world")
     if source == "staged" and not project.staged_key:
         raise HTTPException(status_code=400, detail="Stage the panorama before generating a 3D world from it")
-    if world_quota_blocks(project.owner_device_id):
+    if world_quota_blocks(project.owner_device_id, byok=bool(worldlabs_key)):
         raise HTTPException(status_code=429, detail=WORLD_QUOTA_MESSAGE)
     _reject_if_busy(project.status)
+    set_project_world_key(project_id, worldlabs_key)
     kind = "staged_world" if source == "staged" else "world"
-    outcome, _job_id = await enqueue_job(project_id, kind, retire_worlds="staged" if source == "staged" else "original")
+    outcome, _job_id = await enqueue_job(
+        project_id,
+        kind,
+        retire_worlds="staged" if source == "staged" else "original",
+        byok=bool(worldlabs_key),
+    )
     _raise_for_enqueue(outcome, kind)
     latest = get_project(project_id)
-    return {"status": latest.status if latest else "generating_3d"}
+    resp_body = {"status": latest.status if latest else "generating_3d"}
+    if scope:
+        save_idempotency_record(scope, req_hash, 200, json.dumps(resp_body))
+    return resp_body
 
 
 @router.get("/projects/{project_id}/generate-3d/status")

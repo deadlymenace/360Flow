@@ -11,6 +11,7 @@ Set JOBS_INLINE=1 to await the work inside the request (used by tests).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import contextvars
 import hashlib
 import json
@@ -42,6 +43,7 @@ from db import (
     update_project,
 )
 from db import _as_utc as _as_utc
+from services.byok import get_project_world_key, pop_project_auto_3d, pop_project_stage_key, pop_project_world_key
 from services.quota import STAGING_QUOTA_MESSAGE, WORLD_QUOTA_MESSAGE
 from services.staging import StagingProviderError, stage_image
 from services.stitcher import stitch_images
@@ -82,6 +84,20 @@ _abort_hooks: dict[str, object] = {}
 # The job this task is running, so write guards can check its lease.
 _current_job: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_job", default=None)
 _INTERRUPTED_WORLD = "3D generation was interrupted. Retry from the app."
+
+
+def _byok_kwargs(fn, api_key: str | None, require_byok: bool) -> dict[str, object]:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return {}
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    extra: dict[str, object] = {}
+    if accepts_var_kw or "api_key" in params:
+        extra["api_key"] = api_key
+    if accepts_var_kw or "require_byok" in params:
+        extra["require_byok"] = require_byok
+    return extra
 _INTERRUPTED_WORLD_DETAIL = (
     "Interrupted before a World Labs operation id was saved; not started again, to avoid a second charge."
 )
@@ -142,6 +158,7 @@ async def enqueue_job(
     replace_delayed: bool = False,
     retire_worlds: str | None = None,
     start: bool = True,
+    byok: bool = False,
 ) -> tuple[str, str | None]:
     """Claim the project and queue one job.
 
@@ -154,6 +171,7 @@ async def enqueue_job(
         project_fields=project_fields,
         replace_delayed=replace_delayed,
         retire_worlds=retire_worlds,
+        byok=byok,
     )
     if outcome == "quota" and kind in {"world", "staged_world"}:
         update_project(project_id, error=WORLD_QUOTA_MESSAGE, active_job=None)
@@ -491,7 +509,8 @@ async def run_job(job_id: str) -> None:
             else:
                 delete_owned_job(job_id, WORKER_ID)
     if follow and owned and not abandoned and not keep:
-        await enqueue_job(job.project_id, follow)
+        has_byok = get_project_world_key(job.project_id) is not None
+        await enqueue_job(job.project_id, follow, byok=has_byok)
 
 
 async def run_stitch(project_id: str) -> str | None:
@@ -551,7 +570,7 @@ async def run_stitch(project_id: str) -> str | None:
         logger.exception("Project %s stitch failed", project_id)
         update_project(project_id, status="failed", error="Stitching failed. Try again.")
         return None
-    return "world"
+    return "world" if pop_project_auto_3d(project_id) else None
 
 
 async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None = None) -> None:
@@ -575,8 +594,12 @@ async def run_stage(project_id: str, *, resume: bool = False, job_id: str | None
         def before_generate() -> None:
             _require_lease(job_id)
 
+        stage_key = pop_project_stage_key(project_id)
         staged_bytes, provider, notes = await stage_image(
-            original, project.staging_prompt, before_generate=before_generate
+            original,
+            project.staging_prompt,
+            before_generate=before_generate,
+            **_byok_kwargs(stage_image, stage_key, get_settings().byok_required),
         )
         if _deleted(project_id):
             return
@@ -722,6 +745,7 @@ async def _run_world(
             if job_id:
                 touch_job(job_id)
 
+        world_key = pop_project_world_key(project_id)
         result = await generate_world(
             image,
             label,
@@ -730,6 +754,7 @@ async def _run_world(
             on_operation=on_operation,
             on_submitting=on_submitting,
             on_tick=on_tick,
+            **_byok_kwargs(generate_world, world_key, get_settings().byok_required),
         )
         await _store_world(project_id, result, staged_source, created_ids)
     except LeaseLost:
@@ -788,7 +813,14 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
         def on_tick() -> None:
             touch_job(job.id)
 
-        parsed = await poll_world_operation(job.operation_id or "", timeout_s, on_tick=on_tick)
+        world_key = pop_project_world_key(project_id)
+        require_byok = get_settings().byok_required
+        parsed = await poll_world_operation(
+            job.operation_id or "",
+            timeout_s,
+            on_tick=on_tick,
+            **_byok_kwargs(poll_world_operation, world_key, require_byok),
+        )
         if phase == "draft":
             _store_preview(project_id, parsed, staged_source, created_ids)
             if _deleted(project_id):
@@ -811,6 +843,7 @@ async def _resume_world(project_id: str, job: JobRecord, staged_source: bool) ->
                 on_operation=on_operation,
                 on_submitting=on_submitting,
                 on_tick=on_tick,
+                **_byok_kwargs(continue_full_world, world_key, require_byok),
             )
         await _store_world(project_id, parsed, staged_source, created_ids)
     except LeaseLost:
